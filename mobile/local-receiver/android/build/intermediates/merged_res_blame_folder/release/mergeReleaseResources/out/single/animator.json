@@ -1,0 +1,26 @@
+[
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/animator/fragment_fade_enter.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-fragment-1.6.2-1:/animator/fragment_fade_enter.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/animator/fragment_close_enter.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-fragment-1.6.2-1:/animator/fragment_close_enter.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/animator/fragment_fade_exit.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-fragment-1.6.2-1:/animator/fragment_fade_exit.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/animator/fragment_close_exit.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-fragment-1.6.2-1:/animator/fragment_close_exit.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/animator/fragment_open_exit.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-fragment-1.6.2-1:/animator/fragment_open_exit.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/animator/fragment_open_enter.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-fragment-1.6.2-1:/animator/fragment_open_enter.xml"
+    }
+]

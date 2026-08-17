@@ -1,0 +1,151 @@
+[package]
+name = "backup-desktop"
+version = "0.1.0"
+description = "局域网备份工具电脑端"
+edition = "2021"
+
+[lib]
+name = "backup_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 使用 bundled 编译 SQLite 从源码（开发阶段暂不启用 SQLCipher，需 OpenSSL 环境）
+# 要启用加密：将 features 改为 ["bundled", "sqlcipher"] 并确保 OPENSSL_DIR 环境变量指向 OpenSSL 安装目录
+rusqlite = { version = "0.31", features = ["bundled"] }
+# LocalSend 核心：HTTP 传输（v2 协议客户端 + 服务端）+ 设备发现
+# http feature 自动包含 crypto（mTLS 证书等），这里用纯 HTTP 时 tls_config 传 None 即可
+localsend = { path = "../../../localsend-main/packages/core", features = ["http", "multicast"] }
+tokio = { version = "1", features = ["full"] }
+# 大文件流式上传（ReaderStream）
+tokio-util = { version = "0.7", features = ["io"] }
+# 上传流分块统计（块级进度事件）
+futures-util = "0.3"
+# 接收端冲突重命名时间戳格式化（MMDDhhmmss）
+time = { version = "0.3", features = ["formatting", "parsing", "local-offset"] }
+# AES-256-GCM 传输加密（ring 已通过 rustls 在依赖树中，显式声明为直接依赖）
+ring = "0.17"
+# 子网探测：枚举本机 IPv4 网段（配对/连接发现单播兜底）
+if-addrs = "0.13"
+# SHA-256（块校验 + Merkle 树）
+sha2 = "0.10"
+# 十六进制编码/解码（ETag 格式化）
+hex = "0.4"
+# 随机数（指数退避全抖动）
+rand = "0.8"
+# UUID（会话 ID 生成）
+uuid = { version = "1", features = ["v4"] }
+# xxHash64（弱校验快筛，非加密）
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+# URL 编码（scheduler v1 扩展协议 HTTP 参数）
+urlencoding = "2"
+# 会话状态持久化（tauri-plugin-store）
+tauri-plugin-store = "2"
+
+# 发布构建优化：全程序 LTO + 去除符号
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
+
+# 分级优化（体积与速度兼得）：
+# 全局 opt-level 3 保证速度；热点 crate（本程序 + localsend 传输核心）保持 3，
+# 框架类重型依赖（UI 壳 / HTTP 栈 / TLS / 运行时 / SQLite 等）降到 "s"——
+# 它们不是性能热点，体积可省 ~20%，运行速度几乎无感知。
+[profile.release.package.backup-desktop]
+opt-level = 3
+[profile.release.package.localsend]
+opt-level = 3
+[profile.release.package.localsend-core]
+opt-level = 3
+
+[profile.release.package.tauri]
+opt-level = "s"
+[profile.release.package.tauri-runtime-wry]
+opt-level = "s"
+[profile.release.package.tauri-utils]
+opt-level = "s"
+[profile.release.package.wry]
+opt-level = "s"
+[profile.release.package.tao]
+opt-level = "s"
+[profile.release.package.webview2-com]
+opt-level = "s"
+[profile.release.package.windows]
+opt-level = "s"
+[profile.release.package.windows-core]
+opt-level = "s"
+[profile.release.package.windows-sys]
+opt-level = "s"
+[profile.release.package.reqwest]
+opt-level = "s"
+[profile.release.package.hyper]
+opt-level = "s"
+[profile.release.package.hyper-util]
+opt-level = "s"
+[profile.release.package.h2]
+opt-level = "s"
+[profile.release.package.http]
+opt-level = "s"
+[profile.release.package.http-body-util]
+opt-level = "s"
+[profile.release.package.tower]
+opt-level = "s"
+[profile.release.package.tower-service]
+opt-level = "s"
+[profile.release.package.rustls]
+opt-level = "s"
+[profile.release.package.rustls-pki-types]
+opt-level = "s"
+[profile.release.package.ring]
+opt-level = "s"
+[profile.release.package.tokio-rustls]
+opt-level = "s"
+[profile.release.package.tokio]
+opt-level = "s"
+[profile.release.package.tokio-util]
+opt-level = "s"
+[profile.release.package.bytes]
+opt-level = "s"
+[profile.release.package.futures-util]
+opt-level = "s"
+[profile.release.package.mio]
+opt-level = "s"
+[profile.release.package.socket2]
+opt-level = "s"
+[profile.release.package.rusqlite]
+opt-level = "s"
+[profile.release.package.libsqlite3-sys]
+opt-level = "s"
+[profile.release.package.serde]
+opt-level = "s"
+[profile.release.package.serde_json]
+opt-level = "s"
+[profile.release.package.base64]
+opt-level = "s"
+[profile.release.package.url]
+opt-level = "s"
+[profile.release.package.uuid]
+opt-level = "s"
+[profile.release.package.thiserror]
+opt-level = "s"
+[profile.release.package.anyhow]
+opt-level = "s"
+[profile.release.package.parking_lot]
+opt-level = "s"
+[profile.release.package.lock_api]
+opt-level = "s"
+[profile.release.package.indexmap]
+opt-level = "s"
+[profile.release.package.hashbrown]
+opt-level = "s"
+[profile.release.package.ahash]
+opt-level = "s"

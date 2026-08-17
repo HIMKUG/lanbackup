@@ -1,0 +1,33 @@
+# 构建产物
+node_modules/
+dist/
+target/
+
+# Android 构建
+mobile/android/**/build/
+mobile/android/.gradle/
+mobile/android/.idea/
+mobile/android/local.properties
+mobile/android/.kotlin/
+
+# Rust
+**/Cargo.lock
+src-tauri/target/
+
+# 编辑器
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# OS
+.DS_Store
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Shelf
+
+# Tauri
+src-tauri/icons/

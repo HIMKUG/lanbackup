@@ -1,0 +1,41 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.5.0'
+    }
+}
+
+apply plugin: 'com.android.library'
+
+android {
+    namespace "com.backup.mobile.receiver"
+    compileSdk project.hasProperty('compileSdkVersion') ? rootProject.ext.compileSdkVersion : 35
+    defaultConfig {
+        minSdkVersion project.hasProperty('minSdkVersion') ? rootProject.ext.minSdkVersion : 23
+        targetSdkVersion project.hasProperty('targetSdkVersion') ? rootProject.ext.targetSdkVersion : 35
+        versionCode 1
+        versionName "0.1.0"
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+repositories {
+    google()
+    mavenCentral()
+}
+
+dependencies {
+    implementation project(':capacitor-android')
+    // SAF 遍历：DocumentFile 内部自行处理子目录 tree URI 的 documentId 编码，
+    // 规避部分 ROM 上 buildChildDocumentsUriUsingTree/getDocumentId 的解析问题
+    implementation 'androidx.documentfile:documentfile:1.0.1'
+    // @ActivityCallback 活动结果回调（Capacitor 6 推荐的目录选择模式，
+    // 不依赖旧版 requestCode 路由——旧版在该插件上活动结果会丢失导致"卡死"）
+    implementation 'androidx.activity:activity:1.8.0'
+}

@@ -1,0 +1,11 @@
+{
+  "appId": "com.backup.mobile",
+  "appName": "局域网备份",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": true
+  }
+}

@@ -1,0 +1,1488 @@
+/* ============================================================
+   局域网备份 - 桌面端
+   Liquid Glass 材质系统（按钮/分段/弹窗/Dock/降级）在
+   shared-ui/src/liquid.css，随 shared-ui 导入自动注入；
+   本文件只保留布局、页面级样式与主题变量。
+   强调色：翡翠青 teal；默认浅色；html.dark 深色
+   ============================================================ */
+
+/* ---------- 全局字体：苹方黑体子集（GB2312 一级 + ASCII，woff2 裁切打包） ---------- */
+@font-face {
+  font-family: 'AppFont';
+  src: url('/fonts/app-font.woff2') format('woff2');
+  font-display: swap;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button,
+input,
+select,
+textarea {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* 选中策略：调试模式关闭（html 无 .debug-on）时全局禁选中，仅输入框与调试日志例外 */
+html:not(.debug-on) body {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+html:not(.debug-on) input,
+html:not(.debug-on) textarea,
+html:not(.debug-on) .log-preview-body {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+button,
+.device-item,
+.root-row,
+.paired-row {
+  touch-action: manipulation; /* 消除移动端 300ms 点击延迟 */
+}
+
+button:focus,
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+}
+
+/* 键盘焦点可见性：鼠标点击不显示环，Tab 导航显示强调环（WCAG 2.4.7） */
+button:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+.device-item:focus-visible,
+.root-row:focus-visible,
+.drop-zone:focus-visible,
+.dd-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---------- 主题变量（默认浅色） ---------- */
+:root {
+  --bg-base: #f2f2f7;
+  --text-primary: #1d1d1f;
+  --text-secondary: rgba(29, 29, 31, 0.62);
+  --text-tertiary: rgba(29, 29, 31, 0.45);
+  --accent: #0d9488;
+  --accent-strong: #0f766e;
+  --accent-soft: rgba(13, 148, 136, 0.14);
+  --border-glass: rgba(0, 0, 0, 0.09);
+  --input-bg: rgba(255, 255, 255, 0.42);
+  --chip-bg: rgba(255, 255, 255, 0.32);
+  --row-highlight: rgba(255, 255, 255, 0.28);
+  --shadow-card: 0 8px 24px rgba(0, 0, 0, 0.06);
+  --card-bg: rgba(255, 255, 255, 0.92);
+  --glow-1: rgba(13, 148, 136, 0.3);
+  --glow-2: rgba(59, 130, 246, 0.22);
+  --progress-track: rgba(0, 0, 0, 0.08);
+  /* 间距阶梯（紧凑组 8/12，区块 16/20，大分隔 28）——替代曾经的 12px 一统 */
+  --sp-xs: 8px;
+  --sp-sm: 12px;
+  --sp-md: 16px;
+  --sp-lg: 20px;
+  --sp-xl: 28px;
+  /* 圆角四档：控件 12 / 卡片行 12 / 卡片 18 / 大卡·窗口 24（dock 32 由 liquid.css 管） */
+  --radius-card: 24px;
+  --radius-input: 12px;
+  --radius-window: 26px; /* 整窗圆角 = Dock 圆角（配合 transparent 窗口裁切） */
+  --ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
+  /* Dock 悬浮气泡（桌面为居中窄栏） */
+  --dock-max: 620px;
+  color-scheme: light;
+}
+
+html.dark {
+  --bg-base: #0a0a0c;
+  --text-primary: #f5f5f7;
+  --text-secondary: rgba(235, 235, 245, 0.65);
+  --text-tertiary: rgba(235, 235, 245, 0.4);
+  --accent: #2dd4bf;
+  --accent-strong: #14b8a6;
+  --accent-soft: rgba(45, 212, 191, 0.3);
+  --border-glass: rgba(255, 255, 255, 0.12);
+  --input-bg: rgba(255, 255, 255, 0.08);
+  --chip-bg: rgba(255, 255, 255, 0.05);
+  --row-highlight: rgba(255, 255, 255, 0.1);
+  --shadow-card: 0 8px 24px rgba(0, 0, 0, 0.32);
+  --card-bg: rgba(28, 28, 32, 0.94);
+  --glow-1: rgba(45, 212, 191, 0.22);
+  --glow-2: rgba(96, 165, 250, 0.18);
+  --progress-track: rgba(255, 255, 255, 0.1);
+  color-scheme: dark;
+}
+
+/* 透明圆角窗口的正确姿势：
+   1) html/body 背景必须完全透明。若给 html 设透明、body 带背景，CSS 规范的
+      「根背景传播」会把 body 的背景提升为画布背景——画布直接铺满整个窗口矩形，
+      无视任何 border-radius，圆角即失效（上一版的根因）。
+   2) 带圆角的视觉背景改画在独立的固定层 .window-bg 上，由它自己 border-radius。
+   3) html overflow:auto 阻断 body overflow 向视口传播，body 的圆角裁切才能生效。 */
+html {
+  background: transparent;
+  overflow: auto;
+}
+
+body {
+  font-family: 'AppFont', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: transparent;
+  color: var(--text-primary);
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  border-radius: var(--radius-window);
+  overflow: hidden;
+  transition: color 0.4s ease;
+}
+
+/* 窗口裁切容器：背景全家（底色/壁纸/纱罩/光斑）裁进整窗圆角。
+   fixed 子元素不受 body overflow 裁切，所以全部收进来以 absolute 摆放 */
+.window-clip {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  border-radius: var(--radius-window);
+  overflow: hidden;
+}
+
+.window-clip .window-bg,
+.window-clip .wallpaper-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+.window-clip .glow-blob {
+  position: absolute;
+}
+
+/* 窗口背景层：唯一的圆角背景（整窗圆角 = Dock 圆角，同心） */
+.window-bg {
+  border-radius: var(--radius-window);
+  background:
+    radial-gradient(1100px 700px at 15% -10%, var(--glow-1), transparent 60%),
+    radial-gradient(900px 600px at 110% 15%, var(--glow-2), transparent 55%),
+    var(--bg-base);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+}
+
+html.dark .window-bg {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+}
+
+/* ---------- 动态壁纸：全帧率播放（不锁帧），玻璃卡片的模糊由内部 canvas 采样 ---------- */
+/* 裁切容器内全部靠 DOM 顺序叠放（bg → 视频 → 纱罩 → 光斑），
+   绝不能再给负 z-index，否则不透明底色会反过来盖住壁纸 */
+.wallpaper-video {
+  object-fit: cover;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wallpaper-video {
+    display: none;
+  }
+}
+
+#app {
+  max-width: 620px;
+  margin: 0 auto;
+  min-height: 100vh;
+}
+
+/* ---------- 外壳（底部为悬浮 Dock，预留更高净空） ---------- */
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  padding: 62px 16px 140px; /* 顶部让出标题栏 46px + 间距 */
+}
+
+/* 标题栏下方的连接码行：普通内容区（不可拖动） */
+.app-codebar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 14px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.18), 0 0 2px rgba(0, 0, 0, 0.14); /* 去纱罩后保证裸文本可读（非遮罩） */
+}
+
+/* 连接码点击复制 */
+.code-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-left: -8px;
+  padding: 4px 8px;
+  border: none;
+  border-radius: 10px;
+  background: none;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: color 0.2s ease, background 0.2s ease;
+}
+
+.code-copy:hover {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.header-device {
+  display: none; /* 已废弃：设备名改由 .header-name 承担（保留选择器防旧标记泄漏样式） */
+}
+
+/* ---------- 液态玻璃标题栏（玻璃材质伪元素配方在 liquid.css） ----------
+   分界线（border-bottom）之上整条可拖动，之下不可拖动 */
+.titlebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 46px;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 10px 0 20px;
+  border-radius: var(--radius-window) var(--radius-window) 0 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.5); /* 清晰的白色分界线 */
+}
+
+html.dark .titlebar {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.22);
+}
+
+.titlebar h1 {
+  font-size: 14.5px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  user-select: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.titlebar-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.win-btn {
+  min-width: 36px;
+  height: 30px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 8px;
+  background: var(--chip-bg);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: inset 0 1px 0 var(--row-highlight);
+  transition: background 0.2s ease, color 0.2s ease, transform 0.3s var(--ease-spring);
+}
+
+.win-btn:hover {
+  background: var(--accent-soft);
+  color: var(--text-primary);
+}
+
+.win-btn:active {
+  transform: scale(0.92);
+}
+
+.win-btn.close:hover {
+  background: rgba(255, 69, 58, 0.85);
+  color: #fff;
+}
+
+/* CSS 绘制按钮图形：保证绝对居中 */
+.g-min {
+  display: block;
+  width: 11px;
+  height: 2px;
+  border-radius: 1px;
+  background: currentColor;
+}
+
+.g-x {
+  position: relative;
+  display: block;
+  width: 11px;
+  height: 11px;
+}
+
+.g-x::before,
+.g-x::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 4.5px;
+  width: 11px;
+  height: 2px;
+  border-radius: 1px;
+  background: currentColor;
+}
+
+.g-x::before {
+  transform: rotate(45deg);
+}
+
+.g-x::after {
+  transform: rotate(-45deg);
+}
+
+/* 连接码行：设备名跟在重置按钮右侧（12px 辅助级，与 14px 连接码拉开层级） */
+.header-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-left: 6px;
+  border-left: 1px solid var(--border-glass);
+}
+
+/* 连接码旁的重置小按钮（SVG 图标居中） */
+.mini-btn {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: var(--chip-bg);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1;
+  font-family: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.2s ease, color 0.2s ease, transform 0.3s var(--ease-spring);
+}
+
+.mini-btn:hover {
+  color: var(--accent);
+}
+
+.hist-group-head:hover {
+  color: var(--accent);
+}
+
+.mini-btn:active {
+  transform: rotate(180deg) scale(0.9);
+}
+
+.code-copy strong {
+  color: var(--accent);
+  letter-spacing: 2px;
+  font-weight: 700;
+  font-size: 14px;
+}
+
+/* ---------- 消息队列：悬浮 Toast 堆叠（不占文档流，多条并行互不遮挡） ---------- */
+.toast-stack {
+  position: fixed;
+  top: 58px; /* 标题栏下方 */
+  left: 16px;
+  right: 132px; /* 避开右上窗口控制 */
+  z-index: 260;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  padding: 11px 15px;
+  border: none;
+  border-radius: 16px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.45;
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.42);
+  backdrop-filter: blur(14px) saturate(150%);
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
+  box-shadow: var(--lg-ctl-shadow), inset 0 0 0 1px rgba(255, 255, 255, 0.35);
+  pointer-events: auto;
+}
+
+html.dark .toast {
+  background: rgba(30, 32, 40, 0.5);
+  box-shadow: var(--lg-ctl-shadow), inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+}
+
+.toast.error {
+  color: #d93b2b;
+  box-shadow: var(--lg-ctl-shadow), inset 0 0 0 1px rgba(255, 69, 58, 0.42);
+}
+
+html.dark .toast.error {
+  color: #ff6961;
+}
+
+/* 信息条入场：顶部滑入 + 回弹；退场：上浮淡出 */
+.toast-drop-enter-active {
+  transition: opacity 0.3s ease;
+  animation: toast-drop-in 0.55s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.toast-drop-leave-active {
+  transition: opacity 0.28s ease, transform 0.3s ease;
+}
+
+/* 堆叠中其余消息平滑补位 */
+.toast-drop-move {
+  transition: transform 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.toast-drop-enter-from,
+.toast-drop-leave-to {
+  opacity: 0;
+}
+
+.toast-drop-leave-to {
+  transform: translateY(-10px);
+}
+
+@keyframes toast-drop-in {
+  from {
+    transform: translateY(-16px) scale(0.96);
+  }
+  to {
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* 卡片（收件区配置 / 发件区配置）随角色开关弹入弹出 */
+.card-pop-enter-active {
+  transition: opacity 0.35s ease;
+  animation: card-pop-in 0.55s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.card-pop-leave-active {
+  transition: opacity 0.25s ease, transform 0.3s var(--ease-glass, ease);
+}
+
+.card-pop-enter-from,
+.card-pop-leave-to {
+  opacity: 0;
+  transform: translateY(16px) scale(0.98);
+}
+
+/* ---------- 页面 ---------- */
+.pages {
+  flex: 1;
+}
+
+.page {
+  position: relative; /* 切页动画时旧页 absolute 的锚 */
+  display: flex;
+  flex-direction: column;
+  gap: 0; /* 改用 margin 控制卡间距，方便动画过程中 margin 收拢不残留 gap 闪跳 */
+}
+
+/* 非激活页隐藏（由切页 watch 用 classList 手动切换，避免 v-show 同 tick 竞态） */
+.page-inner.page-off {
+  display: none;
+}
+
+.page-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+/* 页面内每张卡间距用 margin-bottom 控制（可被 cardLeave 动画收拢到 0） */
+.page-inner > .liquidGlass-wrapper,
+.page-inner > .card-gap {
+  margin-bottom: 16px;
+}
+
+.page-inner > .liquidGlass-wrapper:last-child,
+.page-inner > .card-gap:last-child {
+  margin-bottom: 0;
+}
+
+/* 收发件配置卡的 TransitionGroup 容器（与历史记录同款排列） */
+.card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.card-list:empty {
+  margin-bottom: 0;
+}
+
+.glass-card-title {
+  font-size: 15.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 10px;
+}
+
+.muted {
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+  margin-bottom: 8px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+}
+
+
+/* ---------- 内联间距阶梯（替代散落的 style="margin-top:Npx"，单一来源） ---------- */
+.mt-xs { margin-top: var(--sp-xs); }
+.mt-sm { margin-top: var(--sp-sm); }
+.mt-md { margin-top: var(--sp-md); }
+.mt-lg { margin-top: var(--sp-lg); }
+
+/* ---------- 输入 ---------- */
+.glass-input {
+  width: 100%;
+  padding: 11px 13px;
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-input);
+  background: var(--input-bg);
+  color: var(--text-primary);
+  font-size: 14px;
+  font-family: inherit;
+  outline: none;
+  margin-bottom: 7px;
+  box-shadow: inset 0 1px 0 var(--row-highlight);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  transition: border-color 0.25s ease, box-shadow 0.25s ease, background 0.25s ease;
+}
+
+.glass-input:focus {
+  border-color: var(--accent);
+  box-shadow: inset 0 1px 0 var(--row-highlight), 0 0 0 3px rgba(13, 148, 136, 0.18);
+}
+
+.glass-input::placeholder {
+  color: var(--text-tertiary);
+  font-style: italic;
+}
+
+select.glass-input {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-secondary) 50%),
+    linear-gradient(135deg, var(--text-secondary) 50%, transparent 50%);
+  background-position: calc(100% - 18px) 50%, calc(100% - 13px) 50%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+}
+
+.code-input {
+  font-family: "SF Mono", Consolas, monospace;
+  letter-spacing: 3px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.self-code {
+  color: var(--accent);
+  letter-spacing: 2px;
+  font-weight: 700;
+}
+
+/* ---------- 扫描 / 列表（长列表用轻玻璃行，重折射只留给容器卡片） ---------- */
+.scanner-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+  padding: 9px 12px;
+  border: 1px solid rgba(13, 148, 136, 0.3);
+  border-radius: 12px;
+  background: rgba(13, 148, 136, 0.07);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.scanner-pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+  animation: scanner-blink 1.2s ease-in-out infinite;
+}
+
+@keyframes scanner-blink {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgba(13, 148, 136, 0.45);
+  }
+  50% {
+    opacity: 0.4;
+    box-shadow: 0 0 0 6px rgba(13, 148, 136, 0);
+  }
+}
+
+.device-list {
+  position: relative; /* TransitionGroup 离场项绝对定位的锚 */
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* 端口输入：居中、加粗、加大字距，去掉原生步进器 */
+input[type='number'].glass-input {
+  text-align: center;
+  font-weight: 700;
+  letter-spacing: 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+input[type='number']::-webkit-outer-spin-button,
+input[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type='number'] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.device-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 13px;
+  border: 1px solid var(--border-glass);
+  border-radius: 12px;
+  background: var(--chip-bg);
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 var(--row-highlight);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  transition: border-color 0.25s ease, background 0.25s ease, transform 0.2s var(--ease-spring);
+}
+
+.device-item:hover {
+  border-color: var(--accent);
+  background: rgba(13, 148, 136, 0.08);
+}
+
+.device-item:active {
+  transform: scale(0.985);
+}
+
+.device-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.device-main strong {
+  font-size: 14px;
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.paired-badge {
+  font-size: 12px;
+  color: var(--accent);
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.paired-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border: 1px solid var(--border-glass);
+  border-radius: 12px;
+  background: var(--chip-bg);
+  box-shadow: inset 0 1px 0 var(--row-highlight);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.paired-row .glass-btn.small {
+  align-self: center;
+}
+
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.status-dot.on {
+  background: #30d158;
+  animation: status-pulse 2s infinite;
+}
+
+/* 失败态：暖红（与暂停/离线的灰色区分，任务行用） */
+.status-dot.failed {
+  background: #ff6961;
+}
+
+/* 呼吸灯语义收敛：绿=运行/在线，灰=停止/离线（黄色已移除，停止是常态不是警告） */
+@keyframes status-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(48, 209, 88, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(48, 209, 88, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(48, 209, 88, 0);
+  }
+}
+
+/* ---------- 本机状态总览卡 ---------- */
+.status-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  border: 1px solid var(--border-glass);
+  background: var(--chip-bg);
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.status-chip.on {
+  color: #fff;
+  background: linear-gradient(135deg, rgba(13, 148, 136, 0.85), rgba(13, 148, 136, 0.55));
+  border-color: rgba(13, 148, 136, 0.6);
+}
+
+html.dark .status-chip.on {
+  background: linear-gradient(135deg, rgba(45, 212, 191, 0.9), rgba(20, 184, 166, 0.65));
+}
+
+.role-seg {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.role-seg .glass-chip {
+  flex: 1;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+/* 折叠面板：grid 0fr↔1fr 平滑展开/收起（收件区配置 / 发件区配置） */
+.panel-collapse {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 0.4s var(--ease-glass);
+}
+
+.panel-collapse.closed {
+  grid-template-rows: 0fr;
+}
+
+.panel-collapse-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 自动发现/手动连接：CSS grid 0fr↔1fr 双块伸缩（可中断且总能收敛） */
+.pair-blocks {
+  display: flex;
+  flex-direction: column;
+}
+
+.pair-block {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.pair-block.closed {
+  grid-template-rows: 0fr;
+}
+
+.pair-block-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.status-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border-glass);
+  border-radius: 12px;
+  background: var(--chip-bg);
+  box-shadow: inset 0 1px 0 var(--row-highlight);
+}
+
+.status-cell-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+}
+
+.status-cell-value {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-cell-sub {
+  font-size: 11px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-cell.off .status-cell-value {
+  color: var(--text-tertiary);
+}
+
+.last-sync {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-glass);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+/* ---------- 同步操作卡（常驻首屏：目标 + 策略 + 立即同步） ---------- */
+.mirror-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.run-btn {
+  width: 100%;
+  min-height: 44px;
+  margin-top: 16px;
+  font-size: 15px;
+  letter-spacing: 0.02em;
+}
+
+/* 就绪态：主按钮加 accent 光圈，与禁用灰区分 */
+.run-btn.ready {
+  box-shadow: 0 0 0 1px rgba(10, 132, 255, 0.35), 0 8px 24px rgba(10, 132, 255, 0.18);
+}
+
+.run-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+/* 设备行地址复制按钮（手动配对兜底路径的数据可达性） */
+.copy-ip {
+  align-self: center;
+}
+
+/* ---------- 收件区 / 发件区配置：折叠头放大、上下居中 ---------- */
+.recv-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  padding: 4px 2px 8px;
+  min-height: 36px;
+}
+
+.recv-header .glass-card-title {
+  font-size: 15.5px;
+  font-weight: 750;
+}
+
+/* 折叠头文件夹计数（次要信息，不与标题争权重） */
+.folder-count {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+  margin-right: 2px;
+}
+
+.recv-header .status-dot {
+  width: 10px;
+  height: 10px;
+}
+
+.root-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1.5px solid var(--border-glass);
+  border-radius: 12px;
+  background: var(--chip-bg);
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 var(--row-highlight);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  transition: border-color 0.25s ease, background 0.25s ease, box-shadow 0.25s ease, transform 0.2s var(--ease-spring);
+}
+
+.root-row:hover {
+  border-color: var(--accent);
+}
+
+.root-row.checked {
+  border-color: var(--accent);
+  background: linear-gradient(135deg, rgba(13, 148, 136, 0.14), rgba(13, 148, 136, 0.06));
+  box-shadow: inset 0 1px 0 var(--row-highlight), 0 0 0 3px rgba(13, 148, 136, 0.12);
+}
+
+html.dark .root-row.checked {
+  background: linear-gradient(135deg, rgba(45, 212, 191, 0.22), rgba(45, 212, 191, 0.08));
+}
+
+.root-check {
+  font-size: 16px;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.root-row.checked .root-check {
+  color: var(--accent);
+  transform: scale(1.15);
+}
+
+.root-name {
+  flex: 1;
+  font-size: 14px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.synced-hint {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.drop-zone {
+  border: 1.5px dashed var(--border-glass);
+  border-radius: 12px;
+  padding: 14px 12px;
+  text-align: center;
+  cursor: pointer;
+  color: var(--text-tertiary);
+  font-size: 13px;
+  font-weight: 600;
+  transition: border-color 0.25s ease, color 0.25s ease, background 0.25s ease;
+  margin-top: 6px;
+}
+
+.drop-zone:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ---------- 接收状态（收件中行内提示） ---------- */
+
+/* ---------- 进度 ---------- */
+.progress-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 2px;
+}
+
+.progress-track {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--progress-track);
+  overflow: hidden;
+  margin: 9px 0;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), #2dd4bf);
+  box-shadow: 0 0 12px rgba(13, 148, 136, 0.5);
+  transform-origin: left;
+  will-change: transform; /* 高频动画，仅此一处，不全局铺开 */
+  transition: transform 0.4s var(--ease-spring);
+}
+
+/* 不确定进度：用 transform 位移代替 margin（避免 Layout） */
+.progress-fill.indeterminate {
+  width: 40%;
+  animation: indeterminate-slide 1.4s var(--ease-spring) infinite;
+}
+
+@keyframes indeterminate-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+
+.percent-num {
+  font-size: 20px;
+  font-weight: 800;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 0 12px var(--accent-soft);
+}
+
+/* 任务失败原因行（小号、可换行、不与统计行混淆） */
+.task-error {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+  word-break: break-all;
+}
+
+.fade-slide-enter-active,
+.fade-slide-leave-active {
+  transition: opacity 0.3s ease, transform 0.3s var(--ease-spring);
+}
+
+.fade-slide-enter-from {
+  opacity: 0;
+  transform: translateY(14px);
+}
+
+.fade-slide-leave-to {
+  opacity: 0;
+  transform: translateY(-10px);
+}
+
+/* ---------- 背景光晕：预模糊的 radial-gradient（无 filter，避免 blur(90px) 逐帧重过滤） ---------- */
+.glow-blob {
+  position: fixed;
+  border-radius: 50%;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.glow-blob-1 {
+  width: 440px;
+  height: 440px;
+  background: radial-gradient(circle, var(--glow-1), transparent 70%);
+  top: -120px;
+  left: -120px;
+}
+
+.glow-blob-2 {
+  width: 400px;
+  height: 400px;
+  background: radial-gradient(circle, var(--glow-2), transparent 70%);
+  bottom: -140px;
+  right: -100px;
+}
+
+/* ---------- 调试 ---------- */
+.log-has-error strong {
+  color: #d93b2b;
+}
+
+html.dark .log-has-error strong {
+  color: #ff6961;
+}
+
+/* ---------- 配对行按钮组 ---------- */
+.btn-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* ---------- 历史页 ---------- */
+.history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+/* 记录分组（近1天/近7天/近30天/更早），折叠展开带动画（.panel-collapse） */
+.hist-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.hist-group {
+  border: 1px solid var(--border-glass);
+  border-radius: 12px;
+  background: var(--chip-bg);
+  box-shadow: inset 0 1px 0 var(--row-highlight);
+}
+
+.hist-group-head {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 14px;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 14px;
+}
+
+.hist-group-head strong {
+  font-weight: 650;
+}
+
+.hist-caret {
+  color: var(--text-tertiary);
+  font-size: 14px;
+  transition: transform 0.35s var(--ease-glass, var(--ease-spring));
+}
+
+.hist-caret.open {
+  transform: rotate(180deg);
+}
+
+/* 记录明细层级：方向=主色，文件数+大小=主信息（继承 strong），速率/时间=次信息 */
+.hist-dir {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.hist-sub {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+/* 分组内左右留出间距，内行不再贴边 */
+.hist-group .panel-collapse-inner {
+  padding: 0 10px 10px;
+}
+
+/* 日志统计：错误红 / 警告黄 */
+.stat-error {
+  color: #d93b2b;
+}
+
+html.dark .stat-error {
+  color: #ff6961;
+}
+
+.stat-warn {
+  color: #c78a00;
+}
+
+html.dark .stat-warn {
+  color: #ffd60a;
+}
+
+/* 关于卡：开发者信息 */
+.about-dev {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-glass);
+  border-radius: 16px;
+  background: var(--chip-bg);
+  box-shadow: inset 0 1px 0 var(--row-highlight);
+}
+
+.dev-avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}
+
+.dev-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.dev-info strong {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.dev-info a {
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.dev-info a:hover {
+  text-decoration: underline;
+}
+
+/* 下拉面板圆角与卡片体系统一（18 档） */
+.dd-panel {
+  border-radius: 18px;
+}
+
+/* ---------- 自定义下拉（目标设备） ---------- */
+.dd {
+  position: relative;
+}
+
+.dd-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  margin-bottom: 0;
+}
+
+.dd-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dd-caret {
+  color: var(--text-tertiary);
+  font-size: 12px;
+  flex-shrink: 0;
+  transition: transform 0.25s var(--ease-spring);
+}
+
+.dd.open .dd-caret {
+  transform: rotate(180deg);
+}
+
+.dd-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  border-radius: 18px; /* 玻璃材质（伪元素配方）在 liquid.css，此处只管定位；
+     描边由配方 ::after 的 1px 内高光承担，不再叠灰边框（elevation 只声明一次） */
+}
+
+/* Dock 面板内连接码：整格可点复制 */
+.code-kv {
+  cursor: pointer;
+  transition: background 0.25s ease;
+}
+
+.code-kv:hover {
+  background: var(--lg-tint-strong);
+}
+
+/* 悬浮滚动条让位给标题栏（liquid.css 默认 30px 为无标题栏布局） */
+html .gscroll {
+  top: 58px;
+}
+
+.dd-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.dd-item:hover {
+  background: var(--accent-soft);
+}
+
+.dd-name {
+  flex: 1;
+  font-size: 14px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dd-status {
+  font-size: 12px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.dd-empty {
+  padding: 14px 12px;
+  font-size: 13px;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+
+.dd-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: transparent;
+}
+
+/* ---------- 日志预览 ---------- */
+.log-preview {
+  margin-top: 10px;
+  border: 1px solid var(--border-glass);
+  border-radius: 12px;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.log-preview-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-glass);
+}
+
+.log-preview-head .muted {
+  flex: 1;
+}
+
+.log-preview-body {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 280px;
+  overflow-y: auto;
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* ---------- 收件 / 连接确认弹窗（卡片材质在 liquid.css） ---------- */
+.incoming-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  padding: 20px;
+}
+
+.incoming-card h3 {
+  margin-bottom: 6px;
+}
+
+/* ---------- 无障碍：动效减弱 ---------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
+/* ---------- 无障碍：透明度减弱（玻璃降实底，材质配方降级在 liquid.css） ---------- */
+@media (prefers-reduced-transparency: reduce) {
+  .toast,
+  .device-item,
+  .paired-row,
+  .root-row,
+  .win-btn,
+  .glass-input,
+  .scanner-status {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+
+  .toast {
+    background: var(--card-bg);
+  }
+
+  .incoming-overlay {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+}

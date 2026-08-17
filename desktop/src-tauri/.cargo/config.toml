@@ -1,0 +1,6 @@
+# x86-64-v2 指令集基线（SSE4.2 / POPCNT / CMPXCHG16B）：
+# 覆盖 2009 年后全部 x86_64 CPU，不牺牲兼容性；
+# 让 memcpy/memcmp/serde/哈希等热路径充分内联向量化（ring 的 AES-NI/SHA 本就运行时分发，不受影响）。
+# 注意：RUSTFLAGS 环境变量会整体覆盖此处 rustflags。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v2"]

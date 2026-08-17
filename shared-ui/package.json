@@ -1,0 +1,17 @@
+{
+  "name": "shared-ui",
+  "version": "0.1.0",
+  "description": "局域网备份工具共享 UI（Liquid Glass 液态玻璃组件，源自 aslanon/liquid-glass-vue，MIT）",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "peerDependencies": {
+    "vue": "^3.4.0"
+  }
+}

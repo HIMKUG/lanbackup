@@ -1,0 +1,31 @@
+{
+  "name": "backup-mobile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "cap:sync": "cap sync",
+    "cap:android": "cap open android"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.0.0",
+    "@capacitor/core": "^6.0.0",
+    "@capacitor/filesystem": "^6.0.0",
+    "@capacitor/network": "^6.0.0",
+    "gsap": "^3.15.0",
+    "local-receiver": "file:./local-receiver",
+    "shared-core": "file:../shared-core",
+    "shared-ui": "file:../shared-ui",
+    "vue": "^3.4.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.0.0",
+    "@vitejs/plugin-vue": "^5.0.0",
+    "typescript": "^5.5.0",
+    "vite": "^5.0.0",
+    "vue-tsc": "^2.0.0"
+  }
+}

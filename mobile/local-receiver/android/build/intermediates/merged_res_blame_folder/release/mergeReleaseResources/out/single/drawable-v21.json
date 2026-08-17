@@ -1,0 +1,26 @@
+[
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/drawable-v21/abc_dialog_material_background.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-appcompat-1.6.1-8:/drawable-v21/abc_dialog_material_background.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/drawable-v21/notification_action_background.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-core-1.12.0-6:/drawable-v21/notification_action_background.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/drawable-v21/abc_list_divider_material.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-appcompat-1.6.1-8:/drawable-v21/abc_list_divider_material.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/drawable-v21/abc_btn_colored_material.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-appcompat-1.6.1-8:/drawable-v21/abc_btn_colored_material.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/drawable-v21/abc_action_bar_item_background_material.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-appcompat-1.6.1-8:/drawable-v21/abc_action_bar_item_background_material.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/drawable-v21/abc_edit_text_material.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-appcompat-1.6.1-8:/drawable-v21/abc_edit_text_material.xml"
+    }
+]

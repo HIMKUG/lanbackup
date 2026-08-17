@@ -1,0 +1,26 @@
+[
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/drawable-anydpi-v21/ic_call_answer_video.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-core-1.12.0-6:/drawable-anydpi-v21/ic_call_answer_video.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/drawable-anydpi-v21/ic_call_decline.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-core-1.12.0-6:/drawable-anydpi-v21/ic_call_decline.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/drawable-anydpi-v21/ic_call_answer_low.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-core-1.12.0-6:/drawable-anydpi-v21/ic_call_answer_low.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/drawable-anydpi-v21/ic_call_answer_video_low.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-core-1.12.0-6:/drawable-anydpi-v21/ic_call_answer_video_low.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/drawable-anydpi-v21/ic_call_decline_low.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-core-1.12.0-6:/drawable-anydpi-v21/ic_call_decline_low.xml"
+    },
+    {
+        "merged": "com.backup.mobile.receiver.local-receiver-release-24:/drawable-anydpi-v21/ic_call_answer.xml",
+        "source": "com.backup.mobile.receiver.local-receiver-core-1.12.0-6:/drawable-anydpi-v21/ic_call_answer.xml"
+    }
+]

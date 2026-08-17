@@ -1,0 +1,1281 @@
+/* ============================================================
+   Liquid Glass 材质系统 — 照搬 lucasromerodb/liquid-glass-effect-macos
+   （D:\code\tools\docs\毛玻璃图标 示例，结构与参数未改动）
+   核心四层：effect(backdrop 模糊 + SVG 折射) / tint(半透明着色) /
+            shine(内阴影镜面高光) / text(内容)
+   · 卡片（LiquidGlass.vue）直接使用四层 DOM 结构
+   · 按钮/分段/开关/Dock 气泡/弹窗用 ::before(effect) + ::after(tint+shine)
+     伪元素实现同一配方（z-index:-1，不打扰内容层）
+   · 折射滤镜 #glass-distortion 由 GlassFilters.vue 全局提供
+   着色量动态规则（滚动边缘效果）：
+   · 滚动中 / 离开顶部 → --lg-tint 增强为 --lg-tint-strong，文字始终可辨
+   ============================================================ */
+
+:root {
+  /* 示例原值：rgba(255,255,255,0.25) 的半透明着色 */
+  --lg-tint: rgba(255, 255, 255, 0.25);
+  --lg-tint-strong: rgba(255, 255, 255, 0.5);
+  --lg-solid: rgba(246, 247, 250, 0.94); /* 无 backdrop-filter 时的实色降级 */
+  --lg-card-shadow: 0 6px 6px rgba(0, 0, 0, 0.2), 0 0 20px rgba(0, 0, 0, 0.1); /* 示例原值 */
+  --lg-ctl-shadow: 0 6px 6px rgba(0, 0, 0, 0.18), 0 0 20px rgba(0, 0, 0, 0.1);
+  --ease-glass: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+  /* Dock 悬浮气泡（圆角与窗口圆角同心） */
+  --dock-max: 620px;
+  --dock-inset: 10px;
+  --dock-radius: 26px;
+  --dock-gap: 10px;
+}
+
+html.dark {
+  --lg-tint: rgba(28, 30, 38, 0.42);
+  --lg-tint-strong: rgba(24, 26, 34, 0.62);
+  --lg-solid: rgba(24, 25, 30, 0.96);
+  --lg-card-shadow: 0 6px 6px rgba(0, 0, 0, 0.4), 0 0 20px rgba(0, 0, 0, 0.3);
+  --lg-ctl-shadow: 0 6px 6px rgba(0, 0, 0, 0.38), 0 0 20px rgba(0, 0, 0, 0.28);
+}
+
+/* ---------- 滚动边缘效果（GlassDock 监听滚动给 <html> 打标） ---------- */
+html.lg-is-scrolling,
+html.lg-is-scrolled {
+  --lg-tint: var(--lg-tint-strong);
+}
+
+html.lg-is-scrolled {
+  --lg-card-shadow: 0 12px 22px rgba(0, 0, 0, 0.26), 0 0 32px rgba(0, 0, 0, 0.16);
+}
+
+/* ============================================================
+   一、卡片四层（LiquidGlass.vue 内部结构，规则照搬示例 styles.css）
+   ============================================================ */
+.liquidGlass-wrapper {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  color: var(--text-primary, #1d1d1f);
+  box-shadow: var(--lg-card-shadow);
+  transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 2.2); /* 示例原曲线 */
+}
+
+/* 卡片模糊底：canvas 按 3/5fps 采样视频帧（壁纸本身全帧率，不锁帧） */
+.liquidGlass-blur {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+html.quality-low .liquidGlass-blur {
+  display: none; /* 低档无玻璃 */
+}
+
+.liquidGlass-tint {
+  z-index: 1;
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--lg-tint); /* 示例原值 rgba(255,255,255,0.25)，随滚动动态增强 */
+  transition: background 0.3s ease;
+}
+
+.liquidGlass-shine {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: inherit; /* 白边沿圆角渲染，四角同样有辉光 */
+  overflow: hidden;
+  /* 均匀一周的镜面高光（四角同样有高光，不再只亮两个角） */
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.4), inset 0 2px 10px rgba(255, 255, 255, 0.16);
+}
+
+.liquidGlass-text {
+  position: relative;
+  z-index: 3;
+}
+
+/* ============================================================
+   二、控件伪元素配方（按钮/分段/开关/Dock/弹窗与卡片同一材质）
+   ::before = effect（模糊+折射）；::after = tint + shine
+   ============================================================ */
+.glass-btn,
+.glass-chip,
+.dock-bubble,
+.dock-panel,
+.incoming-card,
+.gmodal,
+.gswitch,
+.gseg {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  background: transparent;
+  box-shadow: var(--lg-ctl-shadow);
+}
+
+.glass-btn::before,
+.glass-chip::before,
+.dock-bubble::before,
+.dock-panel::before,
+.incoming-card::before,
+.gmodal::before,
+.gswitch::before,
+.gseg::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  border-radius: inherit;
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+
+/* 选择性折射：大表面（Dock/弹窗）保留 SVG 折射；小控件（按钮/分段/开关）只磨砂不折射，
+   视觉损耗 <10%，折射滤镜实例数减半（高档优化①） */
+.dock-bubble::before,
+.dock-panel::before,
+.incoming-card::before,
+.gmodal::before {
+  filter: url(#glass-distortion);
+}
+
+.glass-btn::after,
+.glass-chip::after,
+.dock-bubble::after,
+.dock-panel::after,
+.incoming-card::after,
+.gmodal::after,
+.gswitch::after,
+.gseg::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--lg-tint);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.4), inset 0 2px 10px rgba(255, 255, 255, 0.16);
+  transition: background 0.3s ease;
+}
+
+html.dark .glass-btn::after,
+html.dark .glass-chip::after,
+html.dark .dock-bubble::after,
+html.dark .dock-panel::after,
+html.dark .incoming-card::after,
+html.dark .gmodal::after,
+html.dark .gswitch::after,
+html.dark .gseg::after {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16), inset 0 2px 10px rgba(255, 255, 255, 0.08);
+}
+
+/* 行内按钮不吃 stacked 按钮的 margin-top（避免行高不齐） */
+.row > .glass-btn.primary,
+.row > .glass-btn.danger,
+.row > .execute-btn {
+  margin-top: 0;
+}
+
+/* ---------- 按钮 ---------- */
+.glass-btn {
+  width: 100%;
+  padding: 11px 16px;
+  border: none;
+  border-radius: 999px;
+  color: var(--text-primary, #1d1d1f);
+  font-size: 14px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition:
+    transform 0.5s var(--ease-bounce),
+    box-shadow 0.3s var(--ease-glass),
+    opacity 0.2s ease;
+}
+
+/* 悬浮呼吸动画由 useGlowHover（GSAP 事件委托）统一驱动；
+   被管理的元素禁用 CSS 过渡，防止两套动画打架 */
+.glow-hover-mgr {
+  transition: none !important;
+}
+
+/* 按下 = 弹性玻璃：快速压扁，松手 spring 回弹 */
+.glass-btn:active:not(:disabled),
+.glass-chip:active {
+  transform: scale(0.94);
+  transition-duration: 0.1s;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.16);
+}
+
+.glass-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.glass-btn.primary,
+.glass-btn.danger,
+.execute-btn {
+  margin-top: 12px;
+}
+
+/* 着色玻璃：染系统色但仍透光 */
+.glass-btn.primary::after {
+  background: linear-gradient(135deg, rgba(13, 148, 136, 0.55), rgba(15, 118, 110, 0.42));
+}
+
+.glass-btn.primary {
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
+}
+
+html.dark .glass-btn.primary::after {
+  background: linear-gradient(135deg, rgba(45, 212, 191, 0.5), rgba(20, 184, 166, 0.38));
+}
+
+.glass-btn.danger::after {
+  background: linear-gradient(135deg, rgba(255, 69, 58, 0.5), rgba(255, 69, 58, 0.32));
+}
+
+.glass-btn.danger {
+  color: #d93b2b;
+  text-shadow: none;
+}
+
+html.dark .glass-btn.danger {
+  color: #ff6961;
+}
+
+.execute-btn.ready::after {
+  background: linear-gradient(135deg, rgba(52, 199, 89, 0.55), rgba(40, 167, 69, 0.4));
+}
+
+.execute-btn.ready {
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+
+.glass-btn.small {
+  width: auto;
+  padding: 6px 14px;
+  font-size: 13px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1.4;
+  margin-top: 0;
+}
+
+/* ---------- 分段 chips（角色多选等） ---------- */
+.glass-chip {
+  flex: 1;
+  padding: 9px 12px;
+  border: none;
+  border-radius: 999px;
+  color: var(--text-secondary, rgba(29, 29, 31, 0.62));
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+  box-shadow: var(--lg-ctl-shadow);
+  transition:
+    transform 0.4s var(--ease-bounce),
+    box-shadow 0.3s var(--ease-glass),
+    color 0.25s ease;
+}
+
+.glass-chip.on::after {
+  background: linear-gradient(135deg, rgba(13, 148, 136, 0.6), rgba(13, 148, 136, 0.38));
+}
+
+html.dark .glass-chip.on::after {
+  background: linear-gradient(135deg, rgba(45, 212, 191, 0.55), rgba(20, 184, 166, 0.38));
+}
+
+.glass-chip.on {
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+
+/* ============================================================
+   三、胶囊分段选择（GlassSeg）：大胶囊 + 竖分割线 + 滑动玻璃气泡
+   ============================================================ */
+.gseg {
+  display: flex;
+  padding: 4px;
+  border-radius: 999px;
+}
+
+.gseg-item {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  z-index: 1;
+  padding: 8px 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary, rgba(29, 29, 31, 0.62));
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: color 0.3s ease, transform 0.4s var(--ease-bounce);
+}
+
+.gseg-item.active {
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+
+.gseg-item:active {
+  transform: scale(0.95);
+  transition-duration: 0.1s;
+}
+
+/* 玻璃气泡滑块：默认停左半，选中右侧时平滑滑过去 */
+.gseg-glider {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  left: 4px;
+  width: calc(50% - 6px);
+  border-radius: 999px;
+  background: linear-gradient(135deg, rgba(13, 148, 136, 0.62), rgba(13, 148, 136, 0.4));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 3px 10px rgba(13, 148, 136, 0.3);
+  transition: transform 0.45s var(--ease-glass);
+  will-change: transform;
+}
+
+html.dark .gseg-glider {
+  background: linear-gradient(135deg, rgba(45, 212, 191, 0.58), rgba(20, 184, 166, 0.4));
+}
+
+.gseg.pos-1 .gseg-glider {
+  transform: translateX(100%);
+}
+
+/* 竖分割线位置由组件内联样式决定（动态 N 档） */
+.gseg-divider {
+  position: absolute;
+  top: 24%;
+  bottom: 24%;
+  width: 1px;
+  background: var(--border-glass, rgba(0, 0, 0, 0.09));
+}
+
+/* ============================================================
+   四、类苹果开关（GlassSwitch）
+   ============================================================ */
+.gswitch {
+  width: 52px;
+  height: 31px;
+  border: none;
+  border-radius: 999px;
+  padding: 0;
+  cursor: pointer;
+  touch-action: manipulation;
+  flex-shrink: 0;
+}
+
+.gswitch::after {
+  background: var(--lg-tint-strong);
+}
+
+.gswitch.on::after {
+  background: linear-gradient(135deg, rgba(52, 199, 89, 0.72), rgba(40, 167, 69, 0.55));
+}
+
+.gswitch-knob {
+  position: absolute;
+  z-index: 1;
+  top: 3px;
+  left: 3px;
+  width: 25px;
+  height: 25px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.95);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  transition: transform 0.45s var(--ease-bounce);
+}
+
+.gswitch.on .gswitch-knob {
+  transform: translateX(21px);
+}
+
+/* ============================================================
+   五、8 格连接码 / 4 段 IP 输入
+   ============================================================ */
+.codeboxes {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.codebox {
+  flex: 1;
+  min-width: 0;
+  height: 42px;
+  text-align: center;
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 17px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--text-primary, #1d1d1f);
+  background: rgba(255, 255, 255, 0.3);
+  border: 1px solid var(--border-glass, rgba(0, 0, 0, 0.09));
+  border-radius: 10px;
+  outline: none;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+html.dark .codebox {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.codebox:focus {
+  border-color: var(--accent, #0d9488);
+  box-shadow: 0 0 0 3px rgba(13, 148, 136, 0.18);
+}
+
+.ipboxes {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.ipbox {
+  flex: 1;
+  min-width: 0;
+  height: 42px;
+  text-align: center;
+  font-size: 15px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary, #1d1d1f);
+  background: rgba(255, 255, 255, 0.3);
+  border: 1px solid var(--border-glass, rgba(0, 0, 0, 0.09));
+  border-radius: 10px;
+  outline: none;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+html.dark .ipbox {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.ipbox:focus {
+  border-color: var(--accent, #0d9488);
+  box-shadow: 0 0 0 3px rgba(13, 148, 136, 0.18);
+}
+
+.ipbox-dot {
+  font-size: 18px;
+  font-weight: 800;
+  color: var(--text-tertiary, rgba(29, 29, 31, 0.45));
+  flex-shrink: 0;
+  user-select: none;
+}
+
+/* ============================================================
+   六、二级确认弹窗（GlassModal）
+   ============================================================ */
+.gmodal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.gmodal {
+  width: 100%;
+  max-width: 330px;
+  padding: 18px 16px;
+  box-shadow: var(--lg-card-shadow), 0 16px 48px rgba(0, 0, 0, 0.3);
+}
+
+.gmodal-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary, #1d1d1f);
+  margin-bottom: 6px;
+}
+
+.gmodal-msg {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-secondary, rgba(29, 29, 31, 0.62));
+  margin-bottom: 12px;
+}
+
+.gmodal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* 弹窗弹性入场 */
+.modal-pop-enter-active,
+.modal-pop-leave-active {
+  transition: opacity 0.25s ease;
+}
+
+.modal-pop-enter-active .gmodal {
+  transition: transform 0.45s var(--ease-bounce);
+}
+
+.modal-pop-enter-from,
+.modal-pop-leave-to {
+  opacity: 0;
+}
+
+.modal-pop-enter-from .gmodal {
+  transform: scale(0.88) translateY(12px);
+}
+
+/* ============================================================
+   七、底部 Dock（悬浮多气泡 + 滑动指示器 + 展开面板）
+   ============================================================ */
+.dock {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: calc(var(--dock-inset) + env(safe-area-inset-bottom, 0px));
+  margin: 0 auto;
+  width: min(var(--dock-max), calc(100% - var(--dock-inset) * 2));
+  z-index: 120;
+  transition: width 0.45s var(--ease-glass);
+}
+
+.dock.is-collapsed {
+  width: min(calc(var(--dock-max) * 0.58), calc(100% - var(--dock-inset) * 2));
+}
+
+/* 展开态压暗 + 主页面模糊 */
+.dock-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(4, 8, 16, 0.24);
+  backdrop-filter: blur(12px) saturate(120%);
+  -webkit-backdrop-filter: blur(12px) saturate(120%);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.35s ease;
+}
+
+.dock.is-expanded .dock-backdrop {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* 展开面板：向上生长，材质随形变大而变厚 */
+.dock-panel-wrap {
+  position: absolute;
+  bottom: calc(100% + var(--dock-gap));
+  left: 0;
+  right: 0;
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(10px) scale(0.97);
+  transform-origin: 50% 100%;
+  transition:
+    grid-template-rows 0.5s var(--ease-glass),
+    opacity 0.3s ease,
+    transform 0.5s var(--ease-bounce),
+    visibility 0s linear 0.5s;
+}
+
+.dock.is-expanded .dock-panel-wrap {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateY(0) scale(1);
+  transition-delay: 0s;
+}
+
+.dock-panel {
+  min-height: 0;
+  overflow: hidden;
+  border-radius: var(--dock-radius);
+  box-shadow: var(--lg-card-shadow), 0 24px 64px rgba(6, 10, 18, 0.32);
+}
+
+.dock-panel-inner {
+  position: relative;
+  padding: 18px;
+  max-height: calc(100dvh - 200px);
+  overflow-y: auto;
+}
+
+/* ---------- 气泡行 ---------- */
+.dock-row {
+  display: flex;
+  gap: var(--dock-gap);
+  align-items: stretch;
+}
+
+.dock-bubble {
+  border-radius: var(--dock-radius);
+  transition:
+    transform 0.45s var(--ease-bounce),
+    box-shadow 0.35s var(--ease-glass);
+}
+
+/* 动态着色：滚动离开顶部 / 展开态 → 着色增强保证可辨度 */
+.dock.is-scrolled .dock-bubble,
+.dock.is-expanded .dock-bubble {
+  --lg-tint: var(--lg-tint-strong);
+}
+
+/* 气泡一：导航 */
+.dock-nav {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  gap: 4px;
+  padding: 6px;
+}
+
+/* 页签指示器：激活底色随页签平滑滑动 */
+.dock-tab-glider {
+  position: absolute;
+  left: 0;
+  top: 6px;
+  height: calc(100% - 12px);
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(13, 148, 136, 0.82), rgba(13, 148, 136, 0.55));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.32), 0 4px 14px rgba(13, 148, 136, 0.32);
+  transition:
+    transform 0.5s var(--ease-glass),
+    width 0.5s var(--ease-glass),
+    opacity 0.2s ease;
+  will-change: transform;
+  opacity: 0;
+}
+
+html.dark .dock-tab-glider {
+  background: linear-gradient(135deg, rgba(45, 212, 191, 0.78), rgba(20, 184, 166, 0.55));
+}
+
+.dock-tab {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 7px 0 6px;
+  border: none;
+  border-radius: 18px;
+  background: transparent;
+  color: var(--text-tertiary, rgba(29, 29, 31, 0.45));
+  font-family: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: color 0.3s ease, transform 0.45s var(--ease-bounce);
+}
+
+.dock-tab .tab-icon {
+  font-size: 19px;
+  line-height: 1;
+  transition: transform 0.4s var(--ease-bounce);
+}
+
+.dock-tab .tab-label {
+  height: 14px;
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 0.3s ease, transform 0.35s var(--ease-glass), height 0.4s var(--ease-glass);
+}
+
+.dock-tab.active {
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
+}
+
+.dock-tab:active {
+  transform: scale(0.92);
+  transition-duration: 0.1s;
+}
+
+/* 收缩态：标签高度收没（图标随之下移实现垂直居中）、图标放大更醒目；
+   布局高度随 label 高度平滑过渡，无瞬跳 */
+.dock.is-collapsed .dock-tab {
+  padding: 8px 0 7px;
+}
+
+.dock.is-collapsed .tab-label {
+  height: 0;
+  opacity: 0;
+  transform: translateY(4px);
+}
+
+.dock.is-collapsed .dock-tab .tab-icon {
+  transform: scale(1.32);
+}
+
+/* 气泡二：状态 / 展开触发 */
+.dock-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 0 14px 0 13px;
+  border: none;
+  font-family: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+  color: var(--text-primary, #1d1d1f);
+  max-width: 46%;
+  transition:
+    transform 0.45s var(--ease-bounce),
+    box-shadow 0.35s var(--ease-glass),
+    padding 0.45s var(--ease-glass),
+    gap 0.45s var(--ease-glass),
+    border-radius 0.45s var(--ease-glass);
+}
+
+.dock-status-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  min-width: 0;
+  max-width: 150px;
+  overflow: hidden;
+  opacity: 1;
+  transition: max-width 0.4s var(--ease-glass), opacity 0.25s ease;
+}
+
+.dock-status-text strong {
+  font-size: 12.5px;
+  font-weight: 700;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dock-status-text small {
+  font-size: 10.5px;
+  color: var(--text-secondary, rgba(29, 29, 31, 0.62));
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dock.is-collapsed .dock-status-text {
+  max-width: 0;
+  opacity: 0;
+}
+
+/* 收缩态：状态气泡收成正圆（仅呼吸灯居中），箭头收没；gap/padding/radius 同步平滑过渡 */
+.dock.is-collapsed .dock-status {
+  gap: 0;
+  padding: 0 17px;
+  border-radius: 50%;
+  justify-content: center;
+}
+
+.dock.is-collapsed .dock-caret {
+  width: 0;
+  opacity: 0;
+}
+
+.dock-status:active {
+  transform: scale(0.97);
+  transition-duration: 0.1s;
+}
+
+.dock-caret {
+  color: var(--text-tertiary, rgba(29, 29, 31, 0.45));
+  font-size: 13px;
+  width: 13px;
+  overflow: hidden;
+  flex-shrink: 0;
+  transition: transform 0.4s var(--ease-glass), width 0.4s var(--ease-glass), opacity 0.25s ease;
+}
+
+.dock.is-expanded .dock-caret {
+  transform: rotate(180deg);
+}
+
+/* ---------- Dock 展开面板内容 ---------- */
+.dock-panel-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary, #1d1d1f);
+  margin-bottom: 10px;
+}
+
+.dock-panel-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.dock-kv {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  padding: 9px 11px;
+  border-radius: 14px;
+  border: 1px solid var(--border-glass, rgba(0, 0, 0, 0.09));
+  background: var(--lg-tint);
+}
+
+.dock-kv span {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-tertiary, rgba(29, 29, 31, 0.45));
+}
+
+.dock-kv strong {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary, #1d1d1f);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dock-panel-sync {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-glass, rgba(0, 0, 0, 0.09));
+  font-size: 12px;
+  color: var(--text-secondary, rgba(29, 29, 31, 0.62));
+}
+
+/* ============================================================
+   八、弹窗卡片（收件/连接确认，材质同配方）
+   ============================================================ */
+.incoming-card {
+  width: 100%;
+  max-width: 340px;
+  padding: 18px 16px;
+  border-radius: var(--dock-radius, 26px);
+  box-shadow: var(--lg-card-shadow), 0 16px 48px rgba(0, 0, 0, 0.3);
+}
+
+.gmodal {
+  border-radius: var(--dock-radius, 26px);
+}
+
+/* ---------- Dock 面板内的可见性行 ---------- */
+.dock-visibility {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 16px;
+  border: 1px solid var(--border-glass, rgba(0, 0, 0, 0.09));
+  background: var(--lg-tint);
+}
+
+.dock-visibility-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.dock-visibility-info strong {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary, #1d1d1f);
+}
+
+.dock-visibility-info small {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-secondary, rgba(29, 29, 31, 0.62));
+}
+
+/* ---------- TransitionGroup：列表项新增/移除/重排的平滑动画 ---------- */
+.lg-list-move {
+  transition: transform 0.55s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.lg-list-enter-active {
+  animation: lg-list-in 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes lg-list-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* 离场交给 JS（烟雾 + 高度收拢）：元素保持在文档流里，
+   高度动画驱动兄弟项连续上移（不用 absolute，避免定位漂移与瞬移） */
+.lg-list-leave-active {
+  transition: none !important;
+}
+
+/* ---------- 下拉从上向下展开 ---------- */
+.drop-down-enter-active {
+  transition: opacity 0.25s ease, transform 0.3s var(--ease-glass);
+}
+
+.drop-down-leave-active {
+  transition: opacity 0.18s ease, transform 0.2s ease;
+}
+
+.drop-down-enter-from {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+.drop-down-leave-to {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+
+/* ---------- 记录删除：灰烟消散（文字先隐，整框化作灰烟随风飘散） ---------- */
+.smoke-puff {
+  position: fixed;
+  border-radius: 50%;
+  pointer-events: none;
+  /* 理论顶层：不设 filter（独立合成层会被 Chromium 的 backdrop-filter 背景捕获吞进下方玻璃），
+     柔和度直接烘进渐变，保证永远在玻璃之上 */
+  z-index: 2147483000;
+  background: radial-gradient(circle, rgba(158, 164, 174, 0.5), rgba(158, 164, 174, 0.28) 45%, rgba(158, 164, 174, 0) 68%);
+}
+
+/* ============================================================
+   九、滚动条：主页面隐藏原生滚动条（GlassScrollbar 自绘悬浮滚动条接管），
+   内部小滚动区用细圆角苹果风样式
+   ============================================================ */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(125, 135, 150, 0.4);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(125, 135, 150, 0.65);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+html.dark ::-webkit-scrollbar-thumb {
+  background: rgba(200, 210, 225, 0.28);
+}
+
+html.dark ::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(200, 210, 225, 0.45);
+}
+
+/* 主页面（window）隐藏原生滚动条：不占布局、不挤页面 */
+html {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+html::-webkit-scrollbar,
+body::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+/* ---------- 自绘悬浮滚动条（GlassScrollbar） ---------- */
+.gscroll {
+  position: fixed;
+  top: 30px; /* 避开窗口顶部圆角 */
+  bottom: 96px; /* 避开底部圆角与 Dock */
+  right: 3px;
+  width: 6px;
+  z-index: 250;
+  pointer-events: none;
+}
+
+.gscroll-thumb {
+  width: 6px;
+  border-radius: 999px;
+  background: rgba(125, 135, 150, 0.5);
+  pointer-events: auto;
+  cursor: pointer;
+  opacity: 0.85;
+  transition: background 0.2s ease;
+}
+
+.gscroll-thumb:hover,
+.gscroll.dragging .gscroll-thumb {
+  background: rgba(125, 135, 150, 0.8);
+}
+
+html.dark .gscroll-thumb {
+  background: rgba(200, 210, 225, 0.35);
+}
+
+html.dark .gscroll-thumb:hover,
+html.dark .gscroll.dragging .gscroll-thumb {
+  background: rgba(200, 210, 225, 0.55);
+}
+
+/* ============================================================
+   十、画面质量降级：
+   · 低：清空所有液态玻璃效果，仅保留 20% 白半透明（无折射/无 blur/无高光）
+   · 中：保留半透明与 blur，去掉重折射（SVG distortion）与高光（预留，待细化）
+   ============================================================ */
+html.quality-low .glass-btn::before,
+html.quality-low .glass-chip::before,
+html.quality-low .dock-bubble::before,
+html.quality-low .dock-panel::before,
+html.quality-low .incoming-card::before,
+html.quality-low .gmodal::before,
+html.quality-low .gswitch::before,
+html.quality-low .gseg::before,
+html.quality-low .glass__warp {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  filter: none !important;
+}
+
+html.quality-low .liquidGlass-shine,
+html.quality-low .glass-btn::after,
+html.quality-low .glass-chip::after,
+html.quality-low .dock-bubble::after,
+html.quality-low .dock-panel::after,
+html.quality-low .incoming-card::after,
+html.quality-low .gmodal::after,
+html.quality-low .gswitch::after,
+html.quality-low .gseg::after {
+  background: rgba(255, 255, 255, 0.2) !important;
+  box-shadow: none !important;
+}
+
+html.quality-low .liquidGlass-shine,
+html.quality-low .glass-btn::after,
+html.quality-low .glass-chip::after {
+  background: rgba(255, 255, 255, 0.2) !important;
+  box-shadow: none !important;
+}
+
+html.quality-low .liquidGlass-wrapper,
+html.quality-low .glass-btn,
+html.quality-low .glass-chip,
+html.quality-low .dock-bubble,
+html.quality-low .dock-panel,
+html.quality-low .incoming-card,
+html.quality-low .gmodal,
+html.quality-low .gswitch,
+html.quality-low .gseg {
+  box-shadow: none !important;
+}
+
+html.quality-low .gseg-glider,
+html.quality-low .dock-tab-glider {
+  opacity: 0.85; /* 低质量下颜色滑块仍可辨，但不带发光 */
+}
+
+/* 低质量深色模式：20% 白底在深色下提亮文字，改用深色半透明保证可读 */
+html.dark.quality-low .liquidGlass-tint,
+html.dark.quality-low .glass-btn::after,
+html.dark.quality-low .glass-chip::after,
+html.dark.quality-low .dock-bubble::after,
+html.dark.quality-low .dock-panel::after,
+html.dark.quality-low .incoming-card::after,
+html.dark.quality-low .gmodal::after,
+html.dark.quality-low .gswitch::after,
+html.dark.quality-low .gseg::after {
+  background: rgba(28, 30, 38, 0.2) !important;
+}
+
+/* 中档：保留半透明+blur+（已降采样的）折射，仅去除行级重复模糊（见下） */
+html.quality-medium .paired-row,
+html.quality-medium .device-item,
+html.quality-medium .root-row,
+html.quality-medium .glass-input,
+html.quality-medium .dd-panel,
+html.quality-low .paired-row,
+html.quality-low .device-item,
+html.quality-low .root-row,
+html.quality-low .glass-input,
+html.quality-low .dd-panel {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+
+/* ============================================================
+   十一、降级：不支持 backdrop-filter → 实色玻璃（保留高光与层次）
+   ============================================================ */
+@supports not ((backdrop-filter: blur(2px)) or (-webkit-backdrop-filter: blur(2px))) {
+  .glass-btn::before,
+  .glass-chip::before,
+  .dock-bubble::before,
+  .dock-panel::before,
+  .incoming-card::before,
+  .gmodal::before,
+  .gswitch::before,
+  .gseg::before {
+    display: none;
+  }
+
+  .liquidGlass-tint,
+  .glass-btn::after,
+  .glass-chip::after,
+  .dock-bubble::after,
+  .dock-panel::after,
+  .incoming-card::after,
+  .gmodal::after,
+  .gswitch::after,
+  .gseg::after {
+    background: var(--lg-solid);
+  }
+}
+
+/* ============================================================
+   十二、标题栏 / 目标设备下拉面板（同一玻璃配方，含质量档与降级）
+   ============================================================ */
+.titlebar,
+.dd-panel {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  background: transparent;
+  box-shadow: var(--lg-ctl-shadow);
+}
+
+.titlebar::before,
+.dd-panel::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  border-radius: inherit;
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  filter: url(#glass-distortion);
+}
+
+.titlebar::after,
+.dd-panel::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--lg-tint);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.4), inset 0 2px 10px rgba(255, 255, 255, 0.16);
+  transition: background 0.3s ease;
+}
+
+html.dark .titlebar::after,
+html.dark .dd-panel::after {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16), inset 0 2px 10px rgba(255, 255, 255, 0.08);
+}
+
+/* 下拉面板内滚动区（外层管玻璃裁切，内层管滚动） */
+.dd-list {
+  max-height: 236px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* 质量档 / 降级与既有配方一致 */
+html.quality-low .titlebar::before,
+html.quality-low .dd-panel::before {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  filter: none !important;
+}
+
+html.quality-low .titlebar::after,
+html.quality-low .dd-panel::after {
+  background: rgba(255, 255, 255, 0.2) !important;
+  box-shadow: none !important;
+}
+
+html.dark.quality-low .titlebar::after,
+html.dark.quality-low .dd-panel::after {
+  background: rgba(28, 30, 38, 0.2) !important;
+}
+
+html.quality-low .titlebar,
+html.quality-low .dd-panel {
+  box-shadow: none !important;
+}
+
+@supports not ((backdrop-filter: blur(2px)) or (-webkit-backdrop-filter: blur(2px))) {
+  .titlebar::before,
+  .dd-panel::before {
+    display: none;
+  }
+
+  .titlebar::after,
+  .dd-panel::after {
+    background: var(--lg-solid);
+  }
+}
+
+/* ---------- 动效减弱偏好 ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .dock,
+  .dock-bubble,
+  .dock-tab,
+  .dock-tab-glider,
+  .dock-status-text,
+  .dock-caret,
+  .dock-panel-wrap,
+  .gseg-glider,
+  .gswitch-knob,
+  .glass-btn,
+  .glass-chip,
+  .liquidGlass-wrapper {
+    transition-duration: 0.01ms !important;
+  }
+}
