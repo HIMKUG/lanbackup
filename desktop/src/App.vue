@@ -3146,7 +3146,7 @@ function clearLogs() {
             <button v-if="debugEnabled && debugRecvDir" class="glass-btn small danger root-del" title="移除调试收件目录" aria-label="移除调试收件目录" @click.stop="resetDebugRecv"><AppIcon name="close" :size="11" /></button>
           </div>
           <div class="row mt-md">
-            <span class="muted" style="margin: 0; flex: 1">收件服务</span>
+            <span class="setting-label" style="margin: 0; flex: 1">收件服务</span>
             <button v-if="serverRunning" class="glass-btn small danger" @click="oneClickCloseReceive">一键关闭</button>
             <button v-else-if="receiverEnabled && recvStarting" class="glass-btn small" disabled>启用中…</button>
             <button v-else class="glass-btn small primary" @click="oneClickReceive">一键开启</button>

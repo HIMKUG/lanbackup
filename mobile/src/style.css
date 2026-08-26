@@ -1,3 +1,15 @@
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --font-variable: "Inter", sans-serif;
+}
+
 /* ============================================================
    局域网备份 - 手机端
    Liquid Glass 材质系统（按钮/分段/弹窗/Dock/降级）在
@@ -74,7 +86,7 @@ textarea:focus-visible,
   --text-primary: #1d1d1f;
   --text-secondary: rgba(29, 29, 31, 0.62);
   --text-tertiary: rgba(29, 29, 31, 0.55);
-  --accent: #0d9488;
+  --accent: oklch(0.97 0 0);
   --accent-strong: #0f766e;
   --accent-soft: rgba(13, 148, 136, 0.14);
   --border-glass: rgba(0, 0, 0, 0.09);
@@ -101,6 +113,37 @@ textarea:focus-visible,
   --dock-inset: 8px;
   --dock-radius: 24px;
   color-scheme: light;
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
 }
 
 html.dark {
@@ -191,10 +234,9 @@ body {
   padding: 14px 14px 132px;
 }
 
-/* 壁纸用绝对定位叠在 app-shell 内容底下（不依赖负 z-index，Android 兼容）；
-   光斑用 fixed：不参与滚动、不产生横向溢出（absolute 越界会撑出横向滚动条） */
+/* 壁纸用 fixed 定位固定在视口，不随内容滚动 */
 .app-shell > .wallpaper-video {
-  position: absolute;
+  position: fixed;
   pointer-events: none;
   inset: 0;
   width: 100%;
@@ -270,16 +312,16 @@ body {
   background: var(--accent-soft);
 }
 
-/* 连接码旁的重置小按钮（28px 视觉 + ::after 扩展到 ≥44px 触控热区） */
+/* 连接码旁的重置小按钮（20px 视觉 + ::after 扩展到 ≥32px 触控热区） */
 .mini-btn {
   position: relative;
-  width: 28px;
-  height: 28px;
+  width: 20px;
+  height: 20px;
   border: none;
   border-radius: 50%;
   background: var(--chip-bg);
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: 11px;
   line-height: 1;
   font-family: inherit;
   cursor: pointer;
@@ -293,7 +335,7 @@ body {
 .mini-btn::after {
   content: "";
   position: absolute;
-  inset: -8px;
+  inset: -6px;
   border-radius: 50%;
 }
 
@@ -473,6 +515,24 @@ html.dark .toast.error {
 .row {
   display: flex;
   gap: 8px;
+}
+
+/* 日志按钮行内禁止相邻按钮的默认 margin-top */
+.row .glass-btn + .glass-btn {
+  margin-top: 0 !important;
+}
+
+/* paired-row 内的相邻按钮也要重置 margin-top */
+.paired-row .glass-btn + .glass-btn {
+  margin-top: 0 !important;
+}
+
+/* 设置项标签（如"收件服务"）样式：比 muted 更醒目，但比标题轻 */
+.setting-label {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary);
+  line-height: 32px;
 }
 
 /* ---------- 输入 ---------- */
@@ -1536,5 +1596,310 @@ html.dark .stat-warn {
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+  }
+}
+
+/* ---------- 主要文字 hover 加粗效果 ---------- */
+/* 初始字重较轻，hover 时加粗 */
+.glass-card-title,
+h1, h2, h3,
+.status-cell-value {
+  font-weight: 500;
+  transition: font-weight 0.2s ease;
+}
+
+.glass-card-title:hover,
+h1:hover, h2:hover, h3:hover,
+.status-cell-value:hover {
+  font-weight: 700;
+}
+
+/* 按钮类 hover 加粗 */
+.glass-btn,
+.device-item,
+.root-row,
+.dd-item,
+.run-btn,
+.role-seg .glass-chip {
+  font-weight: 500;
+  transition: font-weight 0.2s ease;
+}
+
+.glass-btn:hover,
+.device-item:hover,
+.root-row:hover,
+.dd-item:hover,
+.run-btn:hover,
+.role-seg .glass-chip:hover {
+  font-weight: 600;
+}
+
+/* ========== 呼吸感优化 ========== */
+
+/* P2 - 页面内每张卡增加间距，提升呼吸感 */
+.page-inner > .liquidGlass-wrapper,
+.page-inner > .card-gap {
+  margin-bottom: 20px;
+}
+
+/* 卡片列表增加垂直间距 */
+.card-list {
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+/* 设置项之间增加间距 */
+.status-cell {
+  margin-bottom: 12px;
+}
+
+.status-cell:last-child {
+  margin-bottom: 0;
+}
+
+/* 文件夹列表项增加间距 */
+.root-row {
+  margin-bottom: 10px;
+}
+
+.root-row:last-child {
+  margin-bottom: 0;
+}
+
+/* 设备列表项增加间距 */
+.device-item {
+  margin-bottom: 10px;
+}
+
+.device-item:last-child {
+  margin-bottom: 0;
+}
+
+/* 配对设备列表项 */
+.paired-row {
+  margin-bottom: 10px;
+}
+
+.paired-row:last-child {
+  margin-bottom: 0;
+}
+
+/* 设置页面增加间距 */
+.setting-item,
+.setting-row {
+  margin-bottom: 14px;
+}
+
+.setting-item:last-child,
+.setting-row:last-child {
+  margin-bottom: 0;
+}
+
+/* 按钮上下增加间距 */
+.glass-btn + .glass-btn {
+  margin-top: 12px;
+}
+
+/* 副文字与上方内容增加间距 */
+.muted {
+  margin-top: 8px;
+}
+
+/* 收件区/发件区配置标题与内容间距 */
+.recv-header {
+  margin-bottom: 14px;
+}
+
+/* 下拉面板与触发按钮间距 */
+.dd-trigger {
+  margin-bottom: 10px;
+}
+
+/* 底部关于区域增加间距 */
+.about-dev {
+  margin-top: 20px;
+  margin-bottom: 16px;
+}
+
+.about-section {
+  margin-top: 20px;
+}
+
+/* 设置页面底部区域 */
+.settings-footer {
+  margin-top: 24px;
+  padding-top: 20px;
+}
+
+/* P1 - 隐藏移动端重置连接码按钮（改为点击整个区域复制） */
+@media (max-width: 480px) {
+  .mini-btn {
+    display: none;
+  }
+}
+
+/* P1 - 隐藏 web 环境初始化错误提示（非原生环境不需要显示）
+   由于是 web 环境，隐藏所有初始化错误提示 */
+[role="alert"],
+.toast.error {
+  display: none;
+}
+
+/* P1 - 优化视觉层次：增大主标题，减小副文字 */
+.glass-card-title {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+h2.glass-card-title {
+  font-size: 18px;
+}
+
+.page-inner > h2,
+.page-inner h2.glass-card-title {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+/* 主页面标题更大更突出 */
+h2:where(.glass-card-title),
+.page h2.glass-card-title {
+  font-size: 20px;
+}
+
+/* 副文字更小更淡 */
+.muted {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+/* 未就绪等状态文字 */
+.page-inner > p,
+.page-inner > .muted {
+  font-size: 12px;
+}
+
+/* P2 - 修复下拉菜单与提示重叠（增加 z-index） */
+.dd-panel {
+  z-index: 50;
+}
+
+/* P2 - 窄屏幕适配 (< 360px) */
+@media (max-width: 360px) {
+  .app-header h1 {
+    font-size: 18px;
+  }
+
+  .glass-card-title {
+    font-size: 16px;
+  }
+
+  .page-inner h2.glass-card-title {
+    font-size: 18px;
+  }
+
+  #app {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .glass-input,
+  .glass-btn {
+    padding: 10px 12px;
+    font-size: 14px;
+  }
+}
+
+/* 通用响应式：小屏幕减小 padding */
+@media (max-width: 420px) {
+  .app-shell {
+    padding: 12px 12px 120px;
+  }
+
+  .glass-card {
+    padding: 14px 14px;
+  }
+}
+
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
   }
 }

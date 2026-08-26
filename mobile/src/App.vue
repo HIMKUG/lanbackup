@@ -2781,7 +2781,7 @@ async function exportLogs() {
             <span class="root-name">{{ boxC2p ? boxC2p.name : '选择收件目录' }}</span>
           </div>
           <div class="row mt-sm">
-            <span class="muted" style="margin: 0; flex: 1">收件服务</span>
+            <span class="setting-label" style="margin: 0; flex: 1">收件服务</span>
             <button v-if="serverRunning" class="glass-btn small danger" @click="oneClickCloseReceive">一键关闭</button>
             <button v-else-if="receiverEnabled && recvStarting" class="glass-btn small" disabled>启用中…</button>
             <button v-else class="glass-btn small primary" @click="oneClickReceive">一键开启</button>

@@ -302,7 +302,8 @@ html.dark .titlebar {
   border-radius: 8px;
   background: var(--chip-bg);
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 14px;
+  line-height: 1;
   font-family: inherit;
   cursor: pointer;
   display: inline-flex;
@@ -326,7 +327,7 @@ html.dark .titlebar {
   color: #fff;
 }
 
-/* CSS 绘制按钮图形：保证绝对居中 */
+/* CSS 绘制按钮图形：统一高度，保证视觉一致 */
 .g-min {
   display: block;
   width: 11px;
@@ -346,12 +347,15 @@ html.dark .titlebar {
 .g-x::after {
   content: "";
   position: absolute;
-  left: 0;
-  top: 4.5px;
+  left: 50%;
+  top: 50%;
+  margin-left: -5.5px;
+  margin-top: -1px;
   width: 11px;
   height: 2px;
   border-radius: 1px;
   background: currentColor;
+  transform-origin: center center;
 }
 
 .g-x::before {
@@ -588,6 +592,24 @@ html.dark .toast.error {
 .row {
   display: flex;
   gap: 8px;
+}
+
+/* 日志按钮行内禁止相邻按钮的默认 margin-top */
+.row .glass-btn + .glass-btn {
+  margin-top: 0 !important;
+}
+
+/* paired-row 内的相邻按钮也要重置 margin-top */
+.paired-row .glass-btn + .glass-btn {
+  margin-top: 0 !important;
+}
+
+/* 设置项标签（如"收件服务"）样式：比 muted 更醒目，但比标题轻 */
+.setting-label {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary);
+  line-height: 32px;
 }
 
 
@@ -875,6 +897,7 @@ html.dark .status-chip.on {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
   gap: 10px;
+  align-items: stretch;
 }
 
 /* 折叠面板：grid 0fr↔1fr 平滑展开/收起（收件区配置 / 发件区配置） */
@@ -924,6 +947,7 @@ html.dark .status-chip.on {
   border-radius: 12px;
   background: var(--chip-bg);
   box-shadow: inset 0 1px 0 var(--row-highlight);
+  overflow: hidden;
 }
 
 .status-cell-label {
@@ -1687,5 +1711,209 @@ html .gscroll {
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+  }
+}
+
+/* ---------- 主要文字 hover 加粗效果 ---------- */
+/* 初始字重较轻，hover 时加粗 */
+.glass-card-title,
+h1, h2, h3,
+.status-cell-value {
+  font-weight: 500;
+  transition: font-weight 0.2s ease;
+}
+
+.glass-card-title:hover,
+h1:hover, h2:hover, h3:hover,
+.status-cell-value:hover {
+  font-weight: 700;
+}
+
+/* 按钮类 hover 加粗 */
+.glass-btn,
+.device-item,
+.root-row,
+.dd-item,
+.run-btn,
+.role-seg .glass-chip {
+  font-weight: 500;
+  transition: font-weight 0.2s ease;
+}
+
+.glass-btn:hover,
+.device-item:hover,
+.root-row:hover,
+.dd-item:hover,
+.run-btn:hover,
+.role-seg .glass-chip:hover {
+  font-weight: 600;
+}
+
+/* ========== UI 优化修复（与移动端同步） ========== */
+
+/* P1 - 优化视觉层次：增大主标题，减小副文字 */
+.glass-card-title {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+h2.glass-card-title {
+  font-size: 18px;
+}
+
+.page-inner > h2,
+.page-inner h2.glass-card-title {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+/* 主页面标题更大更突出 */
+h2:where(.glass-card-title),
+.page h2.glass-card-title {
+  font-size: 20px;
+}
+
+/* 副文字更小更淡 */
+.muted {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+/* 未就绪等状态文字 */
+.page-inner > p,
+.page-inner > .muted {
+  font-size: 12px;
+}
+
+/* P2 - 修复下拉菜单与提示重叠（增加 z-index） */
+.dd-panel {
+  z-index: 50;
+}
+
+/* ========== 呼吸感优化 ========== */
+
+/* 页面内每张卡增加间距 */
+.page-inner > .liquidGlass-wrapper,
+.page-inner > .card-gap {
+  margin-bottom: 20px;
+}
+
+/* 卡片列表增加垂直间距 */
+.card-list {
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+/* 设置项之间增加间距 */
+.status-cell {
+  margin-bottom: 12px;
+}
+
+.status-cell:last-child {
+  margin-bottom: 0;
+}
+
+/* 文件夹列表项增加间距 */
+.root-row {
+  margin-bottom: 10px;
+}
+
+.root-row:last-child {
+  margin-bottom: 0;
+}
+
+/* 设备列表项增加间距 */
+.device-item {
+  margin-bottom: 10px;
+}
+
+.device-item:last-child {
+  margin-bottom: 0;
+}
+
+/* 配对设备列表项 */
+.paired-row {
+  margin-bottom: 10px;
+}
+
+.paired-row:last-child {
+  margin-bottom: 0;
+}
+
+/* 设置页面增加间距 */
+.setting-item,
+.setting-row {
+  margin-bottom: 14px;
+}
+
+.setting-item:last-child,
+.setting-row:last-child {
+  margin-bottom: 0;
+}
+
+/* 按钮上下增加间距 */
+.glass-btn + .glass-btn {
+  margin-top: 12px;
+}
+
+/* 副文字与上方内容增加间距 */
+.muted {
+  margin-top: 8px;
+}
+
+/* 收件区/发件区配置标题与内容间距 */
+.recv-header {
+  margin-bottom: 14px;
+}
+
+/* 下拉面板与触发按钮间距 */
+.dd-trigger {
+  margin-bottom: 10px;
+}
+
+/* 底部关于区域增加间距 */
+.about-dev {
+  margin-top: 20px;
+  margin-bottom: 16px;
+}
+
+.about-section {
+  margin-top: 20px;
+}
+
+/* 设置页面底部区域 */
+.settings-footer {
+  margin-top: 24px;
+  padding-top: 20px;
+}
+
+/* 日志按钮对齐修复：确保三个按钮文字垂直居中 */
+button.glass-btn.small {
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  height: 32px !important;
+  line-height: 1 !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+}
+
+
+/* P2 - 大屏幕响应式优化 */
+@media (min-width: 1024px) {
+  .app-shell {
+    max-width: 800px;
+    margin: 0 auto;
+  }
+}
+
+/* P2 - 超宽屏幕居中显示 */
+@media (min-width: 1440px) {
+  .app-shell {
+    max-width: 900px;
+  }
+
+  .glass-card-title {
+    font-size: 20px;
   }
 }
