@@ -792,6 +792,7 @@ html.dark .status-chip.on {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
   gap: 8px;
+  align-items: stretch;
 }
 
 /* 折叠面板：grid 0fr↔1fr 平滑展开/收起（收件区配置 / 发件区配置） */

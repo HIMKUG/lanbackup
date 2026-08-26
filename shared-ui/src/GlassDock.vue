@@ -227,6 +227,9 @@ watch(
 /* 收缩/展开引起页签宽度变化 → 逐帧跟随重算指示器位置 */
 watch(collapsed, () => nextTick(() => followActive()));
 
+/* 展开态变化时也重算指示器（面板展开/收起会改变 Dock 可用宽度） */
+watch(expanded, () => nextTick(() => followActive()));
+
 onMounted(() => {
   lastY = window.scrollY;
   nextTick(applyGlider);
