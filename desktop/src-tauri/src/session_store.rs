@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 pub use crate::scheduler::{TransferProgress, PeerInfo};
 
 // re-export scheduler types for use by other modules
-pub use crate::scheduler::FileManifest as SchedulerFileManifest;
+// SchedulerFileManifest intentionally public for external type compatibility
 
 // ============================================================
 // 类型定义（与 shared-core/src/session-store.ts 对齐，camelCase JSON）
@@ -43,7 +43,8 @@ pub struct FileManifest {
     pub chunk_size: Option<u64>,
 }
 
-/// 会话状态（持久化格式）
+/// 会话状态（持久化格式，allow(dead_code)：scheduler 差异同步引擎完全重构后接线）
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
     pub id: String,
@@ -58,7 +59,8 @@ pub struct SessionState {
     pub status: SessionStatus,
 }
 
-/// 会话状态枚举
+/// 会话状态枚举（allow(dead_code)：scheduler 差异同步引擎完全重构后接线）
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
@@ -68,7 +70,8 @@ pub enum SessionStatus {
     Failed,
 }
 
-/// 存储格式（对应 session_store.json 结构）
+/// 存储格式（对应 session_store.json 结构，allow(dead_code)：scheduler 差异同步引擎完全重构后接线）
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionStoreData {
     #[serde(rename = "sessions")]
@@ -81,9 +84,10 @@ pub struct SessionStoreData {
 // DesktopSessionStore 实现
 // ============================================================
 
-/// Desktop 端会话存储
-/// - 热状态：Arc<RwLock<HashMap>>（内存）
-/// - 温状态：tauri-plugin-store（持久化）
+/// Desktop 端会话存储（跨重启保持传输会话状态）
+/// 故意标记 allow(dead_code)：DesktopSessionStore 已在 lib.rs setup 中注册，
+/// 其公共 API（persist/create_session/update_session 等）在 send_files 重构后接线。
+#[allow(dead_code)]
 pub struct DesktopSessionStore {
     /// 热状态缓存
     hot: Arc<RwLock<HashMap<String, SessionState>>>,
@@ -93,6 +97,8 @@ pub struct DesktopSessionStore {
     store_path: std::path::PathBuf,
 }
 
+/// ISessionStore 接口实现（scheduler 差异同步引擎用，allow(dead_code)）
+#[allow(dead_code)]
 impl DesktopSessionStore {
     /// 创建新的 SessionStore
     pub fn new(app_data_dir: &std::path::Path) -> Result<Self, crate::AppError> {
@@ -126,28 +132,34 @@ impl DesktopSessionStore {
         })
     }
 
-    /// 持久化到磁盘（异步）
+    /// 持久化到磁盘（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub async fn persist(&self) -> Result<(), crate::AppError> {
-        let hot = self.hot.read().await;
-        let active_id = self.active_id.read().await;
-        
-        let data = SessionStoreData {
-            sessions: hot.clone(),
-            active_session_id: active_id.clone(),
+        // 锁作用域最小化：仅克隆数据，序列化+磁盘写不持锁（避免阻塞读/写端）
+        let data = {
+            let hot = self.hot.read().await;
+            let active_id = self.active_id.read().await;
+            SessionStoreData {
+                sessions: hot.clone(),
+                active_session_id: active_id.clone(),
+            }
         };
-        
+
         let json = serde_json::to_string_pretty(&data)
             .map_err(|e| crate::AppError(format!("序列化会话状态失败: {}", e)))?;
-        
+
         // 确保目录存在
         if let Some(parent) = self.store_path.parent() {
-            std::fs::create_dir_all(parent)
+            tokio::fs::create_dir_all(parent)
+                .await
                 .map_err(|e| crate::AppError(format!("创建目录失败: {}", e)))?;
         }
-        
-        std::fs::write(&self.store_path, json)
+
+        // 异步非阻塞写：避免同步 std::fs::write 占住 tokio worker（P1-2）
+        tokio::fs::write(&self.store_path, json)
+            .await
             .map_err(|e| crate::AppError(format!("写入 session_store.json 失败: {}", e)))?;
-        
+
         Ok(())
     }
 
@@ -155,7 +167,8 @@ impl DesktopSessionStore {
     // ISessionStore 接口实现
     // ========================================================
 
-    /// 创建新会话
+    /// 创建新会话（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub async fn create_session(&self, session: SessionState) -> Result<(), crate::AppError> {
         let mut hot = self.hot.write().await;
         hot.insert(session.id.clone(), session);
@@ -280,7 +293,8 @@ impl DesktopSessionStore {
     }
 }
 
-/// 部分更新结构体
+/// 部分更新结构体（allow(dead_code)：scheduler 差异同步引擎完全重构后接线）
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct PartialSessionUpdate {
     pub files: Option<Vec<FileManifest>>,
@@ -289,16 +303,20 @@ pub struct PartialSessionUpdate {
     pub status: Option<SessionStatus>,
 }
 
-/// 获取当前时间（ISO8601 简化版，不依赖 chrono）
+/// 获取当前时间（ISO8601 格式化字符串，与 SessionState.updatedAt 语义一致）
+/// 轻量时间戳（allow(dead_code)：scheduler 差异同步引擎完全重构后接线）
+#[allow(dead_code)]
 fn chrono_lite_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let dur = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = dur.as_secs();
-    // 简化实现：输出 Unix timestamp
-    // 实际生产环境应使用 chrono 或 time crate
-    format!("{}", secs)
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| {
+            // 回退：即使 time crate 格式化失败，仍返回 Unix 秒（兼容旧行为）
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string()
+        })
 }
 
 // ============================================================

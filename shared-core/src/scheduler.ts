@@ -10,22 +10,13 @@
 
 // ============================================================
 // 协议类型（localsend-scheduler v1）
-// 注意：FileManifest、SessionState 等类型已移至 session-store.ts
+// 注意：FileManifest、TransferPhase 等类型已移至 session-store.ts
 // 本文件仅保留调度器内部使用的类型
 // ============================================================
 
-/** 文件元数据 + Merkle 树信息（localsend-scheduler v1 扩展） */
-interface FileManifest {
-  fileId: string;
-  fileName: string;
-  fileSize: number;
-  chunkSize: number; // = piece 大小 = 4MB
-  totalChunks: number;
-  fileSha256: string; // 整个文件的 SHA-256
-  merkleRoot?: string; // Merkle 树根（可选，大文件有）
-  pieceHashes: string[]; // 每个 piece 的 SHA-256
-  protocolExtensions: string[]; // 支持的扩展协议
-}
+// 从 session-store.ts 导入统一类型
+import { FileManifest } from './session-store.js';
+import { logger } from './logger.js';
 
 /** 差异分析结果 */
 export interface ChunkDiff {
@@ -37,8 +28,8 @@ export interface ChunkDiff {
   fileComplete: boolean; // 所有块都已到齐且校验通过
 }
 
-/** 会话状态机 */
-type SessionState =
+/** 传输阶段状态机 */
+type TransferPhase =
   | 'idle'
   | 'preparing'
   | 'diffing'
@@ -57,7 +48,7 @@ export interface FileTransferState {
   ackedChunks: Set<number>;
   nackedChunks: Set<number>;
   failedChunks: Set<number>;
-  state: SessionState;
+  state: TransferPhase;
 }
 
 /** 单个接收端会话（发送端视角） */
@@ -65,7 +56,7 @@ export interface PeerSession {
   peerIp: string;
   peerPort: number;
   sessionId: string;
-  state: SessionState;
+  state: TransferPhase;
   files: Map<string, FileTransferState>;
   createdAt: number;
   lastHeartbeat: number;
@@ -189,13 +180,6 @@ export function weakChecksum(data: Uint8Array): bigint {
   return hash;
 }
 
-/** 用 SHA-256 做强校验（同步版本，使用 Web Crypto API） */
-export function strongChecksum(data: Uint8Array): string {
-  // Web Crypto API 只提供异步版本，这里使用简化的同步实现作为占位
-  // 实际运行时建议使用 async/await 调用 sha256HexAsync
-  return sha256HexSync(data);
-}
-
 // ============================================================
 // 指数退避 + 全抖动（AWS 标准）
 // ============================================================
@@ -300,7 +284,7 @@ export class TransferScheduler {
   }
 
   /** 标记会话状态 */
-  setPeerState(ip: string, port: number, state: SessionState): void {
+  setPeerState(ip: string, port: number, state: TransferPhase): void {
     const session = this.getPeer(ip, port);
     if (session) {
       session.state = state;
@@ -352,7 +336,6 @@ export class TransferScheduler {
 
 /**
  * 从文件数据构建 FileManifest（scheduler v1 协议用）
- * 注意：实际计算 SHA-256 和 Merkle 树需要在后台进行
  */
 export function buildSchedulerManifest(
   fileId: string,
@@ -360,18 +343,28 @@ export function buildSchedulerManifest(
   fileSize: number,
   chunkSize: number
 ): FileManifest {
-  const totalChunks = Math.ceil(fileSize / chunkSize);
-  return {
-    fileId,
-    fileName,
-    fileSize,
-    chunkSize,
-    totalChunks,
-    fileSha256: '', // 待计算
-    merkleRoot: undefined,
-    pieceHashes: [],
-    protocolExtensions: ['scheduler-v1'],
-  };
+  return logger.startActiveSpan('scheduler.buildManifest', (span) => {
+    span.setAttributes({
+      'file.id': fileId,
+      'file.name': fileName,
+      'file.size': fileSize,
+      'file.chunk_size': chunkSize,
+      'file.is_large': fileSize > 100 * 1024 * 1024,
+    });
+
+    const manifest: FileManifest = {
+      id: fileId,
+      fileName,
+      size: fileSize,
+      chunkSize,
+      sha256: '',
+      merkleRoot: undefined,
+      pieceHashes: [],
+    };
+
+    span.end();
+    return manifest;
+  });
 }
 
 /**
@@ -395,9 +388,13 @@ export function buildManifestIfNeeded(
 // 工具函数
 // ============================================================
 
-/** 生成会话 ID */
+/** 生成会话 ID（P2-PF6：改用 CSPRNG 的 randomUUID，替代可预测的 Math.random） */
 function generateSessionId(): string {
-  return 'sess_' + Math.random().toString(36).substring(2, 15);
+  // Web Crypto 可用时用随机 UUID；极端旧环境回退（非加密用途，仅保障唯一性）
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return 'sess_' + crypto.randomUUID().replace(/-/g, '').slice(0, 13);
+  }
+  return 'sess_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
 
 /** 计算 SHA-256（8KB 缓冲区） */
@@ -409,46 +406,24 @@ function sha256(data: Uint8Array): Uint8Array {
 
 /**
  * SHA-256 同步实现
- * 浏览器环境：使用 SubtleCrypto（异步 API，无法真正同步）
+ * 浏览器环境：SubtleCrypto 是纯异步 API，本函数抛出错误，强制使用 sha256HexAsync()
  * Node.js 环境：使用 crypto.createHash
- * 注意：此函数在浏览器中返回假哈希，仅用于类型兼容。生产环境应使用 sha256HexAsync
  */
 function sha256Sync(data: Uint8Array): Uint8Array {
-  // 检测环境
+  // 浏览器环境：SubtleCrypto 是纯异步 API，无同步实现
+  // 必须在浏览器中使用 crypto.subtle.digest('SHA-256', data) 并 await 结果
+  // 本函数在浏览器中抛出错误，强制使用 sha256HexAsync()
   if (typeof globalThis.crypto !== 'undefined' && 'subtle' in globalThis.crypto) {
-    // 浏览器环境：SubtleCrypto 是异步的，这里返回基于数据内容的简化哈希
-    // 警告：这不是真正的 SHA-256，仅用于开发测试！
-    // 生产代码应使用 sha256HexAsync()
-    const result = new Uint8Array(32);
-    let hash = 2166136261;
-    for (let i = 0; i < data.length; i++) {
-      hash ^= data[i];
-      hash = (hash * 16777619) >>> 0; // FNV-1a 32位（不是 SHA-256！）
-    }
-    for (let i = 0; i < 32; i++) {
-      result[i] = (hash >> (i * 8)) & 0xff;
-    }
-    return result;
-  } else {
-    // Node.js 环境：使用真的 SHA-256
-    try {
-      const crypto = require('crypto');
-      const hash = crypto.createHash('sha256');
-      hash.update(Buffer.from(data));
-      return new Uint8Array(hash.digest());
-    } catch {
-      // 回退到 FNV-1a
-      const result = new Uint8Array(32);
-      let hash = 2166136261;
-      for (let i = 0; i < data.length; i++) {
-        hash ^= data[i];
-        hash = (hash * 16777619) >>> 0;
-      }
-      for (let i = 0; i < 32; i++) {
-        result[i] = (hash >> (i * 8)) & 0xff;
-      }
-      return result;
-    }
+    throw new Error('SHA-256 is async in browser environment. Use sha256HexAsync() instead.');
+  }
+  // Node.js 环境：使用真的 SHA-256
+  try {
+    const crypto = require('crypto');
+    const hash = crypto.createHash('sha256');
+    hash.update(Buffer.from(data));
+    return new Uint8Array(hash.digest());
+  } catch (e) {
+    throw new Error('SHA-256 computation failed in Node.js: ' + (e as Error).message);
   }
 }
 
@@ -503,6 +478,141 @@ export interface SchedulerPrepareResponse {
   sessionId: string;
   files: Map<string, string>; // fileId -> token
   chunkDiff?: Map<string, ChunkDiff>; // scheduler v1 扩展
+}
+
+// ============================================================
+// 分片级失败用户交互（M1）
+// chunk 连续失败 3 次 → 询问用户选择：重试 / 跳过文件 / 中止
+// ============================================================
+
+/** 用户对分片反复失败的选择（M1 + R2 修正）：
+ *  - 'skip_file'：跳过当前文件，继续下一个
+ *  - 'abort'：中止整次传输
+ *  成功时 uploadChunkWithRetryUI 返回 null（不在此类型中）*/
+export type ChunkFailureAction = 'skip_file' | 'abort';
+
+/** 分片失败时的用户交互回调（M1）。
+ *  弹窗询问用户选择，返回 Promise<ChunkFailureAction>。
+ *  默认实现：直接返回 'abort'（CI/无 UI 环境）。*/
+export interface ChunkFailureHandler {
+  onChunkRetryExhausted(
+    fileId: string,
+    fileName: string,
+    chunkIndex: number,
+    errors: string[],
+  ): Promise<ChunkFailureAction>;
+}
+
+/** 默认分片失败处理器（无 UI 环境使用，直接 abort） */
+export const defaultChunkFailureHandler: ChunkFailureHandler = {
+  async onChunkRetryExhausted() {
+    return 'abort';
+  },
+};
+
+/** 带用户交互的 chunk 上传包装器（M1 + R2 修正）。
+ *  分片重试达到 maxRetries 次后，调用 handler.onChunkRetryExhausted() 询问用户。
+ *
+ *  @returns null 表示上传成功；ChunkFailureAction 表示达到最大重试次数后用户的选择
+ */
+export async function uploadChunkWithRetryUI(
+  uploadChunkFn: () => Promise<void>,
+  handler: ChunkFailureHandler,
+  fileId: string,
+  fileName: string,
+  chunkIndex: number,
+  maxRetries = 3,
+): Promise<ChunkFailureAction | null> {
+  const errors: string[] = [];
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await uploadChunkFn();
+      return null; // R2 修正：成功返回 null，不返回 'retry'
+    } catch (err) {
+      errors.push(`${attempt}: ${(err as Error).message ?? String(err)}`);
+    }
+  }
+  // 达到最大重试次数，询问用户
+  return handler.onChunkRetryExhausted(fileId, fileName, chunkIndex, errors);
+}
+
+// ============================================================
+// 续传降级策略（#20）
+// 检测对方是否支持 scheduler v1（通过响应头 X-Scheduler-Version），
+// 不支持时自动降级为 LocalSend v2 纯文件级续传（全量 SHA-256 校验）。
+// ============================================================
+
+/** 调度器版本协商 */
+export type SchedulerVersion = 0 | 1;
+
+/** 降级策略配置（#20） */
+export const DEGRADATION_STRATEGY = {
+  /** 对方不支持 scheduler v1 时的兜底策略 */
+  fallback: 'file-level' as const,
+  /** 心跳超时阈值（毫秒）：超过则认为对方已断开，触发续传降级 */
+  heartbeatTimeoutMs: 5 * 60 * 1000,
+  /** 连续心跳失败次数阈值：超过则触发降级或中止 */
+  maxHeartbeatFailures: 3,
+  /** scheduler v1 特征头（对方返回则表明支持） */
+  versionHeader: 'X-Scheduler-Version',
+  /** scheduler v1 版本号（双方必须完全匹配才启用） */
+  v1Version: '1',
+} as const;
+
+/** 从 HTTP 响应头检测对方调度器版本 */
+export function detectPeerSchedulerVersion(headers: Record<string, string>): SchedulerVersion {
+  const version = headers[DEGRADATION_STRATEGY.versionHeader.toLowerCase()];
+  if (version === DEGRADATION_STRATEGY.v1Version) return 1;
+  return 0;
+}
+
+/** 判断是否应该降级：peer 支持 scheduler v1 则不需要降级 */
+export function shouldDegrade(peerVersion: SchedulerVersion): boolean {
+  return peerVersion === 0;
+}
+
+/** 续传降级包装器：传入 scheduler v1 完整传输函数，降级时执行 v0 兜底逻辑。
+ *
+ * 降级后的 v0 行为：
+ * - prepare-upload 时跳过 chunk-diff 协商（对方不支持）
+ * - 文件级续传：按 16MB 分块，整体 SHA-256 匹配则跳过该块
+ * - 校验失败时全量重传（无法定位到具体分片）
+ *
+ * @param fullTransferFn scheduler v1 完整传输函数（返回 Promise<void>）
+ * @param degradedFn scheduler v0 降级兜底函数（返回 Promise<void>）
+ * @param peerVersion 对端调度器版本
+ */
+export async function withDegradedResume(
+  fullTransferFn: () => Promise<void>,
+  degradedFn: () => Promise<void>,
+  peerVersion: SchedulerVersion,
+): Promise<void> {
+  if (shouldDegrade(peerVersion)) {
+    logger.info('scheduler', `续传降级：对方不支持 scheduler v1，降级为文件级续传`);
+    return degradedFn();
+  }
+  return fullTransferFn();
+}
+
+/** 生成降级后的分块策略（v0 文件级）。
+ *  大文件按 16MB 分块，每块独立 SHA-256 校验，校验通过则跳过。
+ */
+export function buildDegradedChunkPlan(fileSize: number, checkedRanges: Map<number, boolean>): { offset: number; length: number }[] {
+  const CHUNK_SIZE = 16 * 1024 * 1024; // 16MB
+  const plan: { offset: number; length: number }[] = [];
+  let offset = 0;
+  while (offset < fileSize) {
+    const chunkIndex = Math.floor(offset / CHUNK_SIZE);
+    // 如果这个分块已校验通过（peer 存有完整文件），跳过
+    if (checkedRanges.get(chunkIndex) === true) {
+      offset += CHUNK_SIZE;
+      continue;
+    }
+    const length = Math.min(CHUNK_SIZE, fileSize - offset);
+    plan.push({ offset, length });
+    offset += CHUNK_SIZE;
+  }
+  return plan;
 }
 
 /** 上传块响应 */

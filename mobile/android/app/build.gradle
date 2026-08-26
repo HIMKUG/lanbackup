@@ -62,6 +62,12 @@ dependencies {
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')
+
+    // OpenTelemetry Android RUM
+    // 注意：android-agent 需要 SDK 36 + AGP 8.9+，当前项目为 SDK 34 + AGP 8.5
+    // 移动端为 Capacitor WebView 应用，OTel 已通过 shared-core 在 JS 层集成
+    // implementation platform("io.opentelemetry.android:opentelemetry-android-bom:1.6.0-alpha")
+    // implementation "io.opentelemetry.android:android-agent"
 }
 
 apply from: 'capacitor.build.gradle'

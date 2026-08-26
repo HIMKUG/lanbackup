@@ -1,0 +1,15 @@
+{
+  "deviceId": "d3b0c6e2-4f1a-4c8e-9b2d-8a0f7e1c5a3b",
+  "alias": "MyPhone",
+  "deviceType": "mobile",
+  "port": 53317,
+  "protocolVersion": "3.1",
+  "staticPub": "BL7vO0K0G9T2QhCeWfG6W4pDzNvRcXy0VnQhLk1aB2cD3eF4gH5iJ6kL7mN8oP9qR0sT1uV2wX3yZ4aB5cD6eF7gH8iJ9",
+  "publicKey": "BG7vO0K0G9T2QhCeWfG6W4pDzNvRcXy0VnQhLk1aB2cD3eF4gH5iJ6kL7mN8oP9qR0sT1uV2wX3yZ4aB5cD6eF7gH8iJ9",
+  "serverNonce": "1f2e3d4c5b6a7988978a6b5c4d3e2f100102030405060708090a0b0c0d0e0f10",
+  "capabilities": {
+    "maxChunkSize": 262144,
+    "supportedEncryption": ["aes-256-gcm"],
+    "supportsResume": true
+  }
+}

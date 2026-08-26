@@ -4,6 +4,7 @@
  * 扫描决策逻辑只在发送端做，接收端只负责收。
  * 快速模式（默认）：只扫「上次锚点日期 → 当前日期」区间。
  * 深度模式（手动）：全量遍历 + 清单 Diff。
+ * 镜像模式（初始化）：全量遍历，不做 Diff，用于首次全量同步或锚点丢失时。
  */
 
 import { AnchorMap, isAfterAnchor, scanDateRange } from './anchor.js';
@@ -11,7 +12,7 @@ import { Manifest, ManifestDiff, diffManifests } from './manifest.js';
 import { logger } from './logger.js';
 
 /** 扫描模式 */
-export type ScanMode = 'quick' | 'deep';
+export type ScanMode = 'quick' | 'deep' | 'mirror';
 
 /** 扫描到的文件条目 */
 export interface ScannedFile {
@@ -36,23 +37,31 @@ export interface ScanResult {
 /**
  * 快速模式扫描决策。
  * 只返回「mtime > 锚点」的文件。
- *
- * @param anchors 现有锚点
- * @param allFiles 本次遍历到的所有文件（由平台层提供）
- * @param now 当前时间（毫秒）
  */
 export function quickScan(anchors: AnchorMap, allFiles: ScannedFile[], now: number): ScanResult {
-  const files = allFiles.filter((f) => isAfterAnchor(anchors, f.relPath, f.mtime));
-  const range = scanDateRange(anchors, now);
-  logger.info(
-    'scan',
-    `快速扫描完成: 遍历 ${allFiles.length} 条, 锚点 ${Object.keys(anchors).length} 个, ` +
-      `需传输 ${files.length} 条, 日期区间 [${new Date(range.from).toISOString()}, ${new Date(range.to).toISOString()}]`,
-  );
-  return {
-    files,
-    dateRange: range,
-  };
+  return logger.startActiveSpan('scan.quickScan', (span) => {
+    span.setAttributes({
+      'scan.mode': 'quick',
+      'scan.total_files': allFiles.length,
+      'scan.anchor_count': Object.keys(anchors).length,
+    });
+
+    const files = allFiles.filter((f) => isAfterAnchor(anchors, f.relPath, f.mtime));
+    const range = scanDateRange(anchors, now);
+
+    span.setAttribute('scan.matched_files', files.length);
+    span.setAttribute('scan.date_from', new Date(range.from).toISOString());
+    span.setAttribute('scan.date_to', new Date(range.to).toISOString());
+
+    logger.info(
+      'scan',
+      `快速扫描完成: 遍历 ${allFiles.length} 条, 锚点 ${Object.keys(anchors).length} 个, ` +
+        `需传输 ${files.length} 条, 日期区间 [${new Date(range.from).toISOString()}, ${new Date(range.to).toISOString()}]`,
+    );
+
+    span.end();
+    return { files, dateRange: range };
+  });
 }
 
 /**
@@ -81,6 +90,33 @@ export function deepScan(prevManifest: Manifest, allFiles: ScannedFile[]): ScanR
 }
 
 /**
+ * 镜像模式全量扫描（初始化用）。
+ * 不做 Diff，直接返回全部文件。用于：
+ * 1. 首次全量同步（无锚点、无上次清单）
+ * 2. 锚点丢失后的强制重扫
+ * 3. chokidar 监听启动时 existing 文件未被 'add' 事件触发的补偿
+ *
+ * 注意：镜像模式只返回文件列表，不计算 Diff。
+ * 调用方需自行决定传输策略（全量/增量/按需）。
+ */
+export function scanForMirrorMode(allFiles: ScannedFile[]): ScanResult {
+  return logger.startActiveSpan('scan.mirrorMode', (span) => {
+    span.setAttributes({
+      'scan.mode': 'mirror',
+      'scan.total_files': allFiles.length,
+    });
+
+    logger.info(
+      'scan',
+      `镜像模式全量扫描完成: 返回全部 ${allFiles.length} 条文件（不计算差异）`,
+    );
+
+    span.end();
+    return { files: allFiles };
+  });
+}
+
+/**
  * 统一扫描入口。
  * @param mode 扫描模式
  * @param anchors 现有锚点（快速模式用）
@@ -95,6 +131,9 @@ export function scan(
   allFiles: ScannedFile[],
   now: number,
 ): ScanResult {
+  if (mode === 'mirror') {
+    return scanForMirrorMode(allFiles);
+  }
   if (mode === 'quick') {
     return quickScan(anchors, allFiles, now);
   }

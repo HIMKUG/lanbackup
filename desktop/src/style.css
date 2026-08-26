@@ -37,7 +37,9 @@ html:not(.debug-on) body {
 
 html:not(.debug-on) input,
 html:not(.debug-on) textarea,
-html:not(.debug-on) .log-preview-body {
+html:not(.debug-on) .log-preview-body,
+html:not(.debug-on) .self-code,
+html:not(.debug-on) .copy-ip {
   -webkit-user-select: text;
   user-select: text;
 }
@@ -73,7 +75,7 @@ textarea:focus-visible,
   --bg-base: #f2f2f7;
   --text-primary: #1d1d1f;
   --text-secondary: rgba(29, 29, 31, 0.62);
-  --text-tertiary: rgba(29, 29, 31, 0.45);
+  --text-tertiary: rgba(29, 29, 31, 0.55);
   --accent: #0d9488;
   --accent-strong: #0f766e;
   --accent-soft: rgba(13, 148, 136, 0.14);
@@ -106,7 +108,7 @@ html.dark {
   --bg-base: #0a0a0c;
   --text-primary: #f5f5f7;
   --text-secondary: rgba(235, 235, 245, 0.65);
-  --text-tertiary: rgba(235, 235, 245, 0.4);
+  --text-tertiary: rgba(235, 235, 245, 0.52);
   --accent: #2dd4bf;
   --accent-strong: #14b8a6;
   --accent-soft: rgba(45, 212, 191, 0.3);
@@ -141,7 +143,7 @@ body {
   -webkit-font-smoothing: antialiased;
   border-radius: var(--radius-window);
   overflow: hidden;
-  transition: color 0.4s ease;
+  transition: background 0.4s ease, color 0.4s ease;
 }
 
 /* 窗口裁切容器：背景全家（底色/壁纸/纱罩/光斑）裁进整窗圆角。
@@ -167,13 +169,11 @@ body {
   position: absolute;
 }
 
-/* 窗口背景层：唯一的圆角背景（整窗圆角 = Dock 圆角，同心） */
+/* 窗口背景层：透明（让壁纸视频透出，玻璃才能模糊真实内容）。
+   光效由 .glow-blob-1/2 单独提供，不被 .window-bg 遮挡。 */
 .window-bg {
   border-radius: var(--radius-window);
-  background:
-    radial-gradient(1100px 700px at 15% -10%, var(--glow-1), transparent 60%),
-    radial-gradient(900px 600px at 110% 15%, var(--glow-2), transparent 55%),
-    var(--bg-base);
+  background: transparent;
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
 }
 
@@ -237,6 +237,16 @@ html.dark .window-bg {
   transition: color 0.2s ease, background 0.2s ease;
 }
 
+/* 连接码旁的「点击复制」提示（次要小字，下划线暗示可点） */
+.copy-hint {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  opacity: 0.9;
+}
+
 .code-copy:hover {
   color: var(--accent);
   background: var(--accent-soft);
@@ -298,8 +308,6 @@ html.dark .titlebar {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
   box-shadow: inset 0 1px 0 var(--row-highlight);
   transition: background 0.2s ease, color 0.2s ease, transform 0.3s var(--ease-spring);
 }
@@ -393,6 +401,12 @@ html.dark .titlebar {
   color: var(--accent);
 }
 
+.hist-group-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
 .mini-btn:active {
   transform: rotate(180deg) scale(0.9);
 }
@@ -404,33 +418,29 @@ html.dark .titlebar {
   font-size: 14px;
 }
 
-/* ---------- 消息队列：悬浮 Toast 堆叠（不占文档流，多条并行互不遮挡） ---------- */
+/* ---------- 消息队列：悬浮 Toast 堆叠（右上窄条，不占视觉重心） ---------- */
 .toast-stack {
   position: fixed;
   top: 58px; /* 标题栏下方 */
-  left: 16px;
-  right: 132px; /* 避开右上窗口控制 */
+  right: 12px;
+  width: min(230px, calc(100% - 24px));
   z-index: 260;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
   pointer-events: none;
 }
 
 .toast {
-  position: relative;
-  isolation: isolate;
   overflow: hidden;
-  padding: 11px 15px;
+  padding: 9px 12px;
   border: none;
-  border-radius: 16px;
-  font-size: 13px;
+  border-radius: 14px;
+  font-size: 12.5px;
   font-weight: 600;
-  line-height: 1.45;
+  line-height: 1.4;
   color: var(--text-primary);
   background: rgba(255, 255, 255, 0.42);
-  backdrop-filter: blur(14px) saturate(150%);
-  -webkit-backdrop-filter: blur(14px) saturate(150%);
   box-shadow: var(--lg-ctl-shadow), inset 0 0 0 1px rgba(255, 255, 255, 0.35);
   pointer-events: auto;
 }
@@ -545,10 +555,27 @@ html.dark .toast.error {
 }
 
 .glass-card-title {
-  font-size: 15.5px;
+  font-size: 17px;
   font-weight: 700;
   color: var(--text-primary);
-  margin-bottom: 10px;
+  margin-bottom: 12px;
+}
+
+/* 设置项「主标签 + 副说明」的呼吸节奏：说明文字缓慢明暗浮动，与主标签形成层次 */
+.row + p.muted {
+  animation: glass-breathe 5s ease-in-out infinite;
+}
+
+@keyframes glass-breathe {
+  0%,
+  100% {
+    opacity: 0.82;
+    transform: translateY(0);
+  }
+  50% {
+    opacity: 1;
+    transform: translateY(-1px);
+  }
 }
 
 .muted {
@@ -583,8 +610,6 @@ html.dark .toast.error {
   outline: none;
   margin-bottom: 7px;
   box-shadow: inset 0 1px 0 var(--row-highlight);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
   transition: border-color 0.25s ease, box-shadow 0.25s ease, background 0.25s ease;
 }
 
@@ -656,6 +681,13 @@ select.glass-input {
   }
 }
 
+/* P2-UA6：用户偏好减少动效时关闭扫描脉冲闪烁（WCAG 2.3.1） */
+@media (prefers-reduced-motion: reduce) {
+  .scanner-pulse {
+    animation: none;
+  }
+}
+
 .device-list {
   position: relative; /* TransitionGroup 离场项绝对定位的锚 */
   display: flex;
@@ -694,8 +726,6 @@ input[type='number'] {
   background: var(--chip-bg);
   cursor: pointer;
   box-shadow: inset 0 1px 0 var(--row-highlight);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
   transition: border-color 0.25s ease, background 0.25s ease, transform 0.2s var(--ease-spring);
 }
 
@@ -740,8 +770,6 @@ input[type='number'] {
   border-radius: 12px;
   background: var(--chip-bg);
   box-shadow: inset 0 1px 0 var(--row-highlight);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
 }
 
 .paired-row .glass-btn.small {
@@ -808,6 +836,26 @@ input[type='number'] {
   background: linear-gradient(135deg, rgba(13, 148, 136, 0.85), rgba(13, 148, 136, 0.55));
   border-color: rgba(13, 148, 136, 0.6);
 }
+
+
+html.dark .status-chip {
+  background: rgba(28, 30, 38, 0.6);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  position: relative;
+}
+
+html.dark .status-chip::after {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--lg-tint);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16), inset 0 2px 10px rgba(255, 255, 255, 0.08);
+  pointer-events: none;
+}
+
 
 html.dark .status-chip.on {
   background: linear-gradient(135deg, rgba(45, 212, 191, 0.9), rgba(20, 184, 166, 0.65));
@@ -932,9 +980,24 @@ html.dark .status-chip.on {
   letter-spacing: 0.02em;
 }
 
-/* 就绪态：主按钮加 accent 光圈，与禁用灰区分 */
+/* 就绪态：主按钮加 accent 光圈，与禁用灰区分（强调色=青色，与全站一致） */
 .run-btn.ready {
-  box-shadow: 0 0 0 1px rgba(10, 132, 255, 0.35), 0 8px 24px rgba(10, 132, 255, 0.18);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent), 0 8px 24px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+/* 聚焦时刻：点击「立即同步」→ accent 呼吸脉冲，告知「传输进行中」（唯一主刻动画，animate.md） */
+.run-btn.loading {
+  animation: run-pulse 1.6s var(--ease-spring) infinite;
+}
+
+@keyframes run-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 7px color-mix(in srgb, var(--accent) 0%, transparent);
+  }
 }
 
 .run-hint {
@@ -942,6 +1005,119 @@ html.dark .status-chip.on {
   font-size: 12px;
   color: var(--text-secondary);
   text-align: center;
+}
+
+/* ---------- 同步页新增 UI：策略小标记 / 同步文件夹面板 / 行内开关 / 永久标签 / 长按发光 ---------- */
+.strategy-marker {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.mini-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-primary);
+  background: var(--accent-soft);
+  border: 1px solid var(--border-glass);
+}
+.sync-folder-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.perm-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  vertical-align: 1px;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+/* 行内开关（checkbox 伪装成迷你开关）：本次是否参与同步 */
+.sync-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.sync-toggle input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.sync-toggle-ui {
+  width: 34px;
+  height: 20px;
+  border-radius: 999px;
+  background: rgba(120, 130, 145, 0.45);
+  position: relative;
+  transition: background 0.25s ease;
+}
+.sync-toggle-ui::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.95);
+  transition: transform 0.25s var(--ease-spring);
+}
+.sync-toggle input:checked + .sync-toggle-ui {
+  background: var(--accent);
+}
+.sync-toggle input:checked + .sync-toggle-ui::after {
+  transform: translateX(14px);
+}
+.sync-toggle input:focus-visible + .sync-toggle-ui {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* 长按发件：按钮内部白色发光从左到右填满（1.7s），复用参考页扫光思路，不改液态玻璃 */
+.run-btn {
+  position: relative;
+  overflow: hidden;
+}
+.run-btn .hold-label {
+  position: relative;
+  z-index: 1;
+}
+.run-btn .hold-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-radius: 0; /* 推进前沿为直线分割，非圆角弧线（外角由按钮圆角裁剪） */
+  background: linear-gradient(to right, rgba(255, 255, 255, 0.35), rgba(255, 255, 255, 0.9));
+  box-shadow: 0 0 18px rgba(255, 255, 255, 0.55);
+  pointer-events: none;
+  opacity: 0;
+  z-index: 0;
+}
+.run-btn.hold .hold-fill {
+  opacity: 1;
+  animation: hold-fill 1.7s cubic-bezier(0.16, 1, 0.3, 1) forwards; /* 非线性缓动 */
+}
+@keyframes hold-fill {
+  from {
+    width: 0;
+  }
+  to {
+    width: 100%;
+  }
 }
 
 /* 设备行地址复制按钮（手动配对兜底路径的数据可达性） */
@@ -960,7 +1136,7 @@ html.dark .status-chip.on {
 }
 
 .recv-header .glass-card-title {
-  font-size: 15.5px;
+  font-size: 17px;
   font-weight: 750;
 }
 
@@ -988,8 +1164,6 @@ html.dark .status-chip.on {
   background: var(--chip-bg);
   cursor: pointer;
   box-shadow: inset 0 1px 0 var(--row-highlight);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
   transition: border-color 0.25s ease, background 0.25s ease, box-shadow 0.25s ease, transform 0.2s var(--ease-spring);
 }
 
@@ -1002,6 +1176,27 @@ html.dark .status-chip.on {
   background: linear-gradient(135deg, rgba(13, 148, 136, 0.14), rgba(13, 148, 136, 0.06));
   box-shadow: inset 0 1px 0 var(--row-highlight), 0 0 0 3px rgba(13, 148, 136, 0.12);
 }
+
+
+html.dark .device-item,
+html.dark .paired-row {
+  position: relative;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+html.dark .device-item::after,
+html.dark .paired-row::after {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--lg-tint);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16), inset 0 2px 10px rgba(255, 255, 255, 0.08);
+  pointer-events: none;
+}
+
 
 html.dark .root-row.checked {
   background: linear-gradient(135deg, rgba(45, 212, 191, 0.22), rgba(45, 212, 191, 0.08));
@@ -1025,6 +1220,12 @@ html.dark .root-row.checked {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.root-del {
+  flex-shrink: 0;
+  margin-left: 4px;
+  align-self: center;
 }
 
 .synced-hint {
@@ -1265,9 +1466,28 @@ html.dark .stat-warn {
   box-shadow: inset 0 1px 0 var(--row-highlight);
 }
 
+
+html.dark .about-dev {
+  position: relative;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+html.dark .about-dev::after {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--lg-tint);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16), inset 0 2px 10px rgba(255, 255, 255, 0.08);
+  pointer-events: none;
+}
+
+
 .dev-avatar {
-  width: 44px;
-  height: 44px;
+  width: 52px;
+  height: 52px;
   border-radius: 50%;
   object-fit: cover;
   flex-shrink: 0;
@@ -1277,22 +1497,24 @@ html.dark .stat-warn {
 .dev-info {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
   min-width: 0;
 }
 
-.dev-info strong {
-  font-size: 14px;
+.dev-name {
+  font-size: 18px;
   font-weight: 700;
+  letter-spacing: 0.2px;
+  line-height: 1.3;
 }
 
-.dev-info a {
-  font-size: 12px;
+.dev-link {
+  font-size: 12.5px;
   color: var(--accent);
-  text-decoration: none;
+  cursor: pointer;
 }
 
-.dev-info a:hover {
+.dev-link:hover {
   text-decoration: underline;
 }
 
@@ -1337,7 +1559,9 @@ html.dark .stat-warn {
   top: calc(100% + 6px);
   left: 0;
   right: 0;
-  z-index: 30;
+  z-index: 50; /* 高于卡片内容，弹出时不被下方卡片压住 */
+  max-height: min(320px, 60vh); /* 限高：不溢出视口、不与下方内容大面积重合 */
+  overflow: hidden;
   border-radius: 18px; /* 玻璃材质（伪元素配方）在 liquid.css，此处只管定位；
      描边由配方 ::after 的 1px 内高光承担，不再叠灰边框（elevation 只声明一次） */
 }
@@ -1395,8 +1619,10 @@ html .gscroll {
 .dd-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 20;
-  background: transparent;
+  z-index: 40; /* 高于卡片（压暗背景，让下拉内容清晰），低于 dd-panel(50) */
+  background: rgba(4, 8, 16, 0.28);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
 }
 
 /* ---------- 日志预览 ---------- */
@@ -1461,28 +1687,5 @@ html .gscroll {
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
-  }
-}
-
-/* ---------- 无障碍：透明度减弱（玻璃降实底，材质配方降级在 liquid.css） ---------- */
-@media (prefers-reduced-transparency: reduce) {
-  .toast,
-  .device-item,
-  .paired-row,
-  .root-row,
-  .win-btn,
-  .glass-input,
-  .scanner-status {
-    backdrop-filter: none !important;
-    -webkit-backdrop-filter: none !important;
-  }
-
-  .toast {
-    background: var(--card-bg);
-  }
-
-  .incoming-overlay {
-    backdrop-filter: none !important;
-    -webkit-backdrop-filter: none !important;
   }
 }

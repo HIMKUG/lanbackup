@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://localsend-v3/schemas/v5-unpair.schema.json",
+  "title": "v5 解配对与吊销同步（新架构 §四/§五）",
+  "description": "在线/离线解配对 + 吊销令牌同步。全部消息用 ECDSA P-256 签名（对方公钥存于配对记录 peerPublicKey）。吊销令牌 30 天有效期（§5.3）；REVOKE_PENDING 期间拒绝数据面但接受 sync-status/revoke-ack。",
+  "definitions": {
+    "signature": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{80,}$",
+      "description": "ECDSA P-256 签名，ASN.1 DER base64url"
+    },
+    "revokeToken": {
+      "type": "object",
+      "required": ["issuerDeviceId", "targetDeviceId", "issuedAt", "nonce", "signature"],
+      "properties": {
+        "issuerDeviceId": { "type": "string", "format": "uuid", "description": "发起吊销的设备（B）" },
+        "targetDeviceId": { "type": "string", "format": "uuid", "description": "被吊销的设备（A）" },
+        "issuedAt": { "type": "string", "pattern": "^[0-9]{13}$", "description": "毫秒时间戳字符串" },
+        "nonce": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$", "description": "32B 随机 hex，防重放" },
+        "signature": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{80,}$",
+          "description": "内容 = \"localsend-v3/revoke\" || issuerDeviceId || targetDeviceId || issuedAt || nonce"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "types": {
+    "unpairRequest": {
+      "type": "object",
+      "required": ["issuerDeviceId", "targetDeviceId", "timestamp", "signature"],
+      "properties": {
+        "issuerDeviceId": { "type": "string", "format": "uuid" },
+        "targetDeviceId": { "type": "string", "format": "uuid" },
+        "timestamp": { "type": "string", "pattern": "^[0-9]{13}$" },
+        "signature": { "$ref": "#/definitions/signature", "description": "内容 = \"localsend-v3/unpair-request\" || issuer || target || timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "syncStatus": {
+      "type": "object",
+      "required": ["issuerDeviceId", "targetDeviceId", "timestamp", "signature"],
+      "properties": {
+        "issuerDeviceId": { "type": "string", "format": "uuid" },
+        "targetDeviceId": { "type": "string", "format": "uuid" },
+        "timestamp": { "type": "string", "pattern": "^[0-9]{13}$" },
+        "signature": { "$ref": "#/definitions/signature", "description": "内容 = \"localsend-v3/sync-status\" || issuer || target || timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "revokeNotify": {
+      "type": "object",
+      "required": ["issuerDeviceId", "targetDeviceId", "revokeToken"],
+      "properties": {
+        "issuerDeviceId": { "type": "string", "format": "uuid" },
+        "targetDeviceId": { "type": "string", "format": "uuid" },
+        "revokeToken": { "$ref": "#/definitions/revokeToken" }
+      },
+      "additionalProperties": false
+    },
+    "revokeAck": {
+      "type": "object",
+      "required": ["issuerDeviceId", "targetDeviceId", "issuedAt", "nonce", "signature"],
+      "properties": {
+        "issuerDeviceId": { "type": "string", "format": "uuid" },
+        "targetDeviceId": { "type": "string", "format": "uuid" },
+        "issuedAt": { "type": "string", "pattern": "^[0-9]{13}$" },
+        "nonce": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "signature": { "$ref": "#/definitions/signature", "description": "内容 = \"localsend-v3/revoke-ack\" || issuer || target || issuedAt || nonce" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "responses": {
+    "syncStatusResponse": {
+      "type": "object",
+      "required": ["ok", "status"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "status": { "type": "string", "enum": ["ok", "revoked", "unknown"] },
+        "revokeToken": { "$ref": "#/definitions/revokeToken", "description": "status=revoked 时携带" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

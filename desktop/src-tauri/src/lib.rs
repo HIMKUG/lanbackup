@@ -17,11 +17,14 @@
 mod db;
 mod crypto;
 pub(crate) mod discovery;
+mod bcpd;
 pub(crate) mod identity;
 mod logger;
 pub(crate) mod scheduler;
 pub(crate) mod session_store;
+pub(crate) mod pairing;
 mod transfer;
+mod ball;
 
 // 重导出 AppError，供 transfer.rs 使用
 pub use db::AppError;
@@ -33,35 +36,184 @@ pub struct AppState {
     pub db: db::Database,
 }
 
+/// 探针功能总开关（性能优化）：false 时 probe!/proc_alive 全部编译为空操作。
+/// 排查启动卡死/无响应类问题时改为 true 重新编译，探针点保留在源码中无需重写。
+/// 使用记录：2026-08-22 凭借该探针时间线定位到 parse_log_line 越界 panic 导致的启动冻结。
+pub const PROBE_ENABLED: bool = false;
+
+/// 探针起点：进程内首次使用时计时归零（所有探针输出相对它的耗时）
+pub static PROBE_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// 写文件探针（追加模式 + 相对耗时）：诊断启动卡顿的时间线工具。
+/// 输出到 %TEMP%\tauri_debug_log.txt，格式 `[+秒] 消息`；main.rs 启动时先删除旧文件。
+/// 注意：绝不写盘符根目录——根目录高频写入是杀软 HIPS 行为检测的典型触发特征，
+/// 曾导致整个进程被 360 挂起 → 窗口瞬间"无响应"。
+/// #[macro_export] 使其他模块（transfer.rs 等）可用 `crate::probe!` 调用。
+#[macro_export]
+macro_rules! probe {
+    ($msg:expr) => {{
+        if $crate::PROBE_ENABLED {
+            let start = $crate::PROBE_START.get_or_init(std::time::Instant::now);
+            let line = format!("[+{:>7.3}s] {}\n", start.elapsed().as_secs_f64(), $msg);
+            let path = std::env::temp_dir().join("tauri_debug_log.txt");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                use std::io::Write as _;
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+    }};
+}
+
 /// 启动应用
 pub fn run() {
+    probe!("[1] run() 函数入口");
+
     // panic 信息写入日志缓冲，可随日志导出排查
     logger::install_panic_hook();
-    if let Err(e) = tauri::Builder::default()
+    probe!("[2] panic_hook 已安装");
+
+    // OpenTelemetry 初始化已移除（需要在 async 上下文中初始化，暂不在 startup 调用）
+    // 如需可观测性，请在此处引入 tracing subscriber + opentelemetry_otlp
+
+    probe!("[3] 开始构建 Tauri Builder");
+
+    let result = tauri::Builder::default()
+        // 单实例：第二个实例启动时唤起已有主窗口后退出，
+        // 避免双实例互相抢占 53318/53317 端口（此前导致配对服务绑定失败 + 接收服务反复重启）
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .setup(|app| {
+            probe!("[4] setup 闭包入口");
+
+            probe!("[5] 即将打开 Database");
             let db = db::Database::open(app.handle())?;
+            probe!("[6] Database 已打开");
+
             app.manage(AppState { db });
+            probe!("[7] AppState 已注册");
+
             app.manage(transfer::TransferState::default());
             app.manage(discovery::DiscoveryState::default());
             app.manage(transfer::PairingState::default());
+            // Scheduler 差异同步引擎的全局并发调度器（多接收端/多分片并发控制）
+            app.manage(scheduler::SendScheduler::default());
+            app.manage(bcpd::BcpdState::default());
+            probe!("[8] TransferState/DiscoveryState/PairingState/SendScheduler/BcpdState 已注册");
+
+            // Session 持久化存储（跨重启保持传输会话状态）
+            let app_data = app.path().app_data_dir().map_err(|e| AppError(e.to_string()))?;
+            probe!("[9] app_data_dir 获取成功");
+            let session_store = session_store::DesktopSessionStore::new(&app_data)
+                .map_err(|e| AppError(format!("SessionStore 初始化失败: {e}")))?;
+            probe!("[10] DesktopSessionStore 已初始化");
+            app.manage(session_store);
+            probe!("[11] SessionStore 已注册");
+
+            // OpenTelemetry 初始化已禁用：OTLP gRPC 连接 localhost:4317（无服务监听）。
+            // tonic 连接内部经 getaddrinfo 做网络栈初始化时会持有 Windows 加载器锁，
+            // 连接挂起即连锁锁死主线程（症状：主线程永久阻塞于"网络 I/O"，窗口无响应，
+            // 进程其余部分与 WebView2 渲染正常）。如需启用，必须在专用线程 +
+            // 带 connect timeout 的前提下重写，且 collector 地址可配置。
+            probe!("[12] telemetry 未引入（可观测性预留）");
+
             // 实时日志文件（程序卡死时仍可复制；见 logger.rs）
             logger::init_file(app.handle());
-            // 从 SQLite 恢复配对信任表（重启后配对关系不丢，见 transfer.rs）
-            transfer::load_paired_from_db(app.handle());
-            // UI 主线程阻塞检测（诊断"切换窗口后程序未响应"问题）
-            transfer::spawn_ui_watchdog(app.handle().clone());
-            // 配对服务（端口 53318）常驻：已配对设备穿透隐藏连接（白名单校验），
-            // 未配对设备无法连接（/verify 问候校验白名单）；隐藏时接收服务器关闭，
-            // 子网扫描探测不到本机（/register 无响应），未配对设备无法发现
-            transfer::spawn_pairing_server(app.handle().clone());
-            // 接收服务器僵尸自愈：服务器任务异常退出（端口拒连但状态为运行中）时自动重启，
-            // 否则对端"恢复任务"会 Failed to connect 且 peer-connected 自动拉起被 serverRunning 跳过
-            transfer::spawn_receiver_watchdog(app.handle().clone());
+            probe!("[13] logger::init_file 完成");
+
+            // 关键：所有耗时/阻塞初始化改为异步执行，setup 闭包立即返回，
+            // 让主窗口尽快渲染响应用户输入，避免 OS 将窗口标记为"未响应"。
+            // 悬浮球窗口、后台 watchdog、配对服务等全部后台启动。
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // 从 SQLite 恢复配对信任表（重启后配对关系不丢）
+                transfer::load_paired_from_db(&app_handle);
+                crate::log_info!("后台初始化：load_paired_from_db 完成");
+            });
+
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                probe!("[bg] 开始启动 watchdog");
+                transfer::spawn_ui_watchdog(app_handle.clone());
+                probe!("[bg] watchdog 完成，开始配对服务");
+                transfer::spawn_pairing_server(app_handle.clone());
+                probe!("[bg] 配对服务完成，开始接收 watchdog");
+                transfer::spawn_receiver_watchdog(app_handle.clone());
+                probe!("[bg] 接收 watchdog 完成，开始常驻加密存在广播");
+                // 常驻加密存在：只要运行即宣告存在（仅受防御总闸约束），驱动已配对设备在线/离线
+                bcpd::start_bcpd(app_handle.clone());
+                probe!("[bg] 后台服务全部启动完成");
+                crate::log_info!("后台初始化：watchdog + pairing_server + receiver_watchdog 启动完成");
+            });
+
+            // 悬浮球：状态初始化 + 窗口创建 + 系统托盘（可能涉及 GPU 渲染，异步化避免卡主线程）
+            // 诊断开关：LANBACKUP_NO_BALL=1 时完全跳过悬浮球/托盘/光标跟随，
+            // 用于隔离"透明球窗口拖垮 WebView2 compositor"的启动冻结问题
+            app.manage(ball::BallState::default());
+            let ball_disabled = std::env::var("LANBACKUP_NO_BALL").map(|v| v == "1").unwrap_or(false);
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if ball_disabled {
+                    probe!("[ball] LANBACKUP_NO_BALL=1 → 跳过悬浮球/托盘/光标跟随");
+                    crate::log_info!("悬浮球已被 LANBACKUP_NO_BALL 禁用（诊断模式）");
+                } else {
+                    probe!("[ball] 开始创建托盘");
+                    if let Err(e) = ball::setup_tray(&app_handle) {
+                        probe!("[ball] 托盘创建失败");
+                        crate::log_error!("悬浮球托盘初始化失败: {}", e);
+                    }
+                    probe!("[ball] 托盘完成，开始创建球窗口（透明 WebView2）");
+                    if let Err(e) = ball::create_ball_window(&app_handle) {
+                        probe!("[ball] 球窗口创建失败");
+                        crate::log_error!("悬浮球窗口创建失败: {}", e);
+                    } else {
+                        probe!("[ball] 球窗口创建完成，启动光标跟随");
+                        crate::log_info!("悬浮球窗口已就绪");
+                        // 全局光标跟随（球窗口创建后再启动）
+                        ball::spawn_cursor_tracker(&app_handle);
+                    }
+                }
+                // 主窗口关闭 → 隐藏到托盘（而非退出）
+                ball::setup_main_window_close_to_tray(&app_handle);
+                probe!("[ball] 后台初始化块结束");
+            });
+
+            probe!("[18] setup 闭包立即返回（后台任务运行中）");
+
+            // 进程存活探针（PROBE_ENABLED 门控）：独立 std 线程，每秒直写 %TEMP%\proc_alive.txt。
+            // 与 logger/主线程/任何锁零共享——用于区分"进程被挂起"与"特定组件阻塞"。
+            if PROBE_ENABLED {
+                std::thread::spawn(|| {
+                    let path = std::env::temp_dir().join("proc_alive.txt");
+                    let t0 = std::time::Instant::now();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                        {
+                            use std::io::Write as _;
+                            let _ = writeln!(f, "[{}ms] proc alive", t0.elapsed().as_millis());
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::fe_probe,
             commands::get_self_code,
             commands::refresh_self_code,
             commands::get_self_info,
@@ -77,10 +229,19 @@ pub fn run() {
             commands::start_discovery,
             commands::stop_discovery,
             commands::get_discovered_devices,
-            commands::ping_device,
+            commands::set_defensive,
+            commands::get_defensive,
+            commands::remove_device,
             commands::probe_peer_port,
-            commands::verify_device,
+            commands::v3_probe,
+            commands::v3_handshake_challenge,
+            commands::v3_handshake_verify,
+            commands::v3_pair,
             commands::send_unpair,
+            commands::unpair_peer,
+            commands::sync_all_peers,
+            commands::reset_all_pairings,
+            commands::reset_all_state,
             commands::send_disconnect,
             commands::move_to_delete,
             commands::resolve_incoming,
@@ -95,13 +256,33 @@ pub fn run() {
             commands::delete_transfer,
             commands::get_config,
             commands::set_config,
+            commands::set_debug_mode,
+            commands::get_debug_mode,
+            commands::ball_emit_emotion,
+            commands::ball_set_state,
+            commands::set_ball_enabled,
+            commands::set_ball_visible,
             logger::export_logs,
+            logger::get_rust_logs,
         ])
-        .run(tauri::generate_context!())
-    {
-        eprintln!("tauri application error: {e}");
+        .run(tauri::generate_context!());
+
+    probe!("[19] .run() 调用完成");
+
+    if let Err(e) = result {
+        // Windows GUI 无控制台，eprintln 不可见：改用日志框架 + 显式写调试日志文件
+        crate::log_error!("Tauri 初始化失败: {e}");
+        // 写 %TEMP%（不写盘符根目录：根目录写入是杀软 HIPS 触发特征）
+        let log_path = std::env::temp_dir().join("tauri_debug_log.txt");
+        if let Err(e2) = std::fs::write(
+            &log_path,
+            format!("[ERR] tauri builder error: {e}\n"),
+        ) {
+            crate::log_error!("写入调试日志到 {:?} 也失败: {e2}", log_path);
+        }
         std::process::exit(1);
     }
+    probe!("[20] 程序正常退出");
 }
 
 /// 命令包装层：记录入口/出口（敏感参数与返回值脱敏）
@@ -126,9 +307,14 @@ mod commands {
             .map_err(|e| AppError(format!("任务执行失败: {e}")))
     }
 
+    /// 前端启动探针：把前端各启动步骤追加进 D:\tauri_debug_log.txt（与 Rust 探针同一时间线）
     #[tauri::command]
-    pub fn get_self_code(app: AppHandle) -> String {
-        cmd_log!(logger::LogLevel::Info, "get_self_code", "入口");
+    pub fn fe_probe(msg: String) {
+        probe!(format!("FE {}", msg));
+    }
+
+    #[tauri::command]
+    pub fn get_self_code(app: AppHandle) -> String {        cmd_log!(logger::LogLevel::Info, "get_self_code", "入口");
         let code = identity::get_self_code(&app);
         cmd_log!(
             logger::LogLevel::Info,
@@ -232,26 +418,8 @@ mod commands {
     }
 
     #[tauri::command]
-    pub async fn ping_device(ip: String, port: u16) -> Result<transfer::PingedDevice, AppError> {
-        cmd_log!(logger::LogLevel::Info, "ping_device", "入口 目标={ip}:{port}");
-        // 异步化：阻塞 HTTP 移出主线程（spawn_blocking 线程池）。
-        // 修复：同步命令占用 IPC 主线程，不可达设备 1.5s connect 超时导致 UI 全局卡死
-        // （watchdog 日志实锤：阻塞 ≥1500ms 与 verify/ping 超时逐条对应）
-        let r = tauri::async_runtime::spawn_blocking(move || transfer::ping_device(ip, port))
-            .await
-            .map_err(|e| AppError(format!("探测任务执行失败: {e}")))?;
-        cmd_log!(
-            logger::LogLevel::Info,
-            "ping_device",
-            "出口 ok={}",
-            r.is_ok()
-        );
-        r
-    }
-
-    #[tauri::command]
     pub async fn probe_peer_port(ip: String, port: u16) -> Result<bool, AppError> {
-        // 直连探测对端接收端口（ping_device 走配对服务端口+1，探不到接收服务）
+        // 直连探测对端接收端口（v3 probe 走配对服务端口+1，探不到接收服务）
         let r = tauri::async_runtime::spawn_blocking(move || transfer::probe_peer_port(ip, port))
             .await
             .map_err(|e| AppError(format!("探测任务执行失败: {e}")))?;
@@ -260,37 +428,105 @@ mod commands {
         r
     }
 
+    /// v3 控制面：GET /api/v3/probe（发现对端 v3 能力，路径A 配对材料）
     #[tauri::command]
-    pub async fn verify_device(
+    pub async fn v3_probe(ip: String, port: u16) -> Result<serde_json::Value, AppError> {
+        cmd_log!(logger::LogLevel::Info, "v3_probe", "入口 目标={ip}:{port}");
+        tauri::async_runtime::spawn_blocking(move || transfer::v3_probe(ip, port))
+            .await
+            .map_err(|e| AppError(format!("v3_probe 任务执行失败: {e}")))?
+    }
+
+    /// v3 控制面：POST /api/v3/handshake/challenge（重连路径B）
+    #[tauri::command]
+    pub async fn v3_handshake_challenge(
         ip: String,
         port: u16,
-        code: String,
         device_id: String,
-        name: String,
-        my_code: String,
-        probe: Option<bool>,
     ) -> Result<serde_json::Value, AppError> {
         cmd_log!(
             logger::LogLevel::Info,
-            "verify_device",
-            "入口 目标={ip}:{port} 模式={} 探测={}",
-            if code.is_empty() { "问候" } else { "验证" },
-            probe.unwrap_or(false)
+            "v3_handshake_challenge",
+            "入口 目标={ip}:{port}"
         );
-        // 异步化：阻塞 HTTP 探测移出主线程（spawn_blocking 线程池）。
-        // 返回对方完整响应 {ok, reason}（reason: code_mismatch / rejected）
-        let r = tauri::async_runtime::spawn_blocking(move || {
-            transfer::verify_device(ip, port, code, device_id, name, my_code, probe)
-        })
-        .await
-        .map_err(|e| AppError(format!("探测任务执行失败: {e}")))?;
+        tauri::async_runtime::spawn_blocking(move || transfer::v3_handshake_challenge(ip, port, device_id))
+            .await
+            .map_err(|e| AppError(format!("v3_handshake_challenge 任务执行失败: {e}")))?
+    }
+
+    /// v3 控制面：POST /api/v3/handshake/verify（首次配对路径A / 重连路径B）。
+    /// 路径A 服务端弹窗确认最长 45s，客户端长读超时 60s（P0 修复）。
+    #[tauri::command]
+    pub async fn v3_handshake_verify(
+        ip: String,
+        port: u16,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, AppError> {
         cmd_log!(
             logger::LogLevel::Info,
-            "verify_device",
-            "出口 ok={}",
-            r.as_ref().map(|v| v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false)).unwrap_or(false)
+            "v3_handshake_verify",
+            "入口 目标={ip}:{port} deviceId={}",
+            body.get("deviceId").and_then(|d| d.as_str()).unwrap_or("")
         );
-        r
+        tauri::async_runtime::spawn_blocking(move || transfer::v3_handshake_verify(ip, port, body))
+            .await
+            .map_err(|e| AppError(format!("v3_handshake_verify 任务执行失败: {e}")))?
+    }
+
+    /// v3 首次配对（路径A，完整客户端流程）：probe → ECDH → 派生 → HMAC → verify。
+    /// 加密全部在 Rust 层完成（前端不做密码学）。服务端弹窗确认最长 45s → 长读超时 60s（P0 修复）。
+    /// approved 后持久化 pairing_secret 到 PairingState.secrets（供路径B重连）。
+    #[tauri::command]
+    pub async fn v3_pair(
+        app: AppHandle,
+        ip: String,
+        port: u16,
+        code: String,
+        name: String,
+    ) -> Result<serde_json::Value, AppError> {
+        cmd_log!(
+            logger::LogLevel::Info,
+            "v3_pair",
+            "入口 目标={ip}:{port} name={name}"
+        );
+        let (r, secret) = tauri::async_runtime::spawn_blocking({
+            let app = app.clone();
+            move || transfer::v3_pair(app, ip, port, code, name)
+        })
+            .await
+            .map_err(|e| AppError(format!("v3_pair 任务执行失败: {e}")))??;
+        // approved → 持久化 pairing_secret（路径B重连用）
+        if r.get("status").and_then(|s| s.as_str()) == Some("approved") {
+            if let Some(device_id) = r.get("deviceId").and_then(|d| d.as_str()) {
+                if let Ok(mut m) = app.state::<crate::transfer::PairingState>().secrets.try_write() {
+                    m.insert(device_id.to_string(), secret);
+                }
+                // P5b：approved 后落库 pairing_secret（路径B重连跨进程可用）
+                crate::transfer::persist_paired(&app);
+                // v5：发起方视角写入对端 ECDSA 签名公钥（信任锚）。
+                // 配对记录由前端 sync_paired 建立，此处 upsert 最小记录并补公钥，
+                // sync_paired 的 merge 语义会保留 peerPublicKey，门禁（check_trusted）才能放行。
+                if let Some(pub_key) = r.get("publicKey").and_then(|k| k.as_str()) {
+                    if !pub_key.is_empty() {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        if let Ok(mut m) = app.state::<crate::transfer::PairingState>().paired.lock() {
+                            let rec = m.entry(device_id.to_string()).or_insert_with(|| serde_json::json!({}));
+                            if let Some(o) = rec.as_object_mut() {
+                                o.insert("peerPublicKey".to_string(), serde_json::json!(pub_key));
+                                o.entry("status".to_string()).or_insert_with(|| serde_json::json!("ACTIVE"));
+                                o.entry("pairingTimestamp".to_string()).or_insert_with(|| serde_json::json!(now));
+                            }
+                        }
+                        crate::transfer::persist_paired(&app);
+                    }
+                }
+                cmd_log!(logger::LogLevel::Info, "v3_pair", "已持久化 pairing_secret deviceId={}", crate::logger::mask(device_id));
+            }
+        }
+        Ok(r)
     }
 
     /// 前端响应「接收确认」弹窗：同意/拒绝当前 prepare-upload 会话
@@ -339,11 +575,15 @@ mod commands {
         );
         run_blocking(move || {
             let st = app.state::<transfer::TransferState>();
-            let mut m = st
-                .pending_pairing_approvals
-                .lock()
-                .map_err(|_| AppError::from_poison())?;
-            if let Some(tx) = m.remove(&device_id) {
+            // 锁范围最小化：仅用于取出 tx，send() 在锁外执行避免持有锁时阻塞
+            let tx = {
+                let mut m = st
+                    .pending_pairing_approvals
+                    .lock()
+                    .map_err(|_| AppError::from_poison())?;
+                m.remove(&device_id)
+            };
+            if let Some(tx) = tx {
                 let _ = tx.send(accept);
             }
             Ok(())
@@ -360,6 +600,50 @@ mod commands {
             logger::mask(&device_id)
         );
         run_blocking(move || transfer::send_unpair(ip, port, device_id)).await?
+    }
+
+    /// v5：解除配对统一入口（在线直连 / 离线 REVOKE_PENDING + 吊销令牌）
+    #[tauri::command]
+    pub async fn unpair_peer(app: AppHandle, device_id: String) -> Result<serde_json::Value, AppError> {
+        cmd_log!(
+            logger::LogLevel::Info,
+            "unpair_peer",
+            "入口 deviceId={}",
+            logger::mask(&device_id)
+        );
+        run_blocking(move || transfer::unpair_peer(app, device_id)).await?
+    }
+
+    /// v5：上线状态同步（事件驱动，直连所有已配对设备发 sync-status）
+    #[tauri::command]
+    pub async fn sync_all_peers(app: AppHandle) -> Result<serde_json::Value, AppError> {
+        cmd_log!(logger::LogLevel::Info, "sync_all_peers", "入口");
+        run_blocking(move || transfer::sync_all_peers(app)).await?
+    }
+
+    /// v5：物理重置（清空所有配对 + 重新生成签名身份）
+    #[tauri::command]
+    pub async fn reset_all_pairings(app: AppHandle) -> Result<(), AppError> {
+        cmd_log!(logger::LogLevel::Info, "reset_all_pairings", "入口");
+        run_blocking(move || transfer::reset_all_pairings(app)).await?
+    }
+
+    /// 重置状态：清空全部业务数据（设备/配对/传输历史/身份密钥）+ 重新生成全新身份。
+    /// 设置页「重置状态」二次确认后调用；不可撤销。
+    #[tauri::command]
+    pub async fn reset_all_state(app: AppHandle) -> Result<(), AppError> {
+        cmd_log!(logger::LogLevel::Info, "reset_all_state", "入口");
+        run_blocking(move || {
+            transfer::reset_all_state(&app)?;
+            let state = app.state::<AppState>();
+            state.db.reset_all()?;
+            // 清空前端配置（config.json）：缺失时 get_config 返回空对象，前端用默认值规范化
+            if let Ok(dir) = app.path().app_data_dir() {
+                let _ = std::fs::remove_file(dir.join("config.json"));
+            }
+            Ok(())
+        })
+        .await?
     }
 
     #[tauri::command]
@@ -386,7 +670,8 @@ mod commands {
 
     #[tauri::command]
     pub async fn get_paired_peers(app: AppHandle) -> Vec<serde_json::Value> {
-        cmd_log!(logger::LogLevel::Info, "get_paired_peers", "入口");
+        // UI 轮询命令（每 10s 一次）：DEBUG 级别，release 默认不产生日志噪音
+        cmd_log!(logger::LogLevel::Debug, "get_paired_peers", "入口");
         run_blocking(move || transfer::get_paired_peers(app))
             .await
             .unwrap_or_default()
@@ -400,6 +685,7 @@ mod commands {
         ip: String,
         port: u16,
         fingerprint: String,
+        peer_public_key: String,
     ) -> Result<(), AppError> {
         cmd_log!(
             logger::LogLevel::Info,
@@ -408,7 +694,7 @@ mod commands {
             logger::mask(&device_id),
             name
         );
-        let r = transfer::confirm_paired(app, device_id, name, ip, port, fingerprint);
+        let r = transfer::confirm_paired(app, device_id, name, ip, port, fingerprint, peer_public_key);
         cmd_log!(
             logger::LogLevel::Info,
             "confirm_paired",
@@ -420,15 +706,16 @@ mod commands {
 
     #[tauri::command]
     pub async fn sync_paired(app: AppHandle, peers: Vec<serde_json::Value>) -> Result<(), AppError> {
+        // UI 轮询命令：DEBUG 级别
         cmd_log!(
-            logger::LogLevel::Info,
+            logger::LogLevel::Debug,
             "sync_paired",
             "入口 数量={}",
             peers.len()
         );
         let r = run_blocking(move || transfer::sync_paired(app, peers)).await?;
         cmd_log!(
-            logger::LogLevel::Info,
+            logger::LogLevel::Debug,
             "sync_paired",
             "出口 ok={}",
             r.is_ok()
@@ -463,7 +750,7 @@ mod commands {
 
     #[tauri::command]
     pub async fn get_transfers(app: AppHandle, limit: usize) -> Result<Vec<serde_json::Value>, AppError> {
-        cmd_log!(logger::LogLevel::Info, "get_transfers", "入口 limit={limit}");
+        cmd_log!(logger::LogLevel::Debug, "get_transfers", "入口 limit={limit}");
         run_blocking(move || {
             let state = app.state::<AppState>();
             state.db.get_transfers(limit.max(1).min(100))
@@ -494,7 +781,7 @@ mod commands {
     /// 读取应用配置（app_data_dir/config.json；无配置返回空对象，前端用默认值规范化）
     #[tauri::command]
     pub async fn get_config(app: AppHandle) -> Result<serde_json::Value, AppError> {
-        cmd_log!(logger::LogLevel::Info, "get_config", "入口");
+        cmd_log!(logger::LogLevel::Debug, "get_config", "入口");
         run_blocking(move || {
             let dir = app.path().app_data_dir().map_err(AppError::from_display)?;
             let path = dir.join("config.json");
@@ -579,17 +866,27 @@ mod commands {
         target_port: u16,
         target_code: String,
         files: Vec<transfer::SendFileItem>,
+        encryption_mode: String,
     ) -> Result<u64, AppError> {
         let names: Vec<String> = files.iter().map(|f| f.rel_path().to_string()).collect();
         cmd_log!(
             logger::LogLevel::Info,
             "send_files",
-            "入口 目标={target_ip}:{target_port} 文件数={} 加密={} 列表=[{}]",
+            "入口 目标={target_ip}:{target_port} 文件数={} 加密={} 模式={} 列表=[{}]",
             files.len(),
             if target_code.is_empty() { "否" } else { "是" },
+            encryption_mode,
             names.join(", ")
         );
-        let r = transfer::send_files(app, target_ip, target_port, target_code, files).await;
+        let r = transfer::send_files(
+            app,
+            target_ip,
+            target_port,
+            target_code,
+            files,
+            encryption_mode,
+        )
+        .await;
         cmd_log!(
             logger::LogLevel::Info,
             "send_files",
@@ -662,17 +959,107 @@ mod commands {
     }
 
     #[tauri::command]
+    pub fn set_defensive(app: AppHandle, hidden: bool) {
+        cmd_log!(
+            logger::LogLevel::Info,
+            "set_defensive",
+            "入口 hidden={hidden}"
+        );
+        app.state::<crate::transfer::TransferState>()
+            .defensive_hidden
+            .store(hidden, std::sync::atomic::Ordering::Relaxed);
+        // 防御总闸隐藏：本机不再明文/加密广播、拒绝一切入站连接（句柄层拒绝 + probe 空 id + announce 停）
+        cmd_log!(
+            logger::LogLevel::Info,
+            "set_defensive",
+            "出口 hidden={hidden}"
+        );
+    }
+
+    #[tauri::command]
+    pub fn get_defensive(app: AppHandle) -> bool {
+        app.state::<crate::transfer::TransferState>()
+            .defensive_hidden
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[tauri::command]
     pub fn get_discovered_devices(
         app: AppHandle,
     ) -> Result<Vec<discovery::DiscoveredDeviceInfo>, AppError> {
-        cmd_log!(logger::LogLevel::Info, "get_discovered_devices", "入口");
+        // UI 轮询命令（发现页每 1.5s 拉一次）：DEBUG 级别
+        cmd_log!(logger::LogLevel::Debug, "get_discovered_devices", "入口");
         let r = discovery::get_discovered_devices(app);
         cmd_log!(
-            logger::LogLevel::Info,
+            logger::LogLevel::Debug,
             "get_discovered_devices",
             "出口 数量={}",
             r.as_ref().map(|v| v.len()).unwrap_or(0)
         );
         r
+    }
+
+    /// 按 IP 移除发现列表中的设备（Gap 6：前端确认可疑设备/僵尸设备后清理后端缓存，
+    /// 否则下次 get_discovered_devices 又会把该设备带回来）。
+    #[tauri::command]
+    pub fn remove_device(app: AppHandle, ip: String) -> Result<(), AppError> {
+        cmd_log!(logger::LogLevel::Info, "remove_device", "入口 ip={ip}");
+        discovery::remove_by_ip(app, &ip);
+        Ok(())
+    }
+
+    /// 动态开启/关闭调试模式（前端控制台 DevTools 可调用）。
+    /// 开启后 log_debug! 宏输出完整；关闭后静默丢弃（release 也能开启）。
+    #[tauri::command]
+    pub fn set_debug_mode(enabled: bool) {
+        logger::set_debug_mode(enabled);
+    }
+
+    /// 查询当前调试模式状态
+    #[tauri::command]
+    pub fn get_debug_mode() -> bool {
+        cfg!(debug_assertions)
+    }
+
+    // ---------- 悬浮球表情驱动 ----------
+    /// 发送表情到悬浮球窗口（由 App.vue emitBall() 调用）
+    #[tauri::command]
+    pub fn ball_emit_emotion(app: AppHandle, emotion_id: String, tips: String) -> Result<(), AppError> {
+        ball::emit_ball_emotion(&app, &emotion_id, Some(&tips));
+        Ok(())
+    }
+
+    /// 发送「状态」到悬浮球窗口（球端行为机按脚本演出，现代化行为化驱动）
+    #[tauri::command]
+    pub fn ball_set_state(app: AppHandle, state: String) -> Result<(), AppError> {
+        ball::emit_ball_state(&app, &state);
+        Ok(())
+    }
+
+    // ---------- 悬浮球显隐/启用控制 ----------
+    /// 设置悬浮球启用状态（false 时隐藏窗口），由设置页"悬浮球"开关调用
+    #[tauri::command]
+    pub fn set_ball_enabled(app: AppHandle, enabled: bool) -> Result<(), AppError> {
+        cmd_log!(
+            logger::LogLevel::Info,
+            "set_ball_enabled",
+            "入口 enabled={}",
+            enabled
+        );
+        ball::set_ball_enabled(&app, enabled);
+        Ok(())
+    }
+
+    /// 设置悬浮球显隐（不改变启用状态），由设置页"悬浮球"开关联动调用
+    #[tauri::command]
+    pub fn set_ball_visible(app: AppHandle, visible: bool) -> Result<(), AppError> {
+        cmd_log!(
+            logger::LogLevel::Info,
+            "set_ball_visible",
+            "入口 visible={}",
+            visible
+        );
+        ball::set_ball_visible(&app, visible);
+        Ok(())
     }
 }

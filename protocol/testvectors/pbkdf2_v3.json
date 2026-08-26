@@ -1,0 +1,10 @@
+{
+  "$comment": "双端共享 PBKDF2-HMAC-SHA256 测试向量（L1 storage_key）。Rust 侧已产出基准值（crypto.rs v3_pbkdf2_testvector_baseline），Java 侧 Pbkdf2 手写实现必须断言一致。必须进 CI。",
+  "name": "pbkdf2_hmac_sha256_localsend",
+  "password_str": "NFNMPQRS",
+  "password_hex": "4e464b4d50515253",
+  "salt_hex": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+  "iterations": 600000,
+  "dkLen": 32,
+  "expected_hex": "4d27e37e161ca2882dc9bc83ba4ab7d3218fc3b1be3c26d432bf1ce27f018b4a"
+}

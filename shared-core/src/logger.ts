@@ -5,47 +5,56 @@
  * 1. 时间戳 + 级别 + 模块 + 消息 + 结构化错误码（code）+ 堆栈，写入环形缓冲；
  * 2. 统计 ERROR/WARN 次数并实时通知订阅者（UI 可显示错误徽标）；
  * 3. installGlobalHandlers() 侦测未捕获异常 / 未处理 Promise 拒绝；
- * 4. withTimeout() 侦测「卡死无返回」的静默失败（插件调用无响应等），
- *    这是本次 SAF 目录选择失败的根因场景：Promise 永不 settle，旧日志一无所获；
- * 5. persist()/restore() 把最近日志持久化到 localStorage，App 重启后仍可导出；
- * 6. export() 输出带摘要头部的完整日志，供手机端/电脑端写入日志文件。
+ * 4. withTimeout() 侦测「卡死无返回」的静默失败；
+ * 5. persist()/restore() 把最近日志持久化到 localStorage；
+ * 6. export() 输出带摘要头部的完整日志，含 trace_id；
+ * 7. startActiveSpan() 包裹函数并创建 OTel Span。
  *
- * 敏感信息（连接码/指纹/token）用 maskSecret 脱敏，日志文件可放心随工单分享。
+ * 敏感信息（连接码/指纹/token）用 maskSecret 脱敏。
  */
+
+import { getTracer, currentTraceId, setTelemetryEnabled, isTelemetryEnabled } from './telemetry.js';
+import { SpanStatusCode } from '@opentelemetry/api';
+
+/** OTel Span 的方法子集，供 startActiveSpan 回调使用 */
+interface SpanLike {
+  setAttribute(key: string, value: unknown): void;
+  setAttributes(attrs: Record<string, unknown>): void;
+  setStatus(opts: { code: SpanStatusCode; message?: string }): void;
+  recordException(err: Error): void;
+  end(code?: LogCode): void;
+}
 
 /** 日志级别 */
 export type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
 
-/** 结构化错误码（调度器据此归类问题） */
+/** 结构化错误码 */
 export type LogCode =
-  | 'TIMEOUT' // 操作超时（插件/网络未响应）
-  | 'PLUGIN_FAIL' // 原生插件调用失败
-  | 'HTTP_FAIL' // 网络请求失败
-  | 'SAF_CANCELLED' // 用户取消（如目录选择）
-  | 'SAF_FAIL' // SAF 文件操作失败
-  | 'UNCAUGHT' // 未捕获异常 / 未处理 Promise 拒绝
-  | 'VUE_ERROR' // Vue 渲染/生命周期错误
-  | 'INIT_FAIL' // 初始化失败
-  | 'RUNTIME'; // 其他运行时错误
+  | 'TIMEOUT'
+  | 'PLUGIN_FAIL'
+  | 'HTTP_FAIL'
+  | 'SAF_CANCELLED'
+  | 'SAF_FAIL'
+  | 'UNCAUGHT'
+  | 'VUE_ERROR'
+  | 'INIT_FAIL'
+  | 'RUNTIME';
 
 /** 环形缓冲区上限（条） */
 export const MAX_LOG_ENTRIES = 2000;
 
-/** 单条堆栈上限（字符），防止超大堆栈撑爆导出文件 */
+/** 单条堆栈上限（字符） */
 const MAX_STACK_CHARS = 4000;
 
 /** 缓冲中的单条日志 */
 export interface LogEntry {
-  /** Unix 毫秒时间戳 */
   ts: number;
   level: LogLevel;
-  /** 模块名（如 'transfer'、'filesystem'、'receiver'、'ui'、'global'） */
   module: string;
   message: string;
-  /** 结构化错误码，便于检索归类 */
   code?: LogCode;
-  /** 错误堆栈（截断后） */
   stack?: string;
+  traceId?: string;
 }
 
 /** 日志级别统计 */
@@ -66,20 +75,14 @@ export function formatLogTimestamp(ts: number): string {
   );
 }
 
-/**
- * 脱敏：只保留前 2 + 后 2 字符，中间打码。
- * 用于连接码、设备指纹、会话 token 等配对凭据，避免日志泄露。
- */
+/** 脱敏 */
 export function maskSecret(secret: string): string {
   if (!secret) return '';
   if (secret.length <= 4) return '****';
   return `${secret.slice(0, 2)}****${secret.slice(-2)}`;
 }
 
-/**
- * 列表摘要：条目少时全量展示，多时只展示前 max 条。
- * 用于日志中展示「文件列表」，避免超大清单撑爆日志。
- */
+/** 列表摘要 */
 export function summarizeList(items: string[], max = 20): string {
   if (items.length === 0) return '[]';
   if (items.length <= max) return `[${items.join(', ')}]`;
@@ -106,40 +109,38 @@ export class DebugDispatcher {
   private entries: LogEntry[] = [];
   private minLevel: LogLevel = 'DEBUG';
   private readonly maxEntries = MAX_LOG_ENTRIES;
-  private readonly maxBytes = 512 * 1024; // 缓冲总字节上限（防内存溢出）
+  private readonly maxBytes = 512 * 1024;
   private handlersInstalled = false;
   private counts: LogSummary = { debug: 0, info: 0, warn: 0, error: 0 };
   private totalBytes = 0;
   private readonly persistKey = 'lanbackup_debug_log';
   private listeners = new Set<() => void>();
-  /** ERROR 出现时的回调（UI 可据此弹提示） */
   onError: (() => void) | null = null;
-  /** 调试模式总开关：关闭后所有日志（含 WARN/ERROR）都不记录、不持久化，提升性能 */
-  private enabled = true;
 
-  /** 设置调试模式（false = 完全关闭日志；持久化由调用方负责） */
+  /** 调试模式总开关：关闭后 DEBUG/INFO/WARN 日志不记录，
+   * 但 ERROR 日志仍会记录并持久化（确保关键错误不丢失） */
+  private _enabled = true;
+
+  /** 设置调试模式（false = 关闭 DEBUG/INFO/WARN；ERROR 始终记录） */
   setDebugEnabled(v: boolean): void {
-    this.enabled = v;
+    this._enabled = v;
+    setTelemetryEnabled(v);
   }
 
-  /** 当前调试模式状态 */
   get debugEnabled(): boolean {
-    return this.enabled;
+    return this._enabled;
   }
-  /** 设备标签（'手机' / '电脑'），由两端启动时设置，随每条日志与文件名标注 */
+
   private deviceTag = '';
 
-  /** 设置设备标签（日志条目与导出文件名都会携带，便于区分移动端/桌面端） */
   setDevice(tag: string): void {
     this.deviceTag = tag;
   }
 
-  /** 当前设备标签 */
   get device(): string {
     return this.deviceTag;
   }
 
-  /** 设置最低输出级别（低于该级别的日志不输出、不入缓冲） */
   setMinLevel(level: LogLevel): void {
     this.minLevel = level;
   }
@@ -154,12 +155,8 @@ export class DebugDispatcher {
   }
 
   /**
-   * 核心上报入口：所有模块统一经此上报，调度器负责落缓冲、统计、通知、持久化。
-   * @param level 级别
-   * @param module 模块名
-   * @param message 人类可读描述（说明发生了什么、如何影响用户）
-   * @param opts.code 结构化错误码
-   * @param opts.error 原始错误对象（自动提取 message + stack）
+   * 核心上报入口
+   * 规则：_enabled=false 时，ERROR 仍记录（但不输出到 console），其他级别丢弃
    */
   report(
     level: LogLevel,
@@ -167,9 +164,10 @@ export class DebugDispatcher {
     message: string,
     opts: { error?: unknown; code?: LogCode } = {},
   ): void {
-    // 调试模式关闭 → 完全跳过（热路径零开销，含 WARN/ERROR）
-    if (!this.enabled) return;
-    if (this.order(level) < this.order(this.minLevel)) return;
+    // ERROR 级别永远记录（即使 debug 模式关闭），确保关键错误持久化
+    const isError = level === 'ERROR';
+    if (!this._enabled && !isError) return;
+    if (!isError && this.order(level) < this.order(this.minLevel)) return;
 
     let msg = message;
     let stack: string | undefined;
@@ -181,16 +179,20 @@ export class DebugDispatcher {
       }
     }
 
-    const entry: LogEntry = { ts: Date.now(), level, module, message: msg };
-    if (opts.code) entry.code = opts.code;
-    if (stack) entry.stack = stack;
+    const entry: LogEntry = {
+      ts: Date.now(),
+      level,
+      module,
+      message: msg,
+      code: opts.code,
+      stack,
+      traceId: currentTraceId(),
+    };
 
     this.entries.push(entry);
     this.counts[level.toLowerCase() as 'debug' | 'info' | 'warn' | 'error']++;
     this.totalBytes += msg.length + (stack?.length ?? 0);
 
-    // 环形缓冲：超条数或超字节丢弃最旧。用一次 splice 批量移除，
-    // 避免逐条 shift() 的 O(n) 内存移动（单次大溢出只做一次 memmove）
     if (this.entries.length > this.maxEntries) {
       const overflow = this.entries.length - this.maxEntries;
       const removed = this.entries.splice(0, overflow);
@@ -201,19 +203,21 @@ export class DebugDispatcher {
       this.totalBytes -= old.message.length + (old.stack?.length ?? 0);
     }
 
-    const line = this.format(entry);
-    switch (level) {
-      case 'DEBUG': console.debug(line); break;
-      case 'INFO': console.info(line); break;
-      case 'WARN': console.warn(line); break;
-      case 'ERROR': console.error(line); break;
+    // 仅在 debug 模式开启时输出到 console
+    if (this._enabled) {
+      const line = this.format(entry);
+      switch (level) {
+        case 'DEBUG': console.debug(line); break;
+        case 'INFO': console.info(line); break;
+        case 'WARN': console.warn(line); break;
+        case 'ERROR': console.error(line); break;
+      }
     }
 
-    // 通知订阅者（UI 刷新错误徽标）
     for (const fn of this.listeners) fn();
-    if (level === 'ERROR' && this.onError) this.onError();
-    // 错误/警告出现时持久化，避免进程被杀丢日志
-    if (level === 'ERROR' || level === 'WARN') this.persist();
+    if (isError && this.onError) this.onError();
+    // ERROR 和 WARN 都需要持久化
+    if (isError || level === 'WARN') this.persist();
   }
 
   debug(module: string, message: string): void {
@@ -232,16 +236,50 @@ export class DebugDispatcher {
     this.report('ERROR', module, message, { error, code: 'RUNTIME' });
   }
 
-  /** 带错误码的报错（模块能明确归类问题时使用） */
   errorCode(module: string, message: string, code: LogCode, error?: unknown): void {
     this.report('ERROR', module, message, { error, code });
   }
 
   /**
-   * 侦测「卡死无返回」的静默失败：为异步操作加超时。
-   * 超时未 settle → 上报 ERROR(TIMEOUT) 并 reject，调用方可提示用户。
-   * 用于包裹原生插件调用、网络请求等可能永久挂起的操作。
+   * 包裹函数并创建 OTel Span。
+   * Promise 返回路径：Span 生命周期由调用方（XHR 回调）负责 end。
+   * ⚠️ 维护者注意：务必在每条 XHR 分支（含错误分支）调用 span.end()，
+   * 否则 Span 泄漏。未来新增 XHR 分支时此处 catch 无法兜底。
    */
+  startActiveSpan<T>(name: string, fn: (span: SpanLike) => T): T {
+    const tracer = getTracer();
+    return tracer.startActiveSpan(name, (span) => {
+      try {
+        const result = fn({
+          setAttribute: (key: string, value: unknown) => span.setAttribute(key, value as string | number | boolean),
+          setAttributes: (attrs: Record<string, unknown>) => span.setAttributes(attrs as Record<string, string | number | boolean>),
+          setStatus: (opts: { code: SpanStatusCode; message?: string }) => {
+            span.setStatus(opts);
+          },
+          recordException: (err: Error) => span.recordException(err),
+          end: (code?: LogCode) => {
+            span.setStatus({
+              code: code ? SpanStatusCode.ERROR : SpanStatusCode.OK,
+              message: code ?? undefined,
+            });
+            span.end();
+          },
+        });
+
+        if (!(result instanceof Promise)) {
+          span.end();
+        }
+        return result;
+      } catch (err) {
+        span.recordException(err as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR });
+        span.end();
+        throw err;
+      }
+    });
+  }
+
+  /** 侦测「卡死无返回」的静默失败：为异步操作加超时（插件调用无响应等）。 */
   withTimeout<T>(
     promise: Promise<T>,
     ms: number,
@@ -268,10 +306,7 @@ export class DebugDispatcher {
     });
   }
 
-  /**
-   * 安装全局错误捕获（幂等）：未捕获异常、未处理 Promise 拒绝。
-   * 由两端 main.ts 调用一次；任何模块漏报的错误都会在这里被兜底捕获。
-   */
+  /** 安装全局错误捕获（幂等）：未捕获异常、未处理 Promise 拒绝。 */
   installGlobalHandlers(): void {
     if (this.handlersInstalled || typeof window === 'undefined') return;
     this.handlersInstalled = true;
@@ -306,11 +341,12 @@ export class DebugDispatcher {
     return this.counts.error > 0;
   }
 
-  /** 格式化单条日志（导出格式）：含错误码与堆栈、设备标签 */
+  /** 格式化单条日志（导出格式）：含错误码、trace_id 与堆栈 */
   format(entry: LogEntry): string {
     const code = entry.code ? ` <${entry.code}>` : '';
     const device = this.deviceTag ? ` [${this.deviceTag}]` : '';
-    let line = `[${formatLogTimestamp(entry.ts)}] [${entry.level}] [${entry.module}]${code}${device} ${entry.message}`;
+    const trace = entry.traceId ? ` {${entry.traceId}}` : '';
+    let line = `[${formatLogTimestamp(entry.ts)}] [${entry.level}] [${entry.module}]${code}${device}${trace} ${entry.message}\n`;
     if (entry.stack) line += `\n    ${entry.stack.replace(/\n/g, '\n    ')}`;
     return line;
   }
@@ -363,7 +399,6 @@ export class DebugDispatcher {
       if (!raw) return;
       const saved = JSON.parse(raw) as LogEntry[];
       if (!Array.isArray(saved)) return;
-      // 只合并尚未记录的条目（按 ts 去重粗判）
       const known = new Set(this.entries.map((e) => `${e.ts}|${e.module}|${e.message}`));
       for (const e of saved) {
         const key = `${e.ts}|${e.module}|${e.message}`;
@@ -401,7 +436,7 @@ export function logError(module: string, message: string, error?: unknown): void
   logger.error(module, message, error);
 }
 
-/** 生成日志文件名：debug_<设备>_YYYYMMDD_HHmmss.log（设备标签默认取 logger.device） */
+/** 生成日志文件名：debug_<设备>_YYYYMMDD_HHmmss.log */
 export function logFileName(now: Date = new Date(), tag: string = logger.device): string {
   const pad = (n: number) => String(n).padStart(2, '0');
   const safe = (tag || 'device').replace(/[\\/:*?"<>|]/g, '_');

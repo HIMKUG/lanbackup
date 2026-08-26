@@ -8,6 +8,10 @@
 
 import { logger } from './logger.js';
 
+
+// 最大重命名尝试次数，防止无限循环
+const MAX_RENAME_ATTEMPTS = 1000;
+
 /** 目标端已存在的文件信息 */
 export interface ExistingFile {
   /** 文件名（含扩展名） */
@@ -65,34 +69,45 @@ export function conflictRename(originalName: string, mtime: number): string {
  * 计算最终写入文件名。
  * 若冲突，则重命名；否则用原名。
  * 若重命名后仍冲突（极小概率），追加序号。
- *
- * @param existing 目标端已存在的文件（按文件名索引）
- * @param incoming 待写入的文件
- * @returns 最终文件名
  */
 export function resolveFileName(
   existing: Record<string, ExistingFile>,
   incoming: IncomingFile,
 ): string {
-  const current = existing[incoming.name];
-  if (!isConflict(current, incoming)) {
-    return incoming.name;
-  }
+  return logger.startActiveSpan('conflict.resolveFileName', (span) => {
+    span.setAttributes({
+      'file.name': incoming.name,
+      'file.size': incoming.size,
+    });
 
-  // 冲突 → 重命名
-  let candidate = conflictRename(incoming.name, incoming.mtime);
-  let counter = 1;
-  // 若重命名后仍冲突，追加序号
-  while (existing[candidate] && isConflict(existing[candidate], incoming)) {
-    const dot = candidate.lastIndexOf('.');
-    const base = dot > 0 ? candidate.slice(0, dot) : candidate;
-    const ext = dot > 0 ? candidate.slice(dot) : '';
-    candidate = `${base}_${counter}${ext}`;
-    counter++;
-  }
-  logger.warn(
-    'conflict',
-    `冲突重命名: ${incoming.name}（大小=${incoming.size}, mtime=${incoming.mtime}）→ ${candidate}`,
-  );
-  return candidate;
+    const current = existing[incoming.name];
+    if (!isConflict(current, incoming)) {
+      span.setAttribute('conflict.detected', false);
+      span.end();
+      return incoming.name;
+    }
+
+    span.setAttribute('conflict.detected', true);
+
+    let candidate = conflictRename(incoming.name, incoming.mtime);
+    let counter = 1;
+    while (existing[candidate] && isConflict(existing[candidate], incoming) && counter <= MAX_RENAME_ATTEMPTS) {
+      const dot = candidate.lastIndexOf('.');
+      const base = dot > 0 ? candidate.slice(0, dot) : candidate;
+      const ext = dot > 0 ? candidate.slice(dot) : '';
+      candidate = `${base}_${counter}${ext}`;
+      counter++;
+      if (counter > MAX_RENAME_ATTEMPTS) break;
+    }
+
+    span.setAttribute('conflict.attempt_count', counter);
+    span.setAttribute('conflict.final_name', candidate);
+
+    logger.warn(
+      'conflict',
+      `冲突重命名: ${incoming.name}（大小=${incoming.size}, mtime=${incoming.mtime}）→ ${candidate}`,
+    );
+    span.end();
+    return candidate;
+  });
 }

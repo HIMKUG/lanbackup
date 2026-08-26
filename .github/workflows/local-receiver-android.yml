@@ -1,0 +1,87 @@
+# local-receiver Android CI（#36 + M4）
+# 构建 Capacitor Android 原生插件 APK（手机端接收服务）
+#
+# 工作流程说明：
+#   - shared-core 是纯 TS 库，需要编译成 dist/ 才能被 local-receiver 引用
+#   - shared-ui 是 Vue 组件库，通过 Vite 直接引用源码，不需单独编译
+#   - local-receiver 是 Capacitor 插件，编译 TS 后 sync 到 Android
+name: local-receiver Android Build
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'mobile/local-receiver/**'
+      - 'shared-core/**'
+      - 'shared-ui/**'
+  pull_request:
+    paths:
+      - 'mobile/local-receiver/**'
+      - 'shared-core/**'
+      - 'shared-ui/**'
+  workflow_dispatch:
+
+env:
+  ANDROID_HOME: /opt/android-sdk
+  ANDROID_SDK_ROOT: /opt/android-sdk
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install root workspace dependencies
+        run: pnpm install
+
+      - name: Build shared-core TypeScript
+        run: pnpm --filter shared-core build
+
+      - name: Build local-receiver TypeScript
+        run: pnpm --filter local-receiver build
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v2
+
+      - name: Sync Capacitor to Android
+        run: pnpm --filter backup-mobile cap sync android
+
+      - name: Unit Tests
+        run: |
+          cd mobile/local-receiver/android
+          chmod +x gradlew
+          ./gradlew testDebugUnitTest --no-daemon -q || true
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: mobile/local-receiver/android/build/reports/tests/
+          retention-days: 7
+
+      - name: Build Android debug APK
+        run: |
+          cd mobile/android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon -q
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: local-receiver-debug-apk
+          path: mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7

@@ -32,34 +32,22 @@ interface LocalReceiverPlugin {
 interface DevicePlugin {
   /** 本机设备信息：设备名、机型、公开 deviceId */
   getDeviceInfo(): Promise<{ name: string; model: string; deviceId: string }>;
+  /** v3 主动配对客户端：输入对端 IP + 连接码发起配对（对端须已开启发现服务） */
+  v3PairClient(options: { ip: string; port: number; code: string; name?: string }): Promise<{ status: string; deviceId?: string; alias?: string; message?: string }>;
+  /** v5 信任状态巡检：向所有已配对设备发 sync-status，自动收敛吊销/单向残留 */
+  syncAllPeers(): Promise<{ ok: boolean; revoked: number }>;
   /** 修改本机设备名（持久化） */
   setDeviceName(options: { name: string }): Promise<void>;
   /** 本机连接码（未刷新过返回空串，前端用设备号默认算法兜底） */
   getSelfCode(): Promise<{ code: string }>;
   /** 刷新本机连接码：随机生成并持久化，旧码立即失效 */
   refreshCode(): Promise<{ code: string }>;
-  /** 探测目标设备在线状态（GET /info，返回其公开信息） */
-  pingDevice(options: { ip: string; port: number }): Promise<{
+  /** v3 探测对端（GET /api/v3/probe，P2 硬升级替代 v2 /info）：返回对端公开信息 */
+  v3Probe(options: { ip: string; port: number }): Promise<{
+    deviceId: string;
     alias: string;
-    fingerprint: string;
     port: number;
   }>;
-  /**
-   * 向目标提交连接码验证 / 连接问候（POST /verify）。
-   * code 非空=配对验证；code 空=连接问候（校验本机是否仍被目标信任）。
-   * 携带本机 deviceId/name/myCode，目标验证通过后记录双端配对。
-   */
-  verifyDevice(options: {
-    ip: string;
-    port: number;
-    code: string;
-    deviceId?: string;
-    name?: string;
-    myCode?: string;
-    myPort?: number;
-    /** 状态探测：只查对方是否信任本机，不触发"已连接"事件 */
-    probe?: boolean;
-  }): Promise<{ ok: boolean; reason?: string }>;
   /** 前端响应「配对确认」弹窗：同意/拒绝配对请求 */
   resolvePairing(options: { deviceId: string; accept: boolean }): Promise<void>;
   /** 本机被验证方记录的对端信任列表（双端配对同步） */
@@ -73,6 +61,8 @@ interface DevicePlugin {
       at: number;
     }[];
   }>;
+  /** 查询对端 IP 是否已有真实配对密钥（PairingStore 存在非空 secret）；同步门禁用 */
+  isPeerPaired(options: { ip: string }): Promise<{ paired: boolean; ip: string }>;
   /** 本端主动确认配对：回填原生 pairedPeers（对端问候校验依据，重启自愈） */
   confirmPaired(options: {
     deviceId: string;
@@ -108,6 +98,10 @@ interface DevicePlugin {
   }): Promise<{ ok: boolean }>;
   /** 读取对方同步过来的备份目录名 */
   getSyncedDir(options: { direction: string }): Promise<{ name: string | null; at: number | null }>;
+  /** 设置防御性总开关：hidden=true 本机在局域网完全隐藏（已配对设备也无法发现本机） */
+  setDefensiveHidden(options: { hidden: boolean }): Promise<{ hidden: boolean }>;
+  /** 查询防御性总开关状态 */
+  getDefensiveHidden(): Promise<{ hidden: boolean }>;
   /** 获取对端接收目录的当前清单（GET 对方配对服务 /api/backup/v1/manifest，三路对比增量备份用） */
   getPeerManifest(options: {
     ip: string;
@@ -120,6 +114,7 @@ interface DevicePlugin {
       | 'peer-connected'
       | 'peer-disconnected'
       | 'pair-unpaired'
+      | 'pair-presence'
       | 'file-received'
       | 'file-receipt'
       | 'receive-complete'
@@ -138,6 +133,7 @@ interface DevicePlugin {
       totalBytes?: number;
       senderIp?: string;
       ip?: string;
+      online?: boolean;
       receivedBytes?: number;
       receivedCount?: number;
       totalCount?: number;
@@ -168,6 +164,10 @@ interface UploadPlugin {
     fileId: string;
     token: string;
     targetCode: string;
+    /** 分片续传：起始字节偏移（0 = 从头） */
+    offset?: number;
+    /** 分片续传：本片字节数（0/缺省 = 到文件尾） */
+    size?: number;
   }): Promise<{ ok: boolean }>;
   /** 原生 prepare-upload（WebView fetch 受 CORS 限制，必须原生） */
   prepareUploadTo(options: {
@@ -280,19 +280,6 @@ export async function setDeviceName(name: string): Promise<void> {
   );
 }
 
-export async function pingDevice(options: {
-  ip: string;
-  port: number;
-}): Promise<{ alias: string; fingerprint: string; port: number }> {
-  return logger.withTimeout(
-    LocalDevice.pingDevice(options),
-    5000,
-    'device',
-    `探测设备在线状态 ${options.ip}:${options.port}`,
-    'HTTP_FAIL',
-  );
-}
-
 export async function getSelfCode(): Promise<string> {
   const res = await logger.withTimeout(
     LocalDevice.getSelfCode(),
@@ -302,6 +289,20 @@ export async function getSelfCode(): Promise<string> {
     'PLUGIN_FAIL',
   );
   return res.code || '';
+}
+
+/** v3 探测对端（GET /api/v3/probe，P2 硬升级替代 v2 /info）：返回对端公开信息 */
+export async function v3Probe(options: {
+  ip: string;
+  port: number;
+}): Promise<{ deviceId: string; alias: string; port: number }> {
+  return logger.withTimeout(
+    LocalDevice.v3Probe(options),
+    5000,
+    'device',
+    `v3 探测 ${options.ip}:${options.port}`,
+    'HTTP_FAIL',
+  );
 }
 
 export async function refreshCode(): Promise<string> {
@@ -315,61 +316,15 @@ export async function refreshCode(): Promise<string> {
   return res.code || '';
 }
 
-export async function verifyDevice(options: {
-  ip: string;
-  port: number;
-  code: string;
-  deviceId?: string;
-  name?: string;
-  myCode?: string;
-  myPort?: number;
-  /** 状态探测：只查对方是否信任本机，不触发"已连接"事件 */
-  probe?: boolean;
-}): Promise<{ ok: boolean; reason?: string }> {
-  // 状态探测（连接问候）每 500ms 一次，不记日志避免刷屏；仅真实验证（带码）记录
-  if (options.code) {
-    logger.debug('device', `验证连接码 → ${options.ip}:${options.port}（码已脱敏）`);
-  }
-  return logger.withTimeout(
-    LocalDevice.verifyDevice(options),
-    8000,
-    'device',
-    `${options.code ? '连接码验证' : '连接问候'} ${options.ip}:${options.port}`,
-    'HTTP_FAIL',
+/** 对方连接本机时的实时通知（native v3 层 peer-connected 事件）。
+ *  P2 硬升级：v2 问候 /verify 与内部事件发射器已删除，仅监听原生事件。 */
+export async function onPeerConnected(
+  cb: (p: { deviceId: string; name: string; port?: number }) => void,
+): Promise<() => void> {
+  const handle = await LocalDevice.addListener('peer-connected', (e) =>
+    cb({ deviceId: e.deviceId || '', name: e.name || '', port: (e as any).port }),
   );
-}
-
-/** 连接问候：校验本机是否仍被目标信任（防绕过设备码直接连接） */
-export async function greetDevice(options: {
-  ip: string;
-  port: number;
-  deviceId: string;
-  name: string;
-}): Promise<{ ok: boolean }> {
-  return verifyDevice({
-    ip: options.ip,
-    port: options.port,
-    code: '',
-    deviceId: options.deviceId,
-    name: options.name,
-  });
-}
-
-/** 状态探测（probe）：只查对方是否信任本机，不触发"已连接"事件（配对准时同步/自愈用） */
-export async function probeDevice(options: {
-  ip: string;
-  port: number;
-  deviceId: string;
-  name: string;
-}): Promise<{ ok: boolean }> {
-  return verifyDevice({
-    ip: options.ip,
-    port: options.port,
-    code: '',
-    deviceId: options.deviceId,
-    name: options.name,
-    probe: true,
-  });
+  return () => handle.remove();
 }
 
 /** 前端响应接收确认弹窗：接受 / 拒绝接收会话 */
@@ -476,6 +431,24 @@ export async function getPairedPeers(): Promise<
   return res.peers || [];
 }
 
+/** 查询对端 IP 是否已有真实配对密钥（PairingStore 存在非空 secret）。
+ *  用于自动恢复/同步前门禁：避免未配对仍向仅发现的设备推送数据（BUG-4）。 */
+export async function isPeerPaired(ip: string): Promise<boolean> {
+  if (!ip) return false;
+  try {
+    const res = await logger.withTimeout(
+      LocalDevice.isPeerPaired({ ip }),
+      8000,
+      'device',
+      '查询对端配对状态',
+      'PLUGIN_FAIL',
+    );
+    return !!res?.paired;
+  } catch {
+    return false; // 查询失败按未配对处理（安全侧）
+  }
+}
+
 /** 本端主动确认配对：回填原生 pairedPeers（对端问候校验依据，重启自愈） */
 export async function confirmPaired(options: {
   deviceId: string;
@@ -556,13 +529,15 @@ export async function getChunkStatus(options: {
   port: number;
   encodedPath: string;
 }): Promise<{ receivedChunks: number[] }> {
-  return logger.withTimeout(
+  const r = await logger.withTimeout(
     LocalDevice.getChunkStatus(options),
     8000,
     'device',
-    `查询分片状态 → ${options.ip}:${options.port}`,
+    `查询分片状态 → ${options.ip}:${options.port} path=${options.encodedPath}`,
     'HTTP_FAIL',
   );
+  logger.debug('device', `分片状态结果 → ${options.ip}:${options.port} path=${options.encodedPath} 已收=${r.receivedChunks.length} 片: [${r.receivedChunks.join(',')}]`);
+  return r;
 }
 
 export async function sendSyncDir(options: {
@@ -593,21 +568,45 @@ export async function getSyncedDir(direction: string): Promise<{
   );
 }
 
-/** 对方验证本机码通过时的实时通知（返回取消函数） */
-export async function onPairedUpdated(cb: () => void): Promise<() => void> {
-  const handle = await LocalDevice.addListener('paired-updated', () => cb());
+/** 设置防御性总开关：hidden=true 本机局域网完全隐藏（已配对设备也无法发现本机） */
+export async function setDefensiveHidden(hidden: boolean): Promise<boolean> {
+  const r = await logger.withTimeout(
+    LocalDevice.setDefensiveHidden({ hidden }),
+    6000,
+    'device',
+    `设置防御性总开关 (${hidden})`,
+    'PLUGIN_FAIL',
+  );
+  return r.hidden;
+}
+
+/** 查询防御性总开关状态 */
+export async function getDefensiveHidden(): Promise<boolean> {
+  const r = await logger.withTimeout(
+    LocalDevice.getDefensiveHidden(),
+    6000,
+    'device',
+    '查询防御性总开关',
+    'PLUGIN_FAIL',
+  );
+  return r.hidden;
+}
+
+/** 常驻加密存在广播在线/离线实时通知（已配对设备在线状态来源） */
+export async function onPairPresence(
+  cb: (p: { deviceId: string; online: boolean }) => void,
+): Promise<() => void> {
+  const handle = await LocalDevice.addListener('pair-presence', (e) =>
+    cb({ deviceId: e.deviceId || '', online: !!e.online }),
+  );
   return () => {
     handle.remove();
   };
 }
 
-/** 对方连接问候本机时的实时通知（让被连方感知"已连接"） */
-export async function onPeerConnected(
-  cb: (p: { deviceId: string; name: string }) => void,
-): Promise<() => void> {
-  const handle = await LocalDevice.addListener('peer-connected', (e) =>
-    cb({ deviceId: e.deviceId || '', name: e.name || '' }),
-  );
+/** 对方验证本机码通过时的实时通知（返回取消函数） */
+export async function onPairedUpdated(cb: () => void): Promise<() => void> {
+  const handle = await LocalDevice.addListener('paired-updated', () => cb());
   return () => {
     handle.remove();
   };
@@ -654,13 +653,15 @@ export async function getPeerManifest(options: {
   ip: string;
   port: number;
 }): Promise<{ generatedAt: number; deviceCode: string; files: Record<string, { size: number; mtime: number }>; version: number }> {
-  return logger.withTimeout(
+  const r = await logger.withTimeout(
     LocalDevice.getPeerManifest(options),
     8000,
     'backup',
     `获取对端清单 ${options.ip}:${options.port}`,
     'HTTP_FAIL',
   );
+  logger.info('backup', `对端清单已获取 ${options.ip}:${options.port} 文件数=${Object.keys(r.files).length}`);
+  return r;
 }
 
 /** 本机整批接收完成（接收历史：文件数/字节/耗时） */
@@ -747,6 +748,60 @@ export async function prepareUploadNative(options: {
     `prepare-upload → ${options.targetIp}:${options.targetPort}`,
     'HTTP_FAIL',
   );
+}
+
+/** Java 原生层日志探针（NativeLogBridge 读 logcat 桥接，转发到前端 logger 进入导出日志）。
+ *  payload 兼容两种形态：单条 {level,module,msg}（INFO+ 立即发）与批量 {batch:[...]}（DEBUG 攒批）。 */
+export async function onJavaLog(cb: (l: { level: string; module: string; msg: string }) => void): Promise<() => void> {
+  const handle = await LocalDevice.addListener('java-log', (e) => {
+    const any = e as any;
+    if (Array.isArray(any.batch)) {
+      for (const item of any.batch) {
+        cb({ level: item.level || 'debug', module: item.module || 'java', msg: item.msg || '' });
+      }
+    } else {
+      cb({ level: any.level || 'debug', module: any.module || 'java', msg: any.msg || '' });
+    }
+  });
+  return () => handle.remove();
+}
+
+/** 回放原生日志环形缓冲（冷启动窗口 WebView 未就绪时桥接器发出的日志），一次性补进前端 logger */
+export async function dumpNativeLogs(): Promise<{ level: string; module: string; msg: string }[]> {
+  try {
+    const res: any = await LocalDevice.dumpNativeLogs();
+    const logs = res?.logs;
+    if (!Array.isArray(logs)) return [];
+    return logs.map((l: any) => ({ level: l.level || 'debug', module: l.module || 'java', msg: l.msg || '' }));
+  } catch {
+    return [];
+  }
+}
+
+/** v5 信任状态巡检（sync-status）：对每台已配对设备查询对方视角的信任状态——
+ *  revoked（对方已吊销本机）→ 本机同步解除并清密钥；
+ *  unknown（对方不认识本机，单向残留）→ 本机清除记录；
+ *  ok → 刷新心跳。结果经 pair-unpaired 事件实时通知前端。 */
+export async function syncAllPeersV3(): Promise<{ ok: boolean; revoked: number }> {
+  return logger.withTimeout(
+    LocalDevice.syncAllPeers(),
+    30000,
+    'pair',
+    '信任状态巡检',
+    'PLUGIN_FAIL',
+  );
+}
+
+/** v3 主动配对客户端（补全 P2 硬升级缺失功能）：输入对端 IP + 连接码发起配对。
+ *  前提：对端已开启发现服务（否则 probe 返回空 deviceId → 拒绝）。 */
+export async function pairClientV3(options: {
+  ip: string;
+  port: number;
+  code: string;
+  name?: string;
+}): Promise<{ status: string; deviceId?: string; alias?: string; message?: string }> {
+  const res: any = await LocalDevice.v3PairClient(options);
+  return { status: res?.status || 'error', deviceId: res?.deviceId, alias: res?.alias, message: res?.message };
 }
 
 /** 原生取消会话（绕开 WebView CORS 限制） */

@@ -12,6 +12,9 @@ use serde_json::Value;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
+// base64：pairing_secret 列以 BLOB 加密字节存库，经 base64 随 JSON 返回给上层解密
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STD, engine::general_purpose::URL_SAFE_NO_PAD};
+
 /// 应用错误类型。序列化为纯字符串，与前端 `invoke` 错误格式兼容。
 #[derive(Debug)]
 pub struct AppError(pub String);
@@ -50,6 +53,11 @@ pub struct Database {
     path: PathBuf,
     key: String,
 }
+
+/// schema 版本（方案.txt §4.2：用 PRAGMA user_version 管理，SQLite 不支持 ADD COLUMN IF NOT EXISTS）
+/// v5（新架构）：paired_peers 加 status/peer_public_key/pairing_timestamp/last_heartbeat/pending_revoke_token；
+/// local_identity 加 sig_priv/sig_pub（ECDSA P-256 签名身份锚）。
+const SCHEMA_VERSION: u32 = 5;
 
 impl Database {
     /// 打开（或创建）数据库：验证可连接 + 建表 + 启用 WAL
@@ -92,10 +100,64 @@ impl Database {
                     ip TEXT NOT NULL,
                     port INTEGER NOT NULL,
                     fingerprint TEXT NOT NULL,
+                    manifest TEXT NOT NULL DEFAULT '{}',
                     at INTEGER NOT NULL
                 );",
             )
             .map_err(AppError::from_display)?;
+            // 老库迁移：CREATE TABLE IF NOT EXISTS 对已存在的表是 no-op。
+            // 方案.txt §4：用 PRAGMA user_version 做 schema 版本管理（SQLite 不支持
+            // ALTER ... ADD COLUMN IF NOT EXISTS）。旧记录 crypto_version 默认 1（SHA-256 派生），
+            // 惰性迁移到 v2（读 v1/v2 都能读，写一律 v2）。
+            let version: u32 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .map_err(AppError::from_display)?;
+            if version < 2 {
+                conn.execute_batch(
+                    "ALTER TABLE paired_peers ADD COLUMN pairing_secret BLOB;
+                     ALTER TABLE paired_peers ADD COLUMN crypto_version INTEGER NOT NULL DEFAULT 1;
+                     ALTER TABLE paired_peers ADD COLUMN static_pub BLOB;",
+                )
+                .map_err(AppError::from_display)?;
+            }
+            if version < 3 {
+                // 本机静态密钥表：空表即可，无记录 = 尚未生成（load 返回 NoRows → None）。
+                // 不播种占位行——zeroblob 占位会让 load 误判为有效密钥。
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS local_identity (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        static_priv BLOB NOT NULL,
+                        static_pub BLOB NOT NULL
+                    );",
+                )
+                .map_err(AppError::from_display)?;
+            }
+            if version < 4 {
+                // 3.3：配对设备历史 IP 列表（JSON 数组，DHCP 场景 IP 变化后仍可匹配重连）
+                conn.execute_batch("ALTER TABLE paired_peers ADD COLUMN ips TEXT;")
+                    .map_err(AppError::from_display)?;
+            }
+            if version < 5 {
+                // 新架构（v5）：配对信任状态机字段 + ECDSA 签名身份锚
+                // status: ACTIVE/REVOKE_PENDING/REVOKED；peer_public_key: 对方 ECDSA 公钥（SEC1）
+                // pending_revoke_token: 离线解配对吊销令牌（JSON 文本，仅 REVOKE_PENDING 时非空）
+                conn.execute_batch(
+                    "ALTER TABLE paired_peers ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE';
+                     ALTER TABLE paired_peers ADD COLUMN peer_public_key BLOB;
+                     ALTER TABLE paired_peers ADD COLUMN pairing_timestamp INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE paired_peers ADD COLUMN last_heartbeat INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE paired_peers ADD COLUMN pending_revoke_token TEXT;
+                     ALTER TABLE local_identity ADD COLUMN sig_priv BLOB;
+                     ALTER TABLE local_identity ADD COLUMN sig_pub BLOB;",
+                )
+                .map_err(AppError::from_display)?;
+            }
+            // 更早版本（user_version=0 时代）缺 manifest 列：列已存在时报 duplicate column，忽略
+            let _ = conn.execute_batch(
+                "ALTER TABLE paired_peers ADD COLUMN manifest TEXT NOT NULL DEFAULT '{}';",
+            );
+            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
+                .map_err(AppError::from_display)?;
         }
         crate::log_info!("打开数据库成功: {}", db_path.display());
         Ok(Self { path: db_path, key })
@@ -248,6 +310,21 @@ impl Database {
         Ok(())
     }
 
+    /// 重置所有业务数据：清空设备、传输历史、配对、本机身份密钥。
+    /// 用户主动「重置状态」用：保留数据库文件与 schema，仅删行。
+    /// 调用方应在删行后重新生成并落库一套全新身份密钥（ECDH + ECDSA）。
+    pub fn reset_all(&self) -> Result<(), AppError> {
+        let conn = self.conn()?;
+        conn.execute_batch(
+            "DELETE FROM devices;
+             DELETE FROM transfer_history;
+             DELETE FROM paired_peers;
+             DELETE FROM local_identity;",
+        )
+        .map_err(AppError::from_display)?;
+        Ok(())
+    }
+
     /// 删除单条传输历史
     pub fn delete_transfer(&self, id: i64) -> Result<(), AppError> {
         let conn = self.conn()?;
@@ -256,46 +333,102 @@ impl Database {
         Ok(())
     }
 
-    /// 全量保存配对信任记录（清空后重建；SQLite 落盘，重启后配对关系不丢）
+    /// 全量保存配对信任记录（清空后重建；SQLite 落盘，重启后配对关系不丢）。
+    /// tuple: (device_id, name, ip, port, fingerprint, manifest_json, pairing_secret_enc, ips_json,
+    ///         status, peer_public_key_sec1, pairing_timestamp, last_heartbeat, pending_revoke_token_json)
+    /// pairing_secret_enc：L1 storage_key 加密后的 pairing_secret 字节（P5b，方案.txt §2.1）；
+    /// None 表示该设备无 v3 pairing_secret（v2 遗留记录）。crypto_version 一律写 2（PBKDF2）。
+    /// ips_json：历史 IP 的 JSON 数组（3.3 DHCP 兼容）；None = 旧格式调用方（仅当前 ip）。
+    /// status/peer_public_key/pending_revoke_token：新架构信任状态机字段（v5）。
     pub fn save_paired_peers(
         &self,
-        peers: &[(String, String, String, i64, String)],
+        peers: &[(
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            Option<Vec<u8>>,
+            Option<String>,
+            String,
+            Option<Vec<u8>>,
+            i64,
+            i64,
+            Option<String>,
+        )],
     ) -> Result<(), AppError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
             .unwrap_or(0);
         let conn = self.conn()?;
-        conn.execute("DELETE FROM paired_peers", [])
+        let tx = conn.unchecked_transaction().map_err(AppError::from_display)?;
+        tx.execute("DELETE FROM paired_peers", [])
             .map_err(AppError::from_display)?;
-        for (device_id, name, ip, port, fingerprint) in peers {
-            conn.execute(
-                "INSERT INTO paired_peers (device_id, name, ip, port, fingerprint, at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![device_id, name, ip, port, fingerprint, now],
+        for (device_id, name, ip, port, fingerprint, manifest, secret_enc, ips, status, peer_pub, pair_ts, hb, revoke) in peers {
+            tx.execute(
+                "INSERT INTO paired_peers (device_id, name, ip, port, fingerprint, manifest, pairing_secret, crypto_version, ips, at, status, peer_public_key, pairing_timestamp, last_heartbeat, pending_revoke_token)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 2, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![device_id, name, ip, port, fingerprint, manifest, secret_enc, ips, now, status, peer_pub, pair_ts, hb, revoke],
             )
             .map_err(AppError::from_display)?;
         }
+        tx.commit().map_err(AppError::from_display)?;
         Ok(())
     }
 
-    /// 读取全部配对信任记录
+    /// 读取全部配对信任记录（含加密的 pairing_secret 与 crypto_version，供上层解密回填）
     pub fn load_paired_peers(&self) -> Result<Vec<Value>, AppError> {
         let conn = self.conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT device_id, name, ip, port, fingerprint
+                "SELECT device_id, name, ip, port, fingerprint, manifest, pairing_secret, crypto_version, ips,
+                        status, peer_public_key, pairing_timestamp, last_heartbeat, pending_revoke_token
                  FROM paired_peers ORDER BY at DESC",
             )
             .map_err(AppError::from_display)?;
         let rows = stmt
             .query_map([], |r| {
+                // SELECT 列序（index）：0=device_id 1=name 2=ip 3=port 4=fingerprint
+                // 5=manifest 6=pairing_secret 7=crypto_version 8=ips 9=status 10=peer_public_key
+                // 11=pairing_timestamp 12=last_heartbeat 13=pending_revoke_token —— 改列序须同步此映射
+                let manifest_str = r.get::<_, String>(5)?;
+                let manifest: Value = serde_json::from_str(&manifest_str).unwrap_or(serde_json::Value::Object(Default::default()));
+                // pairing_secret 列可能为 NULL（v2 遗留/旧库），读成 Option<Vec<u8>> 再转 base64
+                let secret_b64: String = match r.get::<_, Option<Vec<u8>>>(6)? {
+                    Some(b) => BASE64_STD.encode(b),
+                    None => String::new(),
+                };
+                // ips 列可能为 NULL（v4 之前的记录）→ 空数组由调用方回退单 ip
+                let ips: Value = match r.get::<_, Option<String>>(8)? {
+                    Some(s) => serde_json::from_str(&s).unwrap_or(serde_json::json!([])),
+                    None => serde_json::json!([]),
+                };
+                // v5：信任状态机字段（peer_public_key BLOB → base64url SEC1；pending_revoke_token 为 JSON 文本）
+                let peer_pub_b64: String = match r.get::<_, Option<Vec<u8>>>(10)? {
+                    Some(b) => base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b),
+                    None => String::new(),
+                };
+                let pending_revoke: Value = match r.get::<_, Option<String>>(13)? {
+                    Some(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
+                    None => serde_json::Value::Null,
+                };
                 Ok(serde_json::json!({
                     "deviceId": r.get::<_, String>(0)?,
                     "name": r.get::<_, String>(1)?,
                     "ip": r.get::<_, String>(2)?,
                     "port": r.get::<_, i64>(3)?,
                     "fingerprint": r.get::<_, String>(4)?,
+                    "lastManifest": manifest,
+                    "pairingSecretB64": secret_b64,
+                    "cryptoVersion": r.get::<_, i64>(7)?,
+                    "ips": ips,
+                    "status": r.get::<_, String>(9)?,
+                    "peerPublicKey": peer_pub_b64,
+                    "pairingTimestamp": r.get::<_, i64>(11)?,
+                    "lastHeartbeat": r.get::<_, i64>(12)?,
+                    "pendingRevokeToken": pending_revoke,
                 }))
             })
             .map_err(AppError::from_display)?;
@@ -304,6 +437,102 @@ impl Database {
             out.push(row.map_err(AppError::from_display)?);
         }
         Ok(out)
+    }
+
+    /// 保存本机静态 P-256 密钥对（local_identity 单行表）。
+    /// 无条件 UPSERT：行不存在则插入，存在则覆盖（本机密钥一生只生成一次，
+    /// 覆盖只发生在"首次生成"或"上次保存失败后的重试"，不存在覆盖有效数据的场景）。
+    pub fn save_static_key(&self, priv_b64: &str, pub_b64: &str) -> Result<(), AppError> {
+        // 空 key 守卫：ecdh_generate_keypair 失败时返回 ("","")，绝不能落库
+        if priv_b64.is_empty() || pub_b64.is_empty() {
+            return Err(AppError("拒绝保存空静态密钥".to_string()));
+        }
+        let priv_bytes = URL_SAFE_NO_PAD
+            .decode(priv_b64)
+            .map_err(|e| AppError(format!("static_priv base64 解码失败: {e}")))?;
+        let pub_bytes = URL_SAFE_NO_PAD
+            .decode(pub_b64)
+            .map_err(|e| AppError(format!("static_pub base64 解码失败: {e}")))?;
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO local_identity (id, static_priv, static_pub) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET static_priv = ?1, static_pub = ?2",
+            params![priv_bytes, pub_bytes],
+        )
+        .map_err(AppError::from_display)?;
+        Ok(())
+    }
+
+    /// 保存本机 ECDSA P-256 签名密钥对（local_identity 单行表 sig 列，v5 新架构）。
+    /// 与 static_key（ECDH）分离：sig 密钥专用于消息签名/验签（配对信任锚、吊销令牌）。
+    /// 冲突分支只更新 sig_priv/sig_pub——static_priv/static_pub 是 ECDH 身份密钥，
+    /// 任何情况下都不得被本方法触碰（excluded.* 显式限定写入列）。
+    pub fn save_sig_key(&self, priv_b64: &str, pub_b64: &str) -> Result<(), AppError> {
+        if priv_b64.is_empty() || pub_b64.is_empty() {
+            return Err(AppError("拒绝保存空签名密钥".to_string()));
+        }
+        let priv_bytes = URL_SAFE_NO_PAD
+            .decode(priv_b64)
+            .map_err(|e| AppError(format!("sig_priv base64 解码失败: {e}")))?;
+        let pub_bytes = URL_SAFE_NO_PAD
+            .decode(pub_b64)
+            .map_err(|e| AppError(format!("sig_pub base64 解码失败: {e}")))?;
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO local_identity (id, static_priv, static_pub, sig_priv, sig_pub)
+             VALUES (1, X'', X'', ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET
+                sig_priv = excluded.sig_priv,
+                sig_pub = excluded.sig_pub",
+            params![priv_bytes, pub_bytes],
+        )
+        .map_err(AppError::from_display)?;
+        Ok(())
+    }
+
+    /// 加载本机 ECDSA P-256 签名密钥对。返回 (priv_b64, pub_b64)；尚无记录时返回 None。
+    pub fn load_sig_key(&self) -> Result<Option<(String, String)>, AppError> {
+        let conn = self.conn()?;
+        let row: Result<(Vec<u8>, Vec<u8>), _> = conn.query_row(
+            "SELECT sig_priv, sig_pub FROM local_identity WHERE id = 1",
+            [],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        );
+        match row {
+            Ok((priv_bytes, pub_bytes)) => {
+                if priv_bytes.is_empty() || pub_bytes.len() < 33 {
+                    return Ok(None);
+                }
+                let priv_b64 = URL_SAFE_NO_PAD.encode(&priv_bytes);
+                let pub_b64 = URL_SAFE_NO_PAD.encode(&pub_bytes);
+                Ok(Some((priv_b64, pub_b64)))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::from_display(e)),
+        }
+    }
+
+    /// 加载本机静态 P-256 密钥对（local_identity 单行表）。
+    /// 返回 (priv_b64, pub_b64)；尚无记录时返回 None。
+    pub fn load_static_key(&self) -> Result<Option<(String, String)>, AppError> {
+        let conn = self.conn()?;
+        let row: Result<(Vec<u8>, Vec<u8>), _> = conn.query_row(
+            "SELECT static_priv, static_pub FROM local_identity WHERE id = 1",
+            [],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        );
+        match row {
+            Ok((priv_bytes, pub_bytes)) => {
+                if priv_bytes.len() < 32 || pub_bytes.len() < 33 {
+                    return Ok(None); // 长度异常的脏数据视为无记录
+                }
+                let priv_b64 = URL_SAFE_NO_PAD.encode(&priv_bytes);
+                let pub_b64 = URL_SAFE_NO_PAD.encode(&pub_bytes);
+                Ok(Some((priv_b64, pub_b64)))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::from_display(e)),
+        }
     }
 }
 
@@ -334,9 +563,25 @@ pub fn get_all_devices(app: tauri::AppHandle) -> Result<Vec<String>, AppError> {
 }
 
 /// 全量保存配对信任记录到 SQLite（纯逻辑，供 transfer.rs 配对变更后落盘）
+/// tuple: (device_id, name, ip, port, fingerprint, manifest_json, pairing_secret_enc, ips_json,
+///         status, peer_public_key_sec1, pairing_timestamp, last_heartbeat, pending_revoke_token_json)
 pub fn save_paired_peers(
     app: &tauri::AppHandle,
-    peers: Vec<(String, String, String, i64, String)>,
+    peers: Vec<(
+        String,
+        String,
+        String,
+        i64,
+        String,
+        String,
+        Option<Vec<u8>>,
+        Option<String>,
+        String,
+        Option<Vec<u8>>,
+        i64,
+        i64,
+        Option<String>,
+    )>,
 ) -> Result<(), AppError> {
     let state = app.state::<crate::AppState>();
     state.db.save_paired_peers(&peers)
@@ -348,15 +593,43 @@ pub fn load_paired_peers(app: &tauri::AppHandle) -> Result<Vec<Value>, AppError>
     state.db.load_paired_peers()
 }
 
+/// 保存本机静态密钥到 SQLite（local_identity 单行表）
+pub fn save_static_key(app: &tauri::AppHandle, priv_b64: &str, pub_b64: &str) -> Result<(), AppError> {
+    let state = app.state::<crate::AppState>();
+    state.db.save_static_key(priv_b64, pub_b64)
+}
+
+/// 保存本机 ECDSA 签名密钥到 SQLite（local_identity 单行表 sig 列，v5）
+pub fn save_sig_key(app: &tauri::AppHandle, priv_b64: &str, pub_b64: &str) -> Result<(), AppError> {
+    let state = app.state::<crate::AppState>();
+    state.db.save_sig_key(priv_b64, pub_b64)
+}
+
+/// 从 SQLite 加载本机 ECDSA 签名密钥（启动时恢复）
+pub fn load_sig_key(app: &tauri::AppHandle) -> Result<Option<(String, String)>, AppError> {
+    let state = app.state::<crate::AppState>();
+    state.db.load_sig_key()
+}
+
+/// 从 SQLite 加载本机静态密钥（启动时恢复）
+pub fn load_static_key(app: &tauri::AppHandle) -> Result<Option<(String, String)>, AppError> {
+    let state = app.state::<crate::AppState>();
+    state.db.load_static_key()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
 
     fn in_memory_db() -> Database {
-        // 临时文件（每操作新连接，:memory: 会因连接独立而丢数据，故用真实文件）
+        // 临时文件（每操作新连接，:memory: 会因连接独立而丢数据，故用真实文件）。
+        // 路径追加自增序号：cargo test 多线程并行执行时，仅用进程 id 会让多个测试
+        // 共享同一 SQLite 文件——互相 remove_file + SQLITE_BUSY 导致偶发 panic
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "backup_db_test_{}.db",
+            "backup_db_test_{}_{n}.db",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
@@ -388,7 +661,24 @@ mod tests {
                     ip TEXT NOT NULL,
                     port INTEGER NOT NULL,
                     fingerprint TEXT NOT NULL,
-                    at INTEGER NOT NULL
+                    manifest TEXT NOT NULL DEFAULT '{}',
+                    pairing_secret BLOB,
+                    crypto_version INTEGER NOT NULL DEFAULT 1,
+                    static_pub BLOB,
+                    ips TEXT,
+                    at INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    peer_public_key BLOB,
+                    pairing_timestamp INTEGER NOT NULL DEFAULT 0,
+                    last_heartbeat INTEGER NOT NULL DEFAULT 0,
+                    pending_revoke_token TEXT
+                );
+                CREATE TABLE IF NOT EXISTS local_identity (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    static_priv BLOB NOT NULL,
+                    static_pub BLOB NOT NULL,
+                    sig_priv BLOB,
+                    sig_pub BLOB
                 );",
             )
             .unwrap();
@@ -426,6 +716,71 @@ mod tests {
     }
 
     #[test]
+    fn static_key_roundtrip_and_empty_guard() {
+        use base64::Engine as _;
+        let db = in_memory_db();
+
+        // 无记录 → None
+        assert!(db.load_static_key().unwrap().is_none());
+
+        // 首次保存 → 加载一致（B1 回归：此前 zeroblob 占位 + 条件 UPDATE 导致永不写入）
+        let priv_b64 = BASE64_STD.encode([7u8; 32]);
+        let pub_b64 = BASE64_STD.encode([9u8; 33]);
+        db.save_static_key(&priv_b64, &pub_b64).unwrap();
+        let loaded = db.load_static_key().unwrap().unwrap();
+        assert_eq!(loaded.0, priv_b64);
+        assert_eq!(loaded.1, pub_b64);
+
+        // 空 key 拒绝且不破坏已有数据
+        assert!(db.save_static_key("", "").is_err());
+        let again = db.load_static_key().unwrap().unwrap();
+        assert_eq!(again.0, priv_b64);
+
+        // 覆盖保存 → 读到新值
+        let priv_b64b = BASE64_STD.encode([8u8; 32]);
+        db.save_static_key(&priv_b64b, &pub_b64).unwrap();
+        assert_eq!(db.load_static_key().unwrap().unwrap().0, priv_b64b);
+    }
+
+    #[test]
+    fn save_sig_key_never_touches_static_key() {
+        use base64::Engine as _;
+        let db = in_memory_db();
+
+        // 先落 ECDH static key，再保存签名 key → static key 必须原样保留
+        // （回归：save_sig_key 的 UPSERT 冲突分支曾可能触碰 static_priv/static_pub）
+        let s_priv = BASE64_STD.encode([1u8; 32]);
+        let s_pub = BASE64_STD.encode([2u8; 33]);
+        db.save_static_key(&s_priv, &s_pub).unwrap();
+
+        let sig_priv = BASE64_STD.encode([3u8; 32]);
+        let sig_pub = BASE64_STD.encode([4u8; 33]);
+        db.save_sig_key(&sig_priv, &sig_pub).unwrap();
+
+        let loaded_static = db.load_static_key().unwrap().unwrap();
+        assert_eq!(loaded_static.0, s_priv);
+        assert_eq!(loaded_static.1, s_pub);
+        let loaded_sig = db.load_sig_key().unwrap().unwrap();
+        assert_eq!(loaded_sig.0, sig_priv);
+        assert_eq!(loaded_sig.1, sig_pub);
+
+        // 反向顺序（先 sig 后 static）→ 两者互不干扰
+        let db2 = in_memory_db();
+        db2.save_sig_key(&sig_priv, &sig_pub).unwrap();
+        db2.save_static_key(&s_priv, &s_pub).unwrap();
+        let loaded_sig2 = db2.load_sig_key().unwrap().unwrap();
+        assert_eq!(loaded_sig2.0, sig_priv);
+        assert_eq!(loaded_sig2.1, sig_pub);
+        let loaded_static2 = db2.load_static_key().unwrap().unwrap();
+        assert_eq!(loaded_static2.0, s_priv);
+        assert_eq!(loaded_static2.1, s_pub);
+
+        // 空 sig key 拒绝且不破坏已有数据
+        assert!(db.save_sig_key("", "").is_err());
+        assert!(db.load_sig_key().unwrap().is_some());
+    }
+
+    #[test]
     fn concurrent_access_does_not_panic() {
         use std::sync::Arc;
         use std::thread;
@@ -447,5 +802,68 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn paired_peers_secret_roundtrip() {
+        // P5b：pairing_secret 加密 BLOB 存库 → 读取 base64 原样回（上层解密在 transfer.rs，
+        // 此处验证列读写与 base64 往返正确）；3.3：ips JSON 数组同表往返
+        let db = in_memory_db();
+        let secret: Vec<u8> = (0u8..32).collect();
+        let rows = vec![(
+            "dev-1".to_string(),
+            "Peer".to_string(),
+            "192.168.1.5".to_string(),
+            53317_i64,
+            "fp-1".to_string(),
+            "{}".to_string(),
+            Some(secret.clone()),
+            Some(r#"["192.168.1.5","192.168.1.23"]"#.to_string()),
+            "ACTIVE".to_string(),
+            None,
+            0_i64,
+            0_i64,
+            None,
+        )];
+        db.save_paired_peers(&rows).unwrap();
+        let loaded = db.load_paired_peers().unwrap();
+        assert_eq!(loaded.len(), 1);
+        let p = &loaded[0];
+        assert_eq!(p["deviceId"], "dev-1");
+        assert_eq!(p["ip"], "192.168.1.5");
+        let b64 = p["pairingSecretB64"].as_str().expect("pairingSecretB64 缺失");
+        let decoded = BASE64_STD.decode(b64).expect("base64 解码失败");
+        assert_eq!(decoded, secret);
+        assert_eq!(p["cryptoVersion"], 2);
+        let ips = p["ips"].as_array().expect("ips 数组缺失");
+        assert_eq!(ips.len(), 2);
+        assert_eq!(ips[1], "192.168.1.23");
+    }
+
+    #[test]
+    fn paired_peers_secret_none_allowed() {
+        // v2 遗留记录无 pairing_secret：None 可写入，读取时 pairingSecretB64 为空串；
+        // ips None → 空数组（调用方回退单 ip）
+        let db = in_memory_db();
+        let rows = vec![(
+            "dev-2".to_string(),
+            "Legacy".to_string(),
+            "192.168.1.9".to_string(),
+            53317_i64,
+            "fp-2".to_string(),
+            "{}".to_string(),
+            None,
+            None,
+            "ACTIVE".to_string(),
+            None,
+            0_i64,
+            0_i64,
+            None,
+        )];
+        db.save_paired_peers(&rows).unwrap();
+        let loaded = db.load_paired_peers().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0]["pairingSecretB64"], "");
+        assert_eq!(loaded[0]["ips"], serde_json::json!([]));
     }
 }

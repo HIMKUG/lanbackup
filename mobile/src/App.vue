@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
+import { ref, computed, watch, onMounted, onUnmounted, reactive } from 'vue';
 import { gsap } from 'gsap';
-import { CodeBoxes, GlassDock, GlassFilters, GlassModal, GlassScrollbar, GlassSeg, GlassSwitch, IpBoxes, LiquidGlass, installGlowHover, setBlurInterval, useAutoResume, useSyncTasks, type SyncTask } from 'shared-ui';
+import { CodeBoxes, GlassDock, GlassFilters, GlassModal, GlassScrollbar, GlassSeg, GlassSwitch, IpBoxes, LiquidGlass, AppIcon, installGlowHover, setBlurInterval, useAutoResume, useSyncTasks, type SyncTask } from 'shared-ui';
 import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
 import {
   requestStoragePermission,
@@ -19,10 +19,9 @@ import {
   setDeviceName,
   getSelfCode,
   refreshCode,
-  pingDevice,
-  verifyDevice,
-  greetDevice,
+  v3Probe,
   getPairedPeers,
+  isPeerPaired,
   sendUnpair,
   sendDisconnect,
   sendSyncDir,
@@ -34,15 +33,22 @@ import {
   onFileReceipt,
   onReceiveComplete,
   onIncomingRequest,
+  cancelSessionNative,
+  onJavaLog,
+  dumpNativeLogs,
   onReceiveProgress,
   onPairingRequest,
-  probeDevice,
   resolveIncoming,
   resolvePairing,
+  pairClientV3,
+  syncAllPeersV3,
   setPairedPeers,
   startScan,
   stopScan,
   getScanResults,
+  getDefensiveHidden,
+  setDefensiveHidden,
+  onPairPresence,
 } from './services/receiver';
 import {
   migrateState,
@@ -98,6 +104,7 @@ let unsubLog: (() => void) | null = null;
 let unlistenPairMobile: (() => void) | null = null;
 let unlistenPeerMobile: (() => void) | null = null;
 let unlistenDisconnectMobile: (() => void) | null = null;
+let unlistenPresenceMobile: (() => void) | null = null;
 let unlistenUnpairMobile: (() => void) | null = null;
 let unlistenFileRecvMobile: (() => void) | null = null;
 let unlistenFileReceiptMobile: (() => void) | null = null;
@@ -107,6 +114,9 @@ let unlistenPairingMobile: (() => void) | null = null;
 let unlistenRecvMobile: (() => void) | null = null;
 // "已连接本机"提示去抖：同一设备 30 秒内不重复提示，且仅状态变化时提示
 const connectNoticeAt = new Map<string, number>();
+// bcpd 确认在线的设备集合（fingerprint → 已通过 HMAC 加密存在验证）。
+// 接入此集合的设备在 connectPeer 时跳过 deviceId 比对（bcpd 的 HMAC 验证比明文 ID 更强）。
+const bcpdConfirmedOnline = new Set<string>();
 
 /** 消息队列：多条提示并行堆叠显示，每条 4.2 秒后自动移除 */
 interface ToastItem {
@@ -165,6 +175,8 @@ let scanStartedAt = 0;
 let scanTimer: ReturnType<typeof setInterval> | null = null;
 let pingTimer: ReturnType<typeof setInterval> | null = null;
 let mergeTimer: ReturnType<typeof setInterval> | null = null;
+/** v5 信任状态巡检定时器（sync-status 周期收敛：对方已解除配对时本机自动感知） */
+let trustTimer: ReturnType<typeof setInterval> | null = null;
 const pairingTarget = ref<ScannedDevice | null>(null);
 const codeInput = ref('');
 const manualIp = ref('');
@@ -213,6 +225,33 @@ const lastReceipt = ref('');
 const recvProgress = ref<{ fileName: string; receivedBytes: number; totalBytes: number; receivedCount: number; totalCount: number } | null>(null);
 /** 接收确认弹窗（电脑→手机 prepare-upload）；senderName 由原生载荷透传（缺失回退 IP） */
 const incomingReq = ref<{ sessionId: string; count: number; totalBytes: number; senderIp: string; senderName?: string } | null>(null);
+/** 当前收件来源（取消收件时通知对端停止传输）：ip/port/sessionId */
+const currentRecvSource = ref<{ ip: string; port: number; sessionId: string } | null>(null);
+/** 镜像确认防重放：fingerprint → 上次询问时刻（5 分钟内不重复弹窗）。
+ *  持久化到 localStorage（BUG-9 复盘：纯内存 Map 重启即失效，杀进程重启可再次触发弹窗）。
+ *  仅保留 24h 内记录，避免无限增长。 */
+const MIRROR_ASKED_KEY = 'lanbackup_mirror_asked_at';
+function loadMirrorAskedAt(): [string, number][] {
+  try {
+    const raw = localStorage.getItem(MIRROR_ASKED_KEY);
+    if (raw) {
+      const obj = JSON.parse(raw) as Record<string, number>;
+      const now = Date.now();
+      return Object.entries(obj).filter(([, ts]) => now - ts < 24 * 60 * 60 * 1000);
+    }
+  } catch {
+    /* 解析失败按空处理 */
+  }
+  return [];
+}
+const mirrorAskedAt = new Map<string, number>(loadMirrorAskedAt());
+function persistMirrorAskedAt() {
+  try {
+    localStorage.setItem(MIRROR_ASKED_KEY, JSON.stringify(Object.fromEntries(mirrorAskedAt)));
+  } catch {
+    /* 持久化失败不影响主流程 */
+  }
+}
 /** 配对确认弹窗（对方填写了本机连接码请求配对） */
 const pairingReq = ref<{ deviceId: string; name: string; ip: string } | null>(null);
 /** 备份完成统计（进度框完成态显示） */
@@ -224,6 +263,8 @@ const transfers = ref<
   { id?: string; direction: string; peer: string; fileCount: number; bytes: number; durationMs: number; createdAt: number }[]
 >([]);
 const serverRunning = ref(false);
+/** 防御性总开关：hidden=true 时本机在局域网完全隐藏（已配对设备也无法发现本机，仅保留本机主动外连） */
+const defensiveHidden = ref(false);
 
 // 速率/大小格式化 + 传输历史（localStorage 持久化，最多 200 条，与桌面端一致）
 function fmtRate(bytes: number, ms: number): string {
@@ -350,10 +391,10 @@ const roleName = computed(() => (role.value === 'receiver' ? '收件' : role.val
 /** 底部 Dock：页面定义 + 状态气泡文案 */
 const pageNames: Record<Page, string> = { devices: '设备', backup: '同步', history: '记录', settings: '设置' };
 const dockTabs: { id: Page; icon: string; label: string }[] = [
-  { id: 'devices', icon: '📡', label: '设备' },
-  { id: 'backup', icon: '💾', label: '同步' },
-  { id: 'history', icon: '🕘', label: '记录' },
-  { id: 'settings', icon: '⚙️', label: '设置' },
+  { id: 'devices', icon: 'devices', label: '设备' },
+  { id: 'backup', icon: 'sync', label: '同步' },
+  { id: 'history', icon: 'history', label: '记录' },
+  { id: 'settings', icon: 'settings', label: '设置' },
 ];
 const dockStatusTitle = computed(() => pageNames[currentPage.value]);
 const dockStatusSub = computed(() => (serverRunning.value ? '收件服务运行中' : '收件服务已停止'));
@@ -456,19 +497,10 @@ const activeTaskId = ref('');
 function taskStateText(s: SyncTask['state']): string {
   return s === 'running' ? '进行中' : s === 'paused' ? '已暂停' : s === 'completed' ? '已完成' : '失败';
 }
-/** 唤醒任务对端：问候触发其拉起接收服务 + 对齐本机同步目标（恢复/重试共用） */
+/** 唤醒任务对端：对齐本机同步目标（恢复/重试共用）。
+ *  P2 硬升级：v2 问候（greetDevice）已删除，接收服务就绪由 sendBackup 内 prepare-upload 重试兜底 */
 async function wakePeerFor(t: SyncTask) {
   if (t.peerIp && t.peerPort && deviceInfo.value) {
-    try {
-      await greetDevice({
-        ip: t.peerIp,
-        port: t.peerPort,
-        deviceId: deviceInfo.value.deviceId,
-        name: deviceInfo.value.name,
-      });
-    } catch {
-      // 对端离线：交给 sendBackup 的唤醒重试与错误提示
-    }
     const rec = t.peerFingerprint ? pairMgr.byFingerprint(t.peerFingerprint) : null;
     if (rec) selectTarget(rec);
   }
@@ -493,14 +525,14 @@ const autoResume = useAutoResume({
   isBusy: () => scanning.value || !!activeTaskId.value,
   getPending: () => tasks.value.find((t: SyncTask) => t.state === 'paused' && t.peerIp && t.peerPort),
   verifyPeer: async (t) => {
-    if (!deviceInfo.value) return false;
-    const res = await greetDevice({
-      ip: t.peerIp!,
-      port: t.peerPort!,
-      deviceId: deviceInfo.value.deviceId,
-      name: deviceInfo.value.name,
-    });
-    return !!res.ok;
+    if (!t.peerIp || !t.peerPort) return false;
+    try {
+      // P2 硬升级：v2 问候（greetDevice）已删除，改 v3 probe 探测对端配对服务可达
+      await v3Probe({ ip: t.peerIp, port: t.peerPort });
+      return true;
+    } catch {
+      return false;
+    }
   },
   onReconnect: (t) => {
     const rec = t.peerFingerprint ? pairMgr.byFingerprint(t.peerFingerprint) : null;
@@ -511,7 +543,19 @@ const autoResume = useAutoResume({
       selectTarget(rec);
     }
   },
-  onResume: () => runBackup(),
+  onResume: async (t) => {
+    // 防御门禁（BUG-4）：自动恢复前校验对端是否真实配对（有 secret）。
+    // 清数据/未配对状态下，仅"被发现"的设备不得触发自动同步推送数据。
+    if (t.peerIp) {
+      const paired = await isPeerPaired(t.peerIp).catch(() => false);
+      if (!paired) {
+        pushToast('warn', `「${t.peer}」尚未与本机完成配对，已跳过自动恢复`);
+        logger.warn('ui', `自动恢复被门禁拦截：对端未配对 peer=${t.peer}(${t.peerIp})`);
+        return;
+      }
+    }
+    runBackup();
+  },
   notify: (text) => pushToast('ok', text),
   logInfo: (msg) => logger.info('ui', msg),
 });
@@ -639,53 +683,89 @@ function cardListLeave(el: Element, done: () => void) {
       done();
     },
   })
-    .to(node, { height: 0, paddingTop: 0, paddingBottom: 0, borderTopWidth: 0, borderBottomWidth: 0, marginBottom: -14, duration: 0.45, ease: 'power3.inOut' })
-    .to(node, { autoAlpha: 0, duration: 0.18, ease: 'power2.in' }, 0.28);
+    .to(node, { height: 0, paddingTop: 0, paddingBottom: 0, borderTopWidth: 0, borderBottomWidth: 0, marginBottom: -14, duration: 0.2, ease: 'power2.inOut' })
+    .to(node, { autoAlpha: 0, duration: 0.1, ease: 'power2.in' }, 0.12);
 }
 
-/** 列表项移除：文字先隐去，整框化作灰色烟雾随风飘散；
-    同时高度收拢到 0，兄弟项被高度动画连续推上移（非瞬移） */
+/** 列表项移除：
+    对删除项施加 SVG feTurbulence 流体烟雾滤镜（颗粒漂移 + displacement 形变 + 雾化），
+    同时持续抖动 turbulence 的 baseFrequency，让内容如烟雾般融化飘散；再收拢高度。
+    prefers-reduced-motion 时降级为纯收拢。 */
 async function smokeDissolve(row: HTMLElement) {
-  /* 动效减弱：不做粒子与补间，直接终态 */
   if (reduceMotion()) {
     gsap.set(row, { autoAlpha: 0, height: 0, paddingTop: 0, paddingBottom: 0, borderTopWidth: 0, borderBottomWidth: 0 });
     return;
   }
-  /* 此刻元素仍在文档流原位置，读取真实坐标（不要再被 absolute 拖到容器顶部） */
-  const rect = row.getBoundingClientRect();
-  const kids = [...row.children] as HTMLElement[];
-  gsap.to(kids, { autoAlpha: 0, y: -4, duration: 0.22, ease: 'power2.in', stagger: 0.03 });
-  const n = 22;
-  for (let i = 0; i < n; i++) {
-    const p = document.createElement('span');
-    p.className = 'smoke-puff';
-    const size = 14 + Math.random() * 22;
-    p.style.width = size + 'px';
-    p.style.height = size + 'px';
-    p.style.left = rect.left + (i / n) * rect.width + (Math.random() - 0.5) * 16 + 'px';
-    p.style.top = rect.top + rect.height / 2 + (Math.random() - 0.5) * rect.height * 0.6 + 'px';
-    document.body.appendChild(p);
-    gsap.fromTo(
-      p,
-      { autoAlpha: 0.55, scale: 0.4 },
-      {
-        autoAlpha: 0,
-        scale: 1.7,
-        x: 60 + Math.random() * 100,
-        y: (Math.random() - 0.35) * 44,
-        duration: 1.1 + Math.random() * 0.7,
-        delay: Math.random() * 0.15,
-        ease: 'power2.out',
-        onComplete: () => p.remove(),
-      },
-    );
+  // ① 把行文本拆成独立「字符粒子」，每个粒子各自向右上飘散成烟
+  spawnSmokeChars(row);
+  // ② 原行及时收拢淡出（字符粒子在 fixed 层独立冒烟，不受行消失影响）
+  await new Promise<void>((res) => {
+    gsap.to(row, { height: 0, paddingTop: 0, paddingBottom: 0, borderTopWidth: 0, borderBottomWidth: 0, opacity: 0, duration: 0.25, ease: 'power2.inOut', onComplete: () => res() });
+  });
+}
+
+/** 拆分文本为独立「字符粒子」，配合 feTurbulence 流体滤镜 + 每粒子独特轨迹向右上扩散 */
+function spawnSmokeChars(row: HTMLElement) {
+  try {
+    const chars = [...(row.innerText || '')].filter((c) => !/\s/.test(c));
+    if (!chars.length) { gsap.set(row, { autoAlpha: 0 }); return; }
+    const r = row.getBoundingClientRect();
+    const st = getComputedStyle(row);
+    const fs = parseFloat(st.fontSize) || 14;
+    const cols = Math.max(4, Math.floor(r.width / fs));
+    const charW = r.width / cols;
+    // 共享 feTurbulence 驱动：全局流体抖动，给每个粒子统一的烟雾颗粒质感
+    const turb = document.getElementById('smoke-turb');
+    let frames = 0;
+    const intv = setInterval(() => {
+      if (!turb) return;
+      frames += 0.2;
+      turb.setAttribute('baseFrequency', `${0.03 + 0.005 * Math.cos((frames * Math.PI) / 180)} ${0.03 + 0.005 * Math.sin((frames * Math.PI) / 180)}`);
+    }, 16);
+    chars.forEach((ch, i) => {
+      const col = i % cols;
+      const rwi = Math.floor(i / cols);
+      const cx = r.left + charW * col + charW / 2;
+      const cy = r.top + 6 + rwi * fs * 1.2;
+      const s = document.createElement('span');
+      s.className = 'smoke-char';
+      s.textContent = ch;
+      s.style.left = `${cx}px`;
+      s.style.top = `${cy}px`;
+      s.style.color = 'transparent'; // 仅靠灰色烟阴影显形，更「灰」更「散」
+      s.style.fontSize = `${fs}px`;
+      s.style.fontFamily = st.fontFamily;
+      s.style.fontWeight = st.fontWeight;
+      s.style.filter = 'url(#smoke-filter)';
+      document.body.appendChild(s);
+      gsap.set(s, { xPercent: -50, yPercent: -50 });
+      // 整体同批次飘散（无 delay）；偶数字符镜像（skewX 反转、scale 更大）
+      const mirror = i % 2 === 0;
+      const tx = 190 + Math.random() * 70; // 右上位移（x 正、y 负）
+      const ty = -(100 + Math.random() * 50);
+      gsap
+        .timeline({ defaults: { ease: 'power1.in' }, onComplete: () => s.remove() })
+        .set(s, { textShadow: '0 0 6px rgba(205,207,214,0.28)' })
+        .to(s, { textShadow: '0 0 40px rgba(212,214,222,0.6)', duration: 0.8 })
+        .to(
+          s,
+          {
+            x: tx,
+            y: ty,
+            rotation: -40,
+            skewX: mirror ? -70 : 70,
+            scale: mirror ? 2 : 1.5,
+            textShadow: '0 0 16px rgba(212,214,222,0.22)',
+            autoAlpha: 0,
+            duration: 1.4,
+          },
+          0.2,
+        );
+    });
+    setTimeout(() => clearInterval(intv), 1900);
+  } catch (e) {
+    console.error('烟雾字符生成失败', e);
   }
-  await Promise.all([
-    gsap.to(row, { autoAlpha: 0, duration: 0.2, ease: 'power2.in' }),
-    new Promise<void>((res) => {
-      gsap.to(row, { height: 0, paddingTop: 0, paddingBottom: 0, borderTopWidth: 0, borderBottomWidth: 0, duration: 0.45, ease: 'power3.inOut', onComplete: () => res() });
-    }),
-  ]);
 }
 
 /** TransitionGroup 离场钩子：烟雾消散后交还控制权，兄弟项由 move 类平滑回位 */
@@ -734,6 +814,23 @@ const recvPanelCollapsed = ref(true); // 收件区配置默认折叠
 const sendPanelCollapsed = ref(true); // 发件区配置默认折叠
 /** 发送端：多文件夹列表（手机端 SAF 限制，实际单文件夹，但模型与桌面端一致） */
 const senderFolders = ref<SendFolder[]>([]);
+/** 临时文件夹（会话级，重启清空；点选新增，与永久文件夹一起参与本次同步） */
+const sessionFolders = ref<SendFolder[]>([]);
+/** 本次同步跳过集合（行内开关：勾选=参与，取消=本次跳过；不写回永久配置） */
+const syncSkip = reactive(new Set<string>());
+/** 自动接收开关：开启后收到的文件全自动保存，无需人工确认（localStorage 持久化） */
+const autoAcceptReceive = ref(localStorage.getItem('auto_accept_receive') === '1');
+function toggleAutoAcceptReceive() {
+  autoAcceptReceive.value = !autoAcceptReceive.value;
+  try { localStorage.setItem('auto_accept_receive', autoAcceptReceive.value ? '1' : '0'); } catch { /* 忽略 */ }
+}
+/** 本次实际发送的文件夹 = 启用的永久文件夹（未被跳过）+ 全部临时文件夹（未被跳过） */
+const effectiveSendFolders = computed(() => {
+  const out: SendFolder[] = [];
+  for (const f of senderFolders.value) if (f.enabled && !syncSkip.has(f.id)) out.push(f);
+  for (const f of sessionFolders.value) if (!syncSkip.has(f.id)) out.push(f);
+  return out;
+});
 
 function loadAppConfig() {
   try {
@@ -861,11 +958,40 @@ async function addSendFolder() {
 
 function removeSendFolder(id: string) {
   senderFolders.value = senderFolders.value.filter((f) => f.id !== id);
+  syncSkip.delete(id);
   if (senderFolders.value.length === 0) {
     boxP2c.value = null;
     persistBox('lanbackup_box_p2c', null);
   }
   persistConfig();
+}
+
+/** 永久文件夹移除（统一走确认弹窗，防误删） */
+async function confirmRemoveSendFolder(f: SendFolder) {
+  const ok = await askConfirmAsync({
+    title: '移除永久文件夹',
+    message: `将「${f.name}」从永久发件配置中移除？此操作不可恢复。`,
+    danger: true,
+  });
+  if (!ok) return;
+  removeSendFolder(f.id);
+}
+
+/** 临时文件夹：点选新增（会话级，重启清空） */
+async function addSessionFolder() {
+  try {
+    const root = await pickBackupRoot();
+    if (!root) return;
+    sessionFolders.value.push({ id: 'tmp_' + genFolderId(), name: root.name || '文件夹', path: root.uri, enabled: true });
+  } catch (e) {
+    errorMsg.value = `选择临时文件夹失败: ${(e as Error).message}`;
+  }
+}
+
+/** 临时文件夹：移除（仅本次会话，直接移除不弹窗） */
+function removeSessionFolder(id: string) {
+  sessionFolders.value = sessionFolders.value.filter((f) => f.id !== id);
+  syncSkip.delete(id);
 }
 
 function toggleSendFolder(id: string) {
@@ -916,6 +1042,12 @@ function setQuality(v: string) {
 function syncWallpaper() {
   const interval = qualityLevel.value === 'high' ? 83 : qualityLevel.value === 'medium' ? 333 : 0;
   setBlurInterval(interval);
+  // 低画质视觉优化（已确认）：视频暂停为静止帧（0fps），省解码开销；切回中/高恢复播放
+  const v = document.querySelector<HTMLVideoElement>('video.wallpaper-video');
+  if (v) {
+    if (qualityLevel.value === 'low') v.pause();
+    else if (v.paused) v.play();
+  }
 }
 
 watch(qualityLevel, (v) => {
@@ -979,13 +1111,37 @@ const progressPercent = computed(() => {
 const percentText = computed(() => Math.round(progressPercent.value * 100));
 /** 就绪状态（同步操作卡常驻按钮用）：目标设备 + 至少一个启用文件夹 */
 const sendFolderCount = computed(() => senderFolders.value.filter((f) => f.enabled).length);
-const syncReady = computed(() => !!targetDevice.value && sendFolderCount.value > 0);
+const syncReady = computed(() => !!targetDevice.value && effectiveSendFolders.value.length > 0);
 const runHintText = computed(() => {
   if (scanning.value) return '同步进行中，可离开此页；进度与任务都会记录在下方';
   if (!targetDevice.value) return '未就绪 · 请选择目标设备';
-  if (sendFolderCount.value === 0) return '未就绪 · 请在发件区添加文件夹';
-  return `就绪 · ${sendFolderCount.value} 个文件夹 → ${targetDevice.value.name}`;
+  if (effectiveSendFolders.value.length === 0) return '未就绪 · 请添加发件文件夹（永久或临时）';
+  return `就绪 · ${effectiveSendFolders.value.length} 个文件夹 → ${targetDevice.value.name}`;
 });
+/** 同步列表面板：永久配置 + 临时会话文件夹 */
+const syncList = computed(() => [...senderFolders.value, ...sessionFolders.value]);
+/** 是否为永久配置文件夹 */
+function isPermanentFolder(f: SendFolder) {
+  return senderFolders.value.some((x) => x.id === f.id);
+}
+/** 行内开关：切换本次是否参与同步（不写回永久配置） */
+function toggleSyncInclude(id: string) {
+  if (syncSkip.has(id)) syncSkip.delete(id);
+  else syncSkip.add(id);
+}
+/** 移除：永久文件夹走确认弹窗（从永久配置删除）；临时文件夹直接移除（本次会话） */
+function removeFolderFromSync(f: SendFolder) {
+  if (isPermanentFolder(f)) confirmRemoveSendFolder(f);
+  else removeSessionFolder(f.id);
+}
+/** 开始同步按钮文案（按模式） */
+const runBtnLabel = computed(() => {
+  if (scanning.value) return '同步进行中...';
+  if (role.value === 'receiver') return autoAcceptReceive.value ? '自动接收：开' : '自动接收：关';
+  return '开始同步';
+});
+/** 开始同步按钮就绪态（只收件时随自动接收：关=灰 / 开=青） */
+const runBtnReady = computed(() => (role.value === 'receiver' ? autoAcceptReceive.value : syncReady));
 /** 接收进度百分比 */
 const recvPercent = computed(() =>
   recvProgress.value && recvProgress.value.totalBytes > 0
@@ -1111,6 +1267,13 @@ onMounted(async () => {
     } catch {
       serverRunning.value = false;
     }
+    // 读取防御性总开关的持久化状态（隐藏=完全不可见）
+    try {
+      defensiveHidden.value = await getDefensiveHidden();
+    } catch (e) {
+      logger.warn('pair', '读取防御性总开关失败', e);
+      defensiveHidden.value = false;
+    }
     loadTransfers();
     // 对方验证本机码通过时实时刷新（被配对场景立即显示，不等轮询）
     try {
@@ -1122,8 +1285,15 @@ onMounted(async () => {
     }
     // 对方连接本机 → 标记已连接（去抖提示，让被连方实时感知）
     try {
-      unlistenPeerMobile = await onPeerConnected((p) => {
-        const rec = pairMgr.byDeviceId(p.deviceId);
+      unlistenPeerMobile = await onPeerConnected(async (p) => {
+        let rec = pairMgr.byDeviceId(p.deviceId);
+        if (!rec) {
+          // 配对成功瞬间的事件顺序竞态：paired-updated → mergePeers 需过桥取数（异步），
+          // peer-connected 常先到达 → 记录未入列 → "已连接"标记静默丢失。
+          // 此处补拉一次原生配对表再标记。
+          await mergePeers();
+          rec = pairMgr.byDeviceId(p.deviceId);
+        }
         if (rec) {
           const wasConnected = !!rec.connected;
           pairMgr.markOnline(rec.fingerprint, rec.ip, rec.port);
@@ -1156,6 +1326,27 @@ onMounted(async () => {
       });
     } catch (e) {
       logger.warn('pair', '监听断开连接事件失败', e);
+    }
+    // 常驻加密存在广播：已配对设备在线/离线（独立于收件/发现服务，仅防御总闸影响）。
+    // 收到有效加密存在(含HMAC) → 在线；连续收不到(约12s) → 立即离线（与桌面端一致）
+    try {
+      unlistenPresenceMobile = await onPairPresence(({ deviceId, online }) => {
+        const rec = pairMgr.byDeviceId(deviceId);
+        if (!rec) return;
+        if (online) {
+          // bcpd HMAC 验证比明文 deviceId 更强：接入集合后 connectPeer 跳过 deviceId 比对
+          bcpdConfirmedOnline.add(rec.fingerprint);
+          pairMgr.markOnline(rec.fingerprint, rec.ip, rec.port);
+          rejectCount.delete(rec.fingerprint);
+          probeSkip.delete(rec.fingerprint);
+        } else {
+          bcpdConfirmedOnline.delete(rec.fingerprint);
+          pairMgr.markOffline(rec.fingerprint);
+        }
+        refreshPairings();
+      });
+    } catch (e) {
+      logger.warn('pair', '监听加密存在广播失败', e);
     }
     // 对方解除配对 → 即时删除本地配对（不再依赖轮询误判）
     try {
@@ -1212,10 +1403,33 @@ onMounted(async () => {
     // 接收确认弹窗（电脑→手机）：prepare-upload 时原生请求用户同意
     try {
       unlistenIncomingMobile = await onIncomingRequest((r) => {
-        incomingReq.value = r;
+        // 记录当前收件来源：取消收件时通知对端（电脑）停止传输（自动接收分支同样记录）
+        currentRecvSource.value = { ip: r.senderIp, port: 53318, sessionId: r.sessionId };
+        // 自动接收开关开启 → 免确认直接接收；否则弹窗人工确认
+        if (autoAcceptReceive.value) {
+          resolveIncoming(r.sessionId, true)
+            .then(() => { notice.value = `已自动接收 ${r.count} 个文件`; })
+            .catch((e) => { errorMsg.value = `自动接收失败: ${(e as Error).message}`; });
+        } else {
+          incomingReq.value = r;
+        }
       });
     } catch (e) {
       logger.warn('pair', '监听接收确认请求失败', e);
+    }
+    // Java 原生层日志探针 → 前端 logger（NativeLogBridge 读 logcat 统一桥接，全部 Java 模块进入导出日志）
+    const handleJavaLog = (l: { level: string; module: string; msg: string }) => {
+      const msg = `[native:${l.module}] ${l.msg}`;
+      if (l.level === 'error') logger.error('native', msg);
+      else if (l.level === 'warn') logger.warn('native', msg);
+      else logger.debug('native', msg);
+    };
+    try {
+      unlistenJavaLogMobile = await onJavaLog(handleJavaLog);
+      // 冷启动窗口（WebView 就绪前）桥接器发出的日志前端收不到，注册监听后回放环形缓冲补齐
+      dumpNativeLogs().then((logs) => logs.forEach(handleJavaLog)).catch(() => {});
+    } catch (e) {
+      logger.warn('pair', '监听原生日志探针失败', e);
     }
     // 接收进度（电脑→手机）：累计字节 / 总字节，前端实时显示总量/速率/剩余
     try {
@@ -1243,16 +1457,19 @@ onUnmounted(() => {
   if (scanTimer) clearInterval(scanTimer);
   if (pingTimer) clearInterval(pingTimer);
   if (mergeTimer) clearInterval(mergeTimer);
+  if (trustTimer) clearInterval(trustTimer);
   if (nameSaveTimer) clearTimeout(nameSaveTimer);
   document.removeEventListener('visibilitychange', onVisibilityChange);
   if (unlistenPairMobile) unlistenPairMobile();
   if (unlistenPeerMobile) unlistenPeerMobile();
   if (unlistenDisconnectMobile) unlistenDisconnectMobile();
+  if (unlistenPresenceMobile) unlistenPresenceMobile();
   if (unlistenUnpairMobile) unlistenUnpairMobile();
   if (unlistenFileRecvMobile) unlistenFileRecvMobile();
   if (unlistenFileReceiptMobile) unlistenFileReceiptMobile();
   if (unlistenReceiveComplete) unlistenReceiveComplete();
   if (unlistenIncomingMobile) unlistenIncomingMobile();
+  if (unlistenJavaLogMobile) unlistenJavaLogMobile();
   if (unlistenPairingMobile) unlistenPairingMobile();
   if (unlistenRecvMobile) unlistenRecvMobile();
   if (unsubLog) unsubLog();
@@ -1315,7 +1532,7 @@ function onDiscoveredClick(d: ScannedDevice) {
   codeInput.value = '';
 }
 
-// 确认配对：把输入的连接码交给对方本地验证（不泄露对方连接码）
+// 确认配对（v3 客户端已补全：本机输入对端连接码主动发起；对端将弹出确认窗口）
 async function confirmPair() {
   const t = pairingTarget.value;
   if (!t) return;
@@ -1326,44 +1543,19 @@ async function confirmPair() {
   verifying.value = true;
   errorMsg.value = '';
   try {
-    const res = await verifyDevice({
-      ip: t.ip,
-      port: t.port,
-      code: codeInput.value.trim(),
-      deviceId: deviceInfo.value.deviceId,
-      name: deviceInfo.value.name,
-      myCode: selfCode.value,
-      myPort: 53317,
-    });
-    if (!res.ok) {
-      errorMsg.value = res.reason === 'rejected' ? '对方拒绝了配对请求' : '连接码不正确，配对失败';
+    const r = await pairClientV3({ ip: t.ip, port: t.port, code: codeInput.value.trim(), name: deviceInfo.value.name || '手机' });
+    if (r.status !== 'approved') {
+      errorMsg.value = r.message || '配对失败';
       return;
     }
-    const fp = normalizeCode(codeInput.value);
-    pairMgr.upsert({
-      fingerprint: fp,
-      deviceId: t.fingerprint,
-      name: t.alias,
-      ip: t.ip,
-      port: t.port,
-      trustAt: Date.now(),
-      online: true,
-      lastSeen: Date.now(),
-    });
     pairingTarget.value = null;
     codeInput.value = '';
-    // 配对成功：立即停止配对扫描并清空发现列表（避免继续发现/重复配对）
-    stopDeviceScanFn();
-    discovered.value = [];
-    refreshPairings();
-    if (!targetDevice.value) targetDevice.value = pairMgr.byFingerprint(fp) ?? null;
     notice.value = `配对成功：${t.alias}`;
-    logger.info('pair', `配对成功 alias=${t.alias} ip=${t.ip}`);
-    // 立即合并对方记录本机的信任信息 + 本端回填原生
+    logger.info('pair', `v3 主动配对成功 alias=${t.alias} ip=${t.ip}`);
+    refreshPairings();
     mergePeers();
-    confirmAllPairs();
   } catch (e) {
-    logger.error('pair', '配对验证失败', e);
+    logger.error('pair', 'v3 主动配对失败', e);
     errorMsg.value = `配对失败: ${(e as Error).message}`;
   } finally {
     verifying.value = false;
@@ -1375,7 +1567,7 @@ function cancelPair() {
   codeInput.value = '';
 }
 
-// 手动配对：IP + 端口 + 连接码
+// 手动配对（v3 客户端已补全：IP + 对端连接码主动发起）
 async function manualPair() {
   if (!manualIp.value.trim() || !manualCode.value.trim()) {
     errorMsg.value = '请填写目标 IP 与连接码';
@@ -1384,41 +1576,18 @@ async function manualPair() {
   verifying.value = true;
   errorMsg.value = '';
   try {
-    const res = await verifyDevice({
-      ip: manualIp.value.trim(),
-      port: manualPort.value,
-      code: manualCode.value.trim(),
-      deviceId: deviceInfo.value.deviceId,
-      name: deviceInfo.value.name,
-      myCode: selfCode.value,
-      myPort: 53317,
-    });
-    if (!res.ok) {
-      errorMsg.value = res.reason === 'rejected' ? '对方拒绝了配对请求' : '连接码不正确，配对失败';
+    const r = await pairClientV3({ ip: manualIp.value.trim(), port: manualPort.value, code: manualCode.value.trim(), name: deviceInfo.value.name || '手机' });
+    if (r.status !== 'approved') {
+      errorMsg.value = r.message || '配对失败';
       return;
     }
-    // 读取对方公开信息（设备名 + deviceId）
-    const info = await pingDevice({ ip: manualIp.value.trim(), port: manualPort.value });
-    const fp = normalizeCode(manualCode.value);
-    pairMgr.upsert({
-      fingerprint: fp,
-      deviceId: info.fingerprint,
-      name: info.alias,
-      ip: manualIp.value.trim(),
-      port: manualPort.value,
-      trustAt: Date.now(),
-      online: true,
-      lastSeen: Date.now(),
-    });
+    notice.value = `配对成功：${r.alias || manualIp.value.trim()}`;
+    logger.info('pair', `v3 手动配对成功 ip=${manualIp.value.trim()}`);
     refreshPairings();
-    if (!targetDevice.value) targetDevice.value = pairMgr.byFingerprint(fp) ?? null;
-    notice.value = `手动配对成功：${info.alias}`;
-    logger.info('pair', `手动配对成功 alias=${info.alias} ip=${manualIp.value}`);
     mergePeers();
-    confirmAllPairs();
   } catch (e) {
-    logger.error('pair', '手动配对失败', e);
-    errorMsg.value = `手动配对失败: ${(e as Error).message}`;
+    logger.error('pair', 'v3 手动配对失败', e);
+    errorMsg.value = `配对失败: ${(e as Error).message}`;
   } finally {
     verifying.value = false;
   }
@@ -1465,11 +1634,10 @@ async function startAutoConnect() {
   autoConnecting = true;
   // 本端确认的配对回填原生 pairedPeers（对端问候校验依据；重启后自愈）
   await confirmAllPairs();
-  try {
-    await startScan({ port: 53317, selfCode: selfCode.value, announce: false });
-  } catch (e) {
-    logger.warn('pair', '自动连接扫描启动失败', e);
-  }
+  // 注意：此处不调 startScan——自动连接只需对「已配对设备」做问候巡检（greetAll）
+  // 和双端信任同步（mergePeers），不需要发现新设备。曾在此启动扫描，导致：
+  // ① app 一启动就占用 UDP 53317 组播 socket，用户手动扫描时 bind 连环 already bound；
+  // ② discoverable 被常驻置 true——手机未开任何服务也能被对端 probe 发现（在线状态泄露）。
   greetAll();
   if (pingTimer) clearInterval(pingTimer);
   pingTimer = setInterval(greetAll, 500); // 状态侦测：2 次/秒，无感感知上下线
@@ -1477,6 +1645,13 @@ async function startAutoConnect() {
   mergeTimer = setInterval(async () => {
     await mergePeers();
   }, 10000); // 双端信任同步：10 秒一次足够
+  // v5 信任巡检（补全 greetAll 缺口）：v3 probe 只有可达性语义，无法感知
+  // "对方已解除配对"。每 30s 一轮 sync-status，revoked/unknown 经
+  // pair-unpaired 事件自动删除本机记录（状态机最终一致，§5.3 弱最终一致）。
+  if (trustTimer) clearInterval(trustTimer);
+  trustTimer = setInterval(() => {
+    syncAllPeersV3().catch(() => {});
+  }, 30000);
   // 后台降级省电：切后台状态侦测降至 5s，回前台恢复 500ms
   document.addEventListener('visibilitychange', onVisibilityChange);
 }
@@ -1510,8 +1685,10 @@ async function mergePeers() {
     let added = 0;
     for (const p of peers) {
       const existing = pairMgr.byDeviceId(p.deviceId);
-      const fp = p.fingerprint || existing?.fingerprint || '';
-      if (!fp && !existing) continue; // 无码且无本地记录：无法加密，跳过
+      // v3 配对记录无连接码概念（fingerprint 为空串）：此前直接 continue 导致
+      // 配对成功的设备永远不进"我的设备"列表。用 deviceId 派生本地指纹兜底。
+      const fp = p.fingerprint || existing?.fingerprint || `v3-${(p.deviceId || '').slice(0, 8)}`;
+      if (fp === 'v3-' && !existing) continue; // deviceId 也缺失：无法登记，跳过
       if (!existing) added++;
       pairMgr.upsert({
         fingerprint: fp,
@@ -1556,45 +1733,22 @@ async function greetAll(force = false) {
       }
       const ips = rec.ips?.length ? rec.ips : [rec.ip];
       let ok = false;
-      let reachable = false;
       for (const ip of ips) {
         try {
-          const res = await probeDevice({
-            ip,
-            port: rec.port,
-            deviceId: deviceInfo.value.deviceId,
-            name: deviceInfo.value.name,
-          });
-          reachable = true;
-          if (res.ok) {
-            pairMgr.markOnline(rec.fingerprint, ip, rec.port);
-            pairMgr.rememberIp(rec.fingerprint, ip);
-            rejectCount.delete(rec.fingerprint);
-            probeSkip.delete(rec.fingerprint);
-            ok = true;
-            break;
-          }
+          // P2 硬升级：v2 信任探测（probeDevice）已删除，改 v3 probe 探测对端配对服务可达。
+          // v3 probe 无「信任校验」语义（v2 ok=false 用于检测对方已解除配对），该能力暂缺
+          await v3Probe({ ip, port: rec.port });
+          pairMgr.markOnline(rec.fingerprint, ip, rec.port);
+          pairMgr.rememberIp(rec.fingerprint, ip);
+          rejectCount.delete(rec.fingerprint);
+          probeSkip.delete(rec.fingerprint);
+          ok = true;
+          break;
         } catch {
           // 该 IP 不可达，尝试下一个
         }
       }
-      if (ok) {
-        // 在线且互信
-      } else if (reachable) {
-        // 对方可达但明确不信任本机 → 判定为已解除配对
-        pairMgr.markOffline(rec.fingerprint);
-        const n = (rejectCount.get(rec.fingerprint) || 0) + 1;
-        rejectCount.set(rec.fingerprint, n);
-        if (n >= 5) {
-          pairMgr.remove(rec.fingerprint);
-          rejectCount.delete(rec.fingerprint);
-          connectNoticeAt.delete(rec.fingerprint);
-          // 同步清空原生信任表：否则 mergeTimer 的 mergePeers 会从原生把已解除设备拉回，
-          // 造成「已配对 → 对方已解除」无限循环
-          confirmAllPairs();
-          notice.value = `「${rec.name}」已不再与本机配对（对方已解除），已从列表移除`;
-        }
-      } else {
+      if (!ok) {
         // 完全不可达 → 离线（状态2：记录永久保留）+ 降频（5s 后再探）
         pairMgr.markOffline(rec.fingerprint);
         probeSkip.set(rec.fingerprint, 9);
@@ -1607,25 +1761,46 @@ async function greetAll(force = false) {
   }
 }
 
-// 连接（显式）：信任校验成功后置为已连接；对方同时收到 peer-connected 同步置位
+// 连接（显式）：v3 probe 探测对端可达 + 校验对端 deviceId 与目标一致后置为已连接。
+// P2 硬升级后：v3Probe 返回对端公开 deviceId，必须与配对记录中的 deviceId 一致才算"同一台已授权设备"。
+// 若对端 deviceId 缺失/与目标不符（IP 复用/清除数据重建身份/未配对伪造响应），拒绝置位"已连接"，
+// 避免单方面握手分裂。守卫为严格匹配：deviceId 缺失一律按失败处理，不跳过校验。
 async function connectPeer(p: PairRecord) {
   const ips = p.ips?.length ? p.ips : [p.ip];
   let ok = false;
+  // 守卫：目标记录必须存在 deviceId（否则本机无可信身份可校验）；若 bcpd 已通过
+  // HMAC 确认该设备在线，则跳过 deviceId 比对（bcpd 验证 > 明文 ID 匹配）。
+  if (!p.deviceId) {
+    logger.warn('ui', `连接守卫：配对记录缺少 deviceId，拒绝握手确认 peer=${p.name}`);
+    pairMgr.markOffline(p.fingerprint);
+    errorMsg.value = `连接失败：${p.name}（配对记录缺少设备身份）`;
+    return;
+  }
+  const trustedByBcpd = bcpdConfirmedOnline.has(p.fingerprint);
   for (const ip of ips) {
     try {
-      const res = await greetDevice({
-        ip,
-        port: p.port,
-        deviceId: deviceInfo.value.deviceId,
-        name: deviceInfo.value.name,
-      });
-      if (res.ok) {
+      const info = await v3Probe({ ip, port: p.port });
+      if (trustedByBcpd) {
+        // bcpd HMAC 已验证对端持有共享 secret，跳过 deviceId 比对，直接信任
         pairMgr.markOnline(p.fingerprint, ip, p.port);
         pairMgr.rememberIp(p.fingerprint, ip);
         pairMgr.markConnected(p.fingerprint, true);
         ok = true;
         break;
       }
+      // 守卫（严格）：无 bcpd 信任背书时，必须明文 deviceId 匹配才放行
+      if (!info.deviceId || info.deviceId !== p.deviceId) {
+        logger.warn(
+          'ui',
+          `连接守卫：对端 deviceId 缺失或不符（IP=${ip}，got=${info.deviceId || '(空)'}），拒绝握手确认`,
+        );
+        continue; // 尝试下一 IP；全部不符则下方进入"连接失败"
+      }
+      pairMgr.markOnline(p.fingerprint, ip, p.port);
+      pairMgr.rememberIp(p.fingerprint, ip);
+      pairMgr.markConnected(p.fingerprint, true);
+      ok = true;
+      break;
     } catch {
       // 尝试下一个 IP
     }
@@ -1635,7 +1810,7 @@ async function connectPeer(p: PairRecord) {
     notice.value = `已连接：${p.name}`;
   } else {
     pairMgr.markOffline(p.fingerprint);
-    errorMsg.value = `连接失败：${p.name}（对方不在线或已解除配对）`;
+    errorMsg.value = `连接失败：${p.name}（对方不在线、未配对或设备身份不匹配）`;
   }
 }
 
@@ -1708,26 +1883,23 @@ async function acceptPairing(accept: boolean) {
   try {
     await resolvePairing(r.deviceId, accept);
     notice.value = accept ? `已同意与「${r.name}」配对` : `已拒绝与「${r.name}」配对`;
+    // 问题3：同意连接后停止扫描与广播（双方已配对，不再需要被发现/继续扫描）
+    if (accept) await stopDeviceScanFn();
   } catch (e) {
     errorMsg.value = `响应配对确认失败: ${(e as Error).message}`;
   }
 }
 
-/** 发现服务开关：开启需已选择接收目录 */
-async function toggleService() {
-  if (serverRunning.value) {
-    await onStopReceiver();
-  } else {
-    if (!boxC2p.value) {
-      errorMsg.value = '请先选择「电脑→手机」接收目录';
-      return;
-    }
-    await startReceiverSafe(boxC2p.value);
-    if (serverRunning.value) {
-      receiverEnabled.value = true;
-      persistConfig();
-      notice.value = '收件服务已启动，可在局域网中被发现';
-    }
+/** 防御性总开关：切换本机完全隐藏/可见。隐藏=不发送加密存在、探针不泄露身份，
+ *  已配对设备同样无法发现本机（仅保留本机主动外连）。与桌面端 set_defensive 对称。 */
+async function setDefensive(hidden: boolean) {
+  defensiveHidden.value = hidden;
+  try {
+    await setDefensiveHidden(hidden);
+    notice.value = hidden ? '本机已在局域网完全隐藏' : '本机已设为可见模式';
+  } catch (e) {
+    logger.error('pair', '切换防御开关失败', e);
+    defensiveHidden.value = !hidden;
   }
 }
 
@@ -1795,14 +1967,50 @@ async function pickBoxC2p() {
 // 选择同步对象
 function selectTarget(p: PairRecord) {
   targetDevice.value = { ...p };
-  // 加载该设备的同步策略与对端缺失列表
+  // 加载该设备的对端缺失列表；注意：不再用设备历史策略覆盖当前 UI 选择（BUG-9）。
+  // 否则用户选了「增量(archive)」后，选设备/重连会静默切回该设备历史存的「镜像(mirror)」，
+  // 导致"增量模式仍弹镜像确认"。同步策略一律以 UI 当前选择为准。
   if (state.value) {
     const device = getOrCreateDevice(state.value, p.fingerprint, p.name);
-    syncStrategy.value = device.syncStrategy;
+    void device; // 仅确保设备记录存在（用于对端缺失列表）
   }
 }
 
 // ---------- 执行备份 ----------
+// ---------- 开始同步按钮：模式感知（点击 / 长按1.7s 白光填满后触发） ----------
+/** 长按1.7s完成后的动作（进入对应状态）：只收→切换自动接收；只发/双向→发件 */
+function longPressSyncAction() {
+  if (role.value === 'receiver') toggleAutoAcceptReceive();
+  else runBackup();
+}
+/** 点击（短按）动作：只发→立即发件；只收/双向→切换自动接收 */
+function clickSyncAction() {
+  if (role.value === 'sender') runBackup();
+  else toggleAutoAcceptReceive();
+}
+const longPressActive = ref(false);
+let longPressTimer: ReturnType<typeof setTimeout> | null = null;
+function onSyncPressStart() {
+  if (scanning.value) return;
+  longPressActive.value = true;
+  longPressTimer = setTimeout(() => {
+    longPressTimer = null;
+    longPressActive.value = false;
+    longPressSyncAction();
+  }, 1700);
+}
+function onSyncPressEnd() {
+  const triggered = !longPressTimer; // 定时器已触发=长按完成，动作已执行
+  if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+  longPressActive.value = false;
+  // 短按：仅双向=切换自动接收；单向无动作
+  if (!triggered && role.value === 'free') clickSyncAction();
+}
+function onSyncPressCancel() {
+  if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+  longPressActive.value = false;
+}
+
 async function runBackup() {
   if (scanning.value) return;
   const t = targetDevice.value;
@@ -1810,7 +2018,7 @@ async function runBackup() {
     errorMsg.value = '请先在「设备」页完成连接，并在「同步」页选择目标设备';
     return;
   }
-  const hasSend = senderFolders.value.some((f) => f.enabled);
+  const hasSend = effectiveSendFolders.value.length > 0;
   const hasRecv = receiverEnabled.value && !!boxC2p.value;
   if (!hasRecv && !hasSend) {
     errorMsg.value = '请至少配置一个备份方向（接收目录或发送文件夹）';
@@ -1842,12 +2050,19 @@ async function runBackup() {
     }
     // 发送方向：把手机目录推送到电脑（三路对比增量，只传新增/变更/对端缺失）
     if (hasSend) {
-      const enabled = senderFolders.value.filter((f) => f.enabled);
+      const enabled = effectiveSendFolders.value;
       for (const folder of enabled) {
         // 构造 BackupRoot 对象
         const root: BackupRoot = { uri: folder.path, name: folder.name, persisted: true };
         const device = getOrCreateDevice(state.value!, t.fingerprint, t.name);
         device.syncStrategy = syncStrategy.value;
+        // [镜像守卫诊断] 记录 mode 来源：UI 当前值 vs 设备历史值，定位"增量却弹镜像"
+        // 是否因设备历史 syncStrategy 覆盖 UI，或历史残留 mirror
+        logger.info(
+          'ui',
+          `策略来源: UI=${syncStrategy.value} 设备历史=${device.syncStrategy} ` +
+            `对象=${t.name}(${t.fingerprint})`,
+        );
         const r = await sendBackup(
           root,
           device.lastManifest,
@@ -1859,13 +2074,29 @@ async function runBackup() {
           t.fingerprint,
           device.knownMissingOnPeer,
           (p) => (progress.value = p),
-          // 镜像运行时确认：展示真实多余文件数；取消则保留对端多余文件
-          async (count) =>
-            askConfirmAsync({
+          // 镜像运行时确认：展示真实多余文件数；取消则保留对端多余文件。
+          // 防重放：无论确认还是取消，5 分钟内不再打扰（自动重试循环曾因"仅确认才记录"每轮重弹）
+          async (count) => {
+            const cnt = Array.isArray(count) ? count.length : Number(count) || 0;
+            const last = mirrorAskedAt.get(t.fingerprint) || 0;
+            if (Date.now() - last < 5 * 60 * 1000) return true; // 本周期已询问过，不再打扰
+            const ok = await askConfirmAsync({
               title: '镜像模式确认',
-              message: `镜像模式会把「${t.name}」上 ${count} 个多余文件移入其 delete 文件夹，确认继续？`,
+              message: `镜像模式会把「${t.name}」上 ${cnt} 个多余文件移入其 delete 文件夹，确认继续？`,
               danger: true,
-            }),
+            });
+            mirrorAskedAt.set(t.fingerprint, Date.now()); // 确认/取消都记录，防重弹
+            persistMirrorAskedAt(); // 持久化，重启后仍防重弹（BUG-9 复盘）
+            return ok;
+          },
+          // 手机唤醒电脑成功后，立即更新本地连接状态（修复"PC已显示已连接但手机不显示"的单向握手问题）
+          (fp) => {
+            const rec = pairMgr.byFingerprint(fp);
+            if (rec) {
+              pairMgr.markOnline(rec.fingerprint, t.ip, t.port);
+              pairMgr.markConnected(rec.fingerprint, true);
+            }
+          },
         );
         device.knownMissingOnPeer = r.knownMissingOnPeer;
         await completeBackup(state.value!, t.fingerprint, r.manifest);
@@ -1877,6 +2108,15 @@ async function runBackup() {
           `）` +
           (serverRunning.value ? `；接收服务运行中（端口 ${serverPort.value}）` : '');
       }
+      // 防御：任务最终统计以 sendBackup 返回值为准并显式回填后标记完成。
+      // 自动恢复/跳过已完成文件时，progress 事件可能未触发，曾出现
+      // "任务显示同步中 0%/0 文件，但历史记录完整"（BUG-9）——此处兜底修正。
+      updateTask(task.id, {
+        sentCount: r.sent,
+        fileCount: r.sent,
+        bytes: r.bytes,
+        totalBytes: r.bytes,
+      });
       completeTask(task.id);
       activeTaskId.value = '';
     }
@@ -1907,11 +2147,55 @@ async function onStopReceiver() {
   }
 }
 
-/** 手动取消收件：停止接收服务（中断当前会话）并清空进度 */
+/** 手动取消收件：分两步——①本地停止接收服务（无条件先行，与对端无关）；②通知对端取消会话。
+ *  通知对端（电脑）的 handle_cancel 会 cancel 发送 token → 强制停止其发送。
+ *  本地停止与通知为两个独立职责，通知失败不影响本地停止；错误提示按两者成败组合，避免误导。 */
 async function cancelReceive() {
+  const src = currentRecvSource.value;
+
+  // Step 1：本地停止接收服务（无条件执行，捕获自己是否成功，不因通知失败而跳)
+  let localStopped = true;
+  if (serverRunning.value) {
+    try {
+      await stopReceiver();
+      serverRunning.value = false;
+    } catch (e) {
+      localStopped = false;
+      errorMsg.value = `停止本机接收服务失败: ${(e as Error).message}`;
+    }
+  }
+
+  // Step 2：通知对端取消（独立于本地停止；失败只影响"对端是否停"提示，不阻塞）
+  let notified = false;
+  if (src) {
+    try {
+      await cancelSessionNative({ targetIp: src.ip, targetPort: src.port, sessionId: src.sessionId });
+      notified = true;
+    } catch {
+      notified = false;
+    }
+  }
+
+  currentRecvSource.value = null;
   recvProgress.value = null;
-  if (serverRunning.value) await onStopReceiver();
-  notice.value = '已取消收件';
+
+  // 组合提示：本地停止与对端通知各自的成败
+  if (src) {
+    if (localStopped && notified) {
+      notice.value = `已取消收件，并已通知「${src.ip}」停止传输`;
+    } else if (localStopped && !notified) {
+      // 本地已停，但对端未知 → 用 errorMsg 明确"对端可能仍在发送"
+      errorMsg.value = `已停止本机接收，但未能通知对端取消（对端可能离线或未识别）——对端可能仍在继续发送，请在对端手动停止`;
+    } else if (!localStopped && notified) {
+      errorMsg.value = `未能完全停止本机接收服务（已通知「${src.ip}」停止）——请在设置中确认接收服务已关闭`;
+    } else {
+      errorMsg.value = `停止本机接收服务失败，且未能通知对端「${src.ip}」取消——请手动检查两端状态`;
+    }
+  } else if (!localStopped) {
+    errorMsg.value = `停止本机接收服务失败，请手动确认`;
+  } else {
+    notice.value = '已取消收件';
+  }
 }
 
 // ---------- 设置 ----------
@@ -2097,7 +2381,8 @@ async function exportLogs() {
     <!-- 消息队列：多条提示堆叠显示，互不遮挡 -->
     <div class="toast-stack" role="status" aria-live="polite">
       <TransitionGroup name="toast-drop" tag="div">
-        <p v-for="t in toasts" :key="t.id" class="toast" :class="{ error: t.kind === 'error' }">{{ t.text }}</p>
+        <!-- P1-UA2：错误 toast 用 role=alert（assertive）立即播报 -->
+        <p v-for="t in toasts" :key="t.id" class="toast" :class="{ error: t.kind === 'error' }" :role="t.kind === 'error' ? 'alert' : undefined">{{ t.text }}</p>
       </TransitionGroup>
     </div>
 
@@ -2206,42 +2491,44 @@ async function exportLogs() {
           </TransitionGroup>
         </LiquidGlass>
 
-      </section>
-
-            <!-- ========== 同步页（主页：状态总览 + 收发配置） ========== -->
-      <section class="page-inner page-off" :data-page="'backup'">
-        <!-- 本机状态总览 -->
-        <LiquidGlass :corner-radius="24" padding="18px 18px">
+        <!-- 本机状态（设备页最下端；不含收件/发件方向按钮） -->
+        <LiquidGlass :corner-radius="24" padding="16px 18px">
           <div class="status-head">
             <h2 class="glass-card-title" style="margin: 0">本机状态</h2>
             <span class="status-chip" :class="{ on: serverRunning }">{{ serverRunning ? '收件服务运行中' : '收件服务已停止' }}</span>
-          </div>
-          <div class="role-seg" role="group" aria-label="同步方向（可多选）">
-            <button class="glass-chip" :class="{ on: role === 'receiver' || role === 'free' }" :aria-pressed="role === 'receiver' || role === 'free'" @click="toggleRoleDir('receive')">📥 收件</button>
-            <button class="glass-chip" :class="{ on: role === 'sender' || role === 'free' }" :aria-pressed="role === 'sender' || role === 'free'" @click="toggleRoleDir('send')">📤 发件</button>
           </div>
           <div class="status-grid">
             <div class="status-cell" :class="{ off: !serverRunning }">
               <span class="status-cell-label">收件服务</span>
               <span class="status-cell-value"><span class="status-dot" :class="{ on: serverRunning }"></span>{{ serverRunning ? '运行中' : '已停止' }}</span>
-              <span class="status-cell-sub">{{ serverRunning ? '端口 ' + serverPort : '未开启 · 见收件区配置' }}</span>
+              <span class="status-cell-sub">{{ serverRunning ? '端口 ' + serverPort : '未开启 · 见设置页收件区配置' }}</span>
             </div>
             <div class="status-cell" :class="{ off: !targetDevice }">
               <span class="status-cell-label">目标设备</span>
               <span class="status-cell-value">{{ targetDevice ? targetDevice.name : '未选择' }}</span>
-              <span class="status-cell-sub">{{ targetDevice ? pairStatus(targetDevice) : '在下方选择目标设备' }}</span>
+              <span class="status-cell-sub">{{ targetDevice ? pairStatus(targetDevice) : '在「同步」页选择目标设备' }}</span>
             </div>
           </div>
           <p v-if="lastSyncText" class="last-sync">{{ lastSyncText }}</p>
         </LiquidGlass>
 
-        <!-- 同步操作（常驻首屏：目标 + 策略 + 立即同步，3 秒内回答「点哪个按钮开始同步」） -->
-        <LiquidGlass v-if="role === 'sender' || role === 'free'" key="sync-action" :corner-radius="24" padding="18px 16px">
+      </section>
+      <section class="page-inner page-off" :data-page="'backup'">
+        <!-- 开始同步（常驻首屏，不随角色隐藏：方向 + 策略 + 目标设备 + 文件夹列表 + 同步按钮） -->
+        <LiquidGlass :corner-radius="24" padding="18px 16px">
           <div class="status-head">
             <h2 class="glass-card-title" style="margin: 0">开始同步</h2>
             <span class="status-chip" :class="{ on: syncReady }">{{ syncReady ? '就绪' : '未就绪' }}</span>
           </div>
-          <div class="dd" :class="{ open: targetDropdownOpen }" @click.stop>
+          <!-- 同步方向（收件 / 发件，可多选 = 双向） -->
+          <div class="role-seg" role="group" aria-label="同步方向（可多选）">
+            <button class="glass-chip" :class="{ on: role === 'receiver' || role === 'free' }" :aria-pressed="role === 'receiver' || role === 'free'" @click="toggleRoleDir('receive')"><AppIcon name="download" :size="13" /> 收件</button>
+            <button class="glass-chip" :class="{ on: role === 'sender' || role === 'free' }" :aria-pressed="role === 'sender' || role === 'free'" @click="toggleRoleDir('send')"><AppIcon name="upload" :size="13" /> 发件</button>
+          </div>
+          <!-- 策略小标记（配置入口在设置页） -->
+          <p class="strategy-marker mt-xs"><span class="mini-chip">{{ syncStrategy === 'mirror' ? '镜像' : '增量' }}</span><span class="muted" style="margin: 0">同步策略</span></p>
+          <!-- 目标设备 -->
+          <div class="dd mt-xs" :class="{ open: targetDropdownOpen }" @click.stop>
             <button class="glass-input dd-trigger" type="button" @click="targetDropdownOpen = !targetDropdownOpen">
               <span class="dd-label">{{ targetDevice ? targetDevice.name + '（' + pairStatus(targetDevice) + '）' : '选择目标设备' }}</span>
               <span class="dd-caret">▾</span>
@@ -2269,88 +2556,46 @@ async function exportLogs() {
           </div>
           <div v-if="targetDropdownOpen" class="dd-backdrop" @click="targetDropdownOpen = false"></div>
 
-          <GlassSeg
-            v-model="syncStrategy"
-            label="同步策略"
-            :options="[
-              { id: 'archive', label: '增量' },
-              { id: 'mirror', label: '镜像' },
-            ]"
-            class="mt-md"
-          />
-          <p v-if="syncStrategy === 'mirror'" class="mirror-hint">镜像：对端多余文件将被移入其 delete 文件夹</p>
+          <!-- 本次同步文件夹（选好目标设备后内联展开：永久配置 + 临时新增） -->
+          <div v-if="targetDevice" class="sync-folder-panel mt-md">
+            <div class="sync-folder-head">
+              <p class="muted" style="margin: 0">本次同步文件夹（{{ syncList.length }}）</p>
+              <span class="muted" style="margin: 0; font-size: 11px">永久自动参与 · 取消勾选即本次跳过</span>
+            </div>
+            <TransitionGroup name="lg-list" tag="div" class="device-list" @leave="listLeave">
+              <div v-for="f in syncList" :key="f.id" class="paired-row">
+                <span class="status-dot" :class="{ on: !syncSkip.has(f.id) }"></span>
+                <div class="device-main">
+                  <strong>{{ f.name }}<span v-if="isPermanentFolder(f)" class="perm-tag">永久</span></strong>
+                  <span class="muted" style="margin: 0">{{ f.path }}</span>
+                </div>
+                <label class="sync-toggle" :title="syncSkip.has(f.id) ? '本次跳过（点击参与）' : '参与本次同步（点击跳过）'">
+                  <input type="checkbox" :checked="!syncSkip.has(f.id)" @change="toggleSyncInclude(f.id)" />
+                  <span class="sync-toggle-ui" aria-hidden="true"></span>
+                </label>
+                <button class="glass-btn small danger" :title="isPermanentFolder(f) ? '从永久配置移除' : '移除（本次会话）'" :aria-label="isPermanentFolder(f) ? '从永久配置移除' : '移除本次会话'" @click="removeFolderFromSync(f)"><AppIcon name="close" :size="11" /></button>
+              </div>
+            </TransitionGroup>
+            <div class="drop-zone mt-xs" role="button" tabindex="0" @click="addSessionFolder" @keydown.enter.prevent="addSessionFolder">
+              <span>＋ 选择临时文件夹（本次会话，重启清空）</span>
+            </div>
+          </div>
+
+          <!-- 开始同步按钮：点击按模式（收=开关自动接收 / 发=发件）；双向长按1.7s 白光填满后发件 -->
           <button
             class="glass-btn primary run-btn"
-            :class="{ ready: syncReady }"
-            @click="runBackup"
-            :disabled="scanning || !syncReady"
+            :class="{ ready: runBtnReady, loading: scanning, hold: longPressActive }"
+            :disabled="scanning || (role === 'sender' && !syncReady)"
+            @pointerdown="onSyncPressStart"
+            @pointerup="onSyncPressEnd"
+            @pointerleave="onSyncPressCancel"
+            @pointercancel="onSyncPressCancel"
           >
-            {{ scanning ? '同步进行中...' : '立即同步' }}
+            <span class="hold-fill" aria-hidden="true"></span>
+            <span class="hold-label">{{ runBtnLabel }}</span>
           </button>
           <p class="run-hint">{{ runHintText }}</p>
         </LiquidGlass>
-
-        <!-- 收件区/发件区配置：与历史记录同款 TransitionGroup 排列（lg-list 进出场 + 高度收拢离场） -->
-        <TransitionGroup name="lg-list" tag="div" class="card-list" @leave="cardListLeave">
-        <LiquidGlass v-if="role === 'receiver' || role === 'free'" key="recv-card" :corner-radius="24" padding="14px 16px">
-          <div class="recv-header" @click="toggleRecvPanel">
-            <span class="status-dot" :class="{ on: recvDot === 'on' }"></span>
-            <h2 class="glass-card-title" style="margin: 0; flex: 1">📥 收件区配置</h2>
-            <button class="glass-btn small" @click.stop="toggleRecvPanel">{{ recvPanelCollapsed ? '展开' : '折叠' }}</button>
-          </div>
-          <div class="panel-collapse" :class="{ closed: recvPanelCollapsed }">
-            <div class="panel-collapse-inner">
-              <p class="muted">收件目录（保存电脑推送的文件）</p>
-              <div class="root-row" :class="{ checked: boxC2p }" role="button" tabindex="0" @click="pickBoxC2p" @keydown.enter.prevent="pickBoxC2p">
-                <span class="root-check">{{ boxC2p ? '✓' : '＋' }}</span>
-                <span class="root-name">{{ boxC2p ? boxC2p.name : '选择收件目录' }}</span>
-              </div>
-              <div class="row mt-sm">
-                <span class="muted" style="margin: 0; flex: 1">收件服务</span>
-                <button v-if="serverRunning" class="glass-btn small danger" @click="oneClickCloseReceive">一键关闭</button>
-                <button v-else-if="receiverEnabled && recvStarting" class="glass-btn small" disabled>启用中…</button>
-                <button v-else class="glass-btn small primary" @click="oneClickReceive">一键开启</button>
-              </div>
-              <p v-if="!boxC2p" class="muted synced-hint mt-xs">⚠ 对方将无法推送文件到本机——请先选择收件目录并开启收件服务</p>
-            </div>
-          </div>
-        </LiquidGlass>
-
-        <!-- 发件区配置（发件 / 双向），默认折叠：仅文件夹管理，同步入口常驻上方「开始同步」卡 -->
-        <LiquidGlass v-if="role === 'sender' || role === 'free'" key="send-card" :corner-radius="24" padding="14px 16px">
-          <div class="recv-header" @click="toggleSendPanel">
-            <span class="status-dot" :class="{ on: sendDot === 'on' }"></span>
-            <h2 class="glass-card-title" style="margin: 0; flex: 1">📤 发件区配置</h2>
-            <span class="folder-count">{{ sendFolderCount }}/{{ senderFolders.length }} 个文件夹</span>
-            <button class="glass-btn small" @click.stop="toggleSendPanel">{{ sendPanelCollapsed ? '展开' : '折叠' }}</button>
-          </div>
-          <div class="panel-collapse" :class="{ closed: sendPanelCollapsed }">
-            <div class="panel-collapse-inner">
-              <p class="muted">发件内容（本机文件夹，推送到目标设备）</p>
-              <TransitionGroup name="lg-list" tag="div" class="device-list" @leave="listLeave">
-                <div v-for="f in senderFolders" :key="f.id" class="paired-row">
-                  <span class="status-dot" :class="{ on: f.enabled }"></span>
-                  <div class="device-main">
-                    <strong>{{ f.name }}</strong>
-                    <span class="muted" style="margin: 0">{{ f.path }}</span>
-                  </div>
-                  <button class="glass-btn small" @click="toggleSendFolder(f.id)">{{ f.enabled ? '禁用' : '启用' }}</button>
-                  <button class="glass-btn small danger" title="移除文件夹" @click="removeSendFolder(f.id)">✕</button>
-                </div>
-              </TransitionGroup>
-              <div
-                class="drop-zone mt-xs"
-                role="button"
-                tabindex="0"
-                @click="addSendFolder"
-                @keydown.enter.prevent="addSendFolder"
-              >
-                <span>＋ 选择要发送的文件夹</span>
-              </div>
-            </div>
-          </div>
-        </LiquidGlass>
-        </TransitionGroup>
 
         <!-- 进度（发件 / 收件） -->
         <Transition name="fade-slide" mode="out-in">
@@ -2418,7 +2663,7 @@ async function exportLogs() {
               <div class="btn-group">
                 <button v-if="t.state === 'paused'" class="glass-btn small primary" @click="resumeTaskAction()">恢复</button>
                 <button v-else-if="t.state === 'failed'" class="glass-btn small primary" @click="retryTaskAction(t)">重试</button>
-                <button class="glass-btn small" title="移除任务记录" @click="removeTask(t.id)">✕</button>
+                <button class="glass-btn small" title="移除任务记录" aria-label="移除任务记录" @click="removeTask(t.id)"><AppIcon name="close" :size="11" /></button>
               </div>
             </div>
           </div>
@@ -2464,7 +2709,7 @@ async function exportLogs() {
                         <span class="muted hist-sub" style="margin: 0">{{ t.durationMs > 0 ? (t.durationMs / 1000).toFixed(1) + ' 秒' : '—' }}<template v-if="t.durationMs > 0 && t.bytes > 0"> · {{ fmtRate(t.bytes, t.durationMs) }}</template></span>
                         <span class="muted hist-sub" style="margin: 0">{{ new Date(t.createdAt).toLocaleString() }}</span>
                       </div>
-                      <button class="glass-btn small" title="删除这条记录" @click="deleteTransfer(transfers.indexOf(t))">✕</button>
+                      <button class="glass-btn small" title="删除这条记录" aria-label="删除这条记录" @click="deleteTransfer(transfers.indexOf(t))"><AppIcon name="close" :size="11" /></button>
                     </div>
                   </TransitionGroup>
                 </div>
@@ -2480,11 +2725,68 @@ async function exportLogs() {
           <h2 class="glass-card-title">设备信息</h2>
           <p class="muted">本机公开标识：{{ deviceInfo.deviceId ? deviceInfo.deviceId.slice(0, 8) + '…' : '' }} · 机型 {{ deviceInfo.model }}</p>
           <input class="glass-input" v-model="deviceNameInput" placeholder="设备名（如 小米17）" @blur="flushDeviceName" />
-          <p class="muted">输入后自动保存；重置连接码请点顶部连接码旁的 ↻</p>
-          <div class="row mt-xs">
-            <span class="muted" style="margin: 0; flex: 1">启动时自动开启收件</span>
+          <p class="muted">输入后自动保存；重置连接码请点顶部连接码旁的刷新按钮</p>
+        </LiquidGlass>
+
+        <!-- 自动收件：与「调试」同构（标题+开关同排），独立成卡，与桌面端一致 -->
+        <LiquidGlass :corner-radius="24" padding="14px 16px">
+          <div class="history-head">
+            <h2 class="glass-card-title" style="margin: 0">自动收件</h2>
             <GlassSwitch :model-value="autoStartReceiver" label="启动时自动开启收件" @update:model-value="toggleAutoStartReceiver" />
           </div>
+          <p class="muted">启动后自动开启收件服务，随时接收对方推送</p>
+        </LiquidGlass>
+
+        <!-- 同步策略：增量 / 镜像（从同步页移入设置页） -->
+        <LiquidGlass :corner-radius="24" padding="14px 16px">
+          <h2 class="glass-card-title">同步策略</h2>
+          <GlassSeg
+            v-model="syncStrategy"
+            label="同步策略"
+            :options="[
+              { id: 'archive', label: '增量' },
+              { id: 'mirror', label: '镜像' },
+            ]"
+            @update:model-value="setStrategy"
+          />
+          <p v-if="syncStrategy === 'mirror'" class="muted">镜像：对端多余文件将被移入其 delete 文件夹；增量仅发送差异文件</p>
+        </LiquidGlass>
+
+        <!-- 发件区配置：永久文件夹（持久化，重启保留，默认每次参与同步） -->
+        <LiquidGlass :corner-radius="24" padding="14px 16px">
+          <h2 class="glass-card-title">发件区配置</h2>
+          <p class="muted">永久发件文件夹：程序关闭后仍保留，默认每次都参与同步</p>
+          <TransitionGroup name="lg-list" tag="div" class="device-list" @leave="listLeave">
+            <div v-for="f in senderFolders" :key="f.id" class="paired-row">
+              <span class="status-dot" :class="{ on: f.enabled }"></span>
+              <div class="device-main">
+                <strong>{{ f.name }}</strong>
+                <span class="muted" style="margin: 0">{{ f.path }}</span>
+              </div>
+              <button class="glass-btn small" @click="toggleSendFolder(f.id)">{{ f.enabled ? '禁用' : '启用' }}</button>
+              <button class="glass-btn small danger" title="移除文件夹" aria-label="移除文件夹" @click="confirmRemoveSendFolder(f)"><AppIcon name="close" :size="11" /></button>
+            </div>
+          </TransitionGroup>
+          <div class="drop-zone mt-xs" role="button" tabindex="0" @click="addSendFolder" @keydown.enter.prevent="addSendFolder">
+            <span>＋ 选择永久发送文件夹</span>
+          </div>
+        </LiquidGlass>
+
+        <!-- 收件区配置：收件目录 + 收件服务开关（从同步页迁移） -->
+        <LiquidGlass :corner-radius="24" padding="14px 16px">
+          <h2 class="glass-card-title">收件区配置</h2>
+          <p class="muted">收件目录（保存电脑推送的文件）</p>
+          <div class="root-row" :class="{ checked: boxC2p }" role="button" tabindex="0" @click="pickBoxC2p" @keydown.enter.prevent="pickBoxC2p">
+            <span class="root-check">{{ boxC2p ? '✓' : '＋' }}</span>
+            <span class="root-name">{{ boxC2p ? boxC2p.name : '选择收件目录' }}</span>
+          </div>
+          <div class="row mt-sm">
+            <span class="muted" style="margin: 0; flex: 1">收件服务</span>
+            <button v-if="serverRunning" class="glass-btn small danger" @click="oneClickCloseReceive">一键关闭</button>
+            <button v-else-if="receiverEnabled && recvStarting" class="glass-btn small" disabled>启用中…</button>
+            <button v-else class="glass-btn small primary" @click="oneClickReceive">一键开启</button>
+          </div>
+          <p v-if="!boxC2p" class="muted synced-hint mt-xs">⚠ 对方将无法推送文件到本机——请先选择收件目录并开启收件服务</p>
         </LiquidGlass>
 
         <LiquidGlass :corner-radius="24" padding="14px 16px">
@@ -2578,7 +2880,7 @@ async function exportLogs() {
     />
 
     <!-- 底部 Dock：悬浮多气泡液态玻璃（向下滚动收缩 / 轻点状态气泡向上展开） -->
-    <GlassDock v-model="currentPage" :tabs="dockTabs" :status-title="dockStatusTitle" :status-sub="dockStatusSub" :status-on="serverRunning">
+    <GlassDock v-model="currentPage" :tabs="dockTabs" :status-title="dockStatusTitle" :status-sub="dockStatusSub" :status-on="role === 'receiver' ? autoAcceptReceive : serverRunning" :dual="role === 'free'" :on-sync-long-press="longPressSyncAction" :on-sync-click="toggleAutoAcceptReceive">
       <template #panel>
         <h3 class="dock-panel-title">本机状态</h3>
         <div class="dock-panel-grid">
@@ -2590,10 +2892,12 @@ async function exportLogs() {
         <p v-if="lastSyncText" class="dock-panel-sync">{{ lastSyncText }}</p>
         <div class="dock-visibility">
           <div class="dock-visibility-info">
-            <strong>{{ serverRunning ? '本机可见中' : '未配对设备无法发现本机' }}</strong>
-            <small>{{ serverRunning ? '局域网内设备可以发现并向你推送文件' : '未配对设备无法发现本机；已配对设备仍可连接' }}</small>
+            <strong>{{ defensiveHidden ? '本机已完全隐藏' : serverRunning ? '本机可见中' : '未配对设备无法发现本机' }}</strong>
+            <small v-if="defensiveHidden">防御性总开关已开启：所有设备（含已配对）均无法发现或连接本机，仅本机可主动外连</small>
+            <small v-else-if="serverRunning">局域网内设备可以发现并向你推送文件；已配对设备始终可凭凭证发现/连接</small>
+            <small v-else>未配对设备无法发现本机；已配对设备仍可凭加密凭证发现/连接</small>
           </div>
-          <button class="glass-btn small" :class="{ danger: serverRunning }" @click="toggleService">{{ serverRunning ? '设为隐藏' : '设为可见' }}</button>
+          <button class="glass-btn small" :class="{ danger: defensiveHidden }" @click="setDefensive(!defensiveHidden)">{{ defensiveHidden ? '设为可见' : '设为隐藏' }}</button>
         </div>
       </template>
     </GlassDock>

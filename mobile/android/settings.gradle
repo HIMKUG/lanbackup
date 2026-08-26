@@ -3,3 +3,8 @@ include ':capacitor-cordova-android-plugins'
 project(':capacitor-cordova-android-plugins').projectDir = new File('./capacitor-cordova-android-plugins/')
 
 apply from: 'capacitor.settings.gradle'
+
+// ⚠️ 覆盖：local-receiver 必须指向真实源码目录（mobile/local-receiver/android），
+// 而非 Capacitor 生成的 pnpm 旧副本——副本是 outdated 的，手机端 P6 改动与
+// src/test 单元测试（conformance/crypto）都不会进入编译，导致改了不生效。
+project(':local-receiver').projectDir = new File('../local-receiver/android')

@@ -1,0 +1,12 @@
+{
+  "schemaHash": "PENDING_FIRST_CAPTURE",
+  "description": "契约指纹：协议 Schema 序列化后的 SHA-256。契约一旦变更，旧 Golden File 全部失效，CI 立即报警。首次抓取真实响应后回填。",
+  "capturedAt": null,
+  "endpoints": [
+    "GET /api/v3/probe",
+    "POST /api/v3/pair/initiate",
+    "GET /api/v3/pair/status",
+    "POST /api/v3/handshake/challenge",
+    "POST /api/v3/handshake/verify"
+  ]
+}

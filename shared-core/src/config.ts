@@ -56,6 +56,10 @@ export const DEFAULT_CONFIG: AppConfig = {
 
 /** 生成发送文件夹唯一 id */
 export function genFolderId(): string {
+  // CSPRNG 消除 Date.now()+Math.random() 的毫秒内碰撞风险；旧环境回退原实现
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `f_${crypto.randomUUID()}`;
+  }
   return `f_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
@@ -70,10 +74,11 @@ export function normalizeConfig(raw: unknown): AppConfig {
   const role: DeviceRole = r.role === 'receiver' || r.role === 'sender' || r.role === 'free' ? r.role : 'sender';
   const folders = Array.isArray(sender.folders)
     ? sender.folders
-        .filter((f): f is SendFolder => !!f && typeof f === 'object' && typeof f.path === 'string')
+        .filter((f): f is SendFolder => !!f && typeof f === 'object' && typeof f.path === 'string' && f.path.trim() !== '')
         .map((f, i) => ({
           id: typeof f.id === 'string' && f.id ? f.id : `${i}_${genFolderId()}`,
           name: typeof f.name === 'string' ? f.name : '',
+          // P3-227：图标/展示保留原始路径，但过滤已排除纯空白
           path: f.path,
           enabled: f.enabled !== false,
         }))
@@ -111,5 +116,11 @@ export function stringifyConfig(config: AppConfig): string {
 
 /** 复制配置（避免共享引用） */
 export function cloneConfig(config: AppConfig): AppConfig {
-  return normalizeConfig(JSON.parse(JSON.stringify(config)));
+  try {
+    // structuredClone is faster and handles Date objects correctly
+    return structuredClone(config);
+  } catch {
+    // Fallback for environments where structuredClone throws
+    return normalizeConfig(JSON.parse(JSON.stringify(config)));
+  }
 }

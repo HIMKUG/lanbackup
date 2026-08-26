@@ -130,6 +130,9 @@ export function planIncremental(
   const peerExtra: string[] = [];
   if (peer?.files) {
     for (const k of Object.keys(peer.files)) {
+      // 对端假删除区（delete/）不参与多余判定：moveToDelete 后文件留在 delete 文件夹，
+      // 若仍算多余会无限弹镜像确认（问题5 死循环）
+      if (k.startsWith('delete/') || k.startsWith('delete\\')) continue;
       if (!curNormSet.has(normalizeForCompare(k))) peerExtra.push(k);
     }
   }

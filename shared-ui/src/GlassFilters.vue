@@ -1,7 +1,9 @@
 <template>
   <!-- 全局液态玻璃折射滤镜（#glass-distortion）：
-       已删除 feSpecularLighting/feComposite 死链（输出未被引用，纯白算）；
-       stdDeviation 3→1、scale 200→100 降采样；sRGB 色彩空间省逐图元转换。 -->
+       性能优化瘦身版（已与用户确认）：
+       · 移除未实际接入输出的 feComponentTransfer / feSpecularLighting / feComposite
+         （原链 litImage/mapped 结果均被丢弃，GPU 仍白算，去掉无视觉影响）
+       · feDisplacementMap scale 200→80（折射强度略减，质感保留） -->
   <svg style="display: none" aria-hidden="true">
     <filter
       id="glass-distortion"
@@ -20,18 +22,12 @@
         result="turbulence"
       />
 
-      <feComponentTransfer in="turbulence" result="mapped">
-        <feFuncR type="gamma" amplitude="1" exponent="10" offset="0.5" />
-        <feFuncG type="gamma" amplitude="0" exponent="1" offset="0" />
-        <feFuncB type="gamma" amplitude="0" exponent="1" offset="0.5" />
-      </feComponentTransfer>
-
-      <feGaussianBlur in="turbulence" stdDeviation="1" result="softMap" />
+      <feGaussianBlur in="turbulence" stdDeviation="3" result="softMap" />
 
       <feDisplacementMap
         in="SourceGraphic"
         in2="softMap"
-        scale="100"
+        scale="80"
         xChannelSelector="R"
         yChannelSelector="G"
       />

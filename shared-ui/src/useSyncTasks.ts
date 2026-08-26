@@ -23,6 +23,8 @@ export interface SyncTask {
   totalBytes: number;
   createdAt: number;
   updatedAt: number;
+  /** 防重放对话框标志（同一任务不重复弹窗） */
+  dialogShown?: boolean;
 }
 
 const STORAGE_KEY = 'lanbackup_sync_tasks';
@@ -58,7 +60,10 @@ export function useSyncTasks() {
     totalBytes: number;
   }): SyncTask {
     const task: SyncTask = {
-      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      // CSPRNG：任务 ID 仅作不透明主键用，randomUUID 消除毫秒内碰撞风险
+      id: typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       direction: t.direction,
       peer: t.peer,
       peerIp: t.peerIp,
@@ -71,6 +76,7 @@ export function useSyncTasks() {
       totalBytes: t.totalBytes,
       createdAt: Date.now(),
       updatedAt: Date.now(),
+      dialogShown: false,
     };
     tasks.value = [task, ...tasks.value].slice(0, MAX_TASKS);
     return task;
@@ -96,8 +102,24 @@ export function useSyncTasks() {
   }
 
   function removeTask(id: string) {
-    tasks.value = tasks.value.filter((x) => x.id !== id);
+    const idx = tasks.value.findIndex((x) => x.id === id);
+    if (idx !== -1) tasks.value.splice(idx, 1);
   }
 
-  return { tasks, createTask, updateTask, pauseTask, completeTask, failTask, removeTask };
+  /**
+   * 标记对话框已显示（防重放）
+   */
+  function markDialogShown(id: string) {
+    updateTask(id, { dialogShown: true });
+  }
+
+  /**
+   * 检查是否已显示过对话框（防重放）
+   */
+  function isDialogShown(id: string): boolean {
+    const t = tasks.value.find((x) => x.id === id);
+    return t?.dialogShown ?? false;
+  }
+
+  return { tasks, createTask, updateTask, pauseTask, completeTask, failTask, removeTask, markDialogShown, isDialogShown };
 }

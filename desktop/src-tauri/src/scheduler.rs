@@ -7,7 +7,7 @@
 //! 非 LocalSend 官方协议。接收端不支持时自动降级为纯 LocalSend v2。
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use sha2::Digest;
@@ -21,6 +21,9 @@ use crate::db::AppError;
 // ============================================================
 
 /// 文件元数据 + Merkle 树信息（localsend-scheduler v1 扩展）
+/// 故意标记 allow(dead_code)：scheduler 差异同步引擎的公共 API，
+/// build_manifest 和 SchedulerHttpClient 在 send_files 完全重构后接线。
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct FileManifest {
     /// 文件唯一 ID（对应 LocalSend v2 FileDto.id）
@@ -43,7 +46,8 @@ pub struct FileManifest {
     pub protocol_extensions: Vec<String>,
 }
 
-/// 差异分析结果
+/// 差异分析结果（未来 chunk 差异同步用）
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ChunkDiff {
     pub file_id: String,
@@ -58,7 +62,8 @@ pub struct ChunkDiff {
     pub file_complete: bool,
 }
 
-/// 会话状态机
+/// 会话状态机（scheduler 差异同步引擎用）
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionState {
     Idle,
@@ -72,7 +77,8 @@ pub enum SessionState {
     Error(String),
 }
 
-/// 单个文件的传输状态
+/// 单个文件的传输状态（scheduler 差异同步引擎用）
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct FileTransferState {
     pub manifest: FileManifest,
@@ -84,7 +90,8 @@ pub struct FileTransferState {
     pub state: SessionState,
 }
 
-/// 单个接收端会话（发送端视角）
+/// 单个接收端会话（发送端视角，scheduler 差异同步引擎用）
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct PeerSession {
     pub peer_ip: String,
@@ -97,6 +104,8 @@ pub struct PeerSession {
 }
 
 impl PeerSession {
+    /// 创建新会话（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub fn new(peer_ip: String, peer_port: u16) -> Self {
         Self {
             peer_ip,
@@ -109,7 +118,8 @@ impl PeerSession {
         }
     }
 
-    /// 推进状态机
+    /// 推进状态机（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub fn set_state(&mut self, new_state: SessionState) {
         crate::log_debug!(
             "PeerSession {} → {:?}",
@@ -120,11 +130,14 @@ impl PeerSession {
     }
 
     /// 心跳保活
+    /// 更新心跳时间（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub fn touch(&mut self) {
         self.last_heartbeat = std::time::Instant::now();
     }
 
-    /// 是否超时（15 秒无心跳）
+    /// 是否超时（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub fn is_timed_out(&self, timeout_secs: u64) -> bool {
         self.last_heartbeat.elapsed().as_secs() > timeout_secs
     }
@@ -152,7 +165,8 @@ pub struct TransferProgress {
     pub last_error: Option<String>,
 }
 
-/// 对端信息
+/// 对端信息（scheduler 差异同步引擎用，allow(dead_code)：SessionStore 重构后接线）
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerInfo {
     pub peer_id: String,
@@ -162,7 +176,8 @@ pub struct PeerInfo {
     pub status: PeerStatus,
 }
 
-/// 对端连接状态
+/// 对端连接状态（scheduler 差异同步引擎用，allow(dead_code)：SessionStore 重构后接线）
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum PeerStatus {
@@ -175,13 +190,15 @@ pub enum PeerStatus {
 // ============================================================
 
 /// Merkle 树节点
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum MerkleNode {
     Leaf(Vec<u8>),      // 16KiB block SHA-256（32 字节）
     Internal(Vec<u8>),   // 中间节点哈希（32 字节）
 }
 
-/// Merkle 哈希树（BitTorrent v2 BEP-0052 兼容）
+/// Merkle 哈希树（BitTorrent v2 BEP-0052 兼容，scheduler 差异同步引擎用）
+#[allow(dead_code)]
 pub struct MerkleTree {
     /// 每个 piece 的 Merkle 根（叶子节点 = 16KiB block SHA-256）
     piece_hashes: Vec<Vec<u8>>,
@@ -189,11 +206,13 @@ pub struct MerkleTree {
     root_hash: Vec<u8>,
     /// piece 大小（= 传输分片大小 = 4MB）
     piece_size: u64,
+    /// P3-44：构建时顺带算出的整文件 SHA-256（hex），避免 build_manifest 二次全量读
+    file_sha256: Option<String>,
 }
 
 impl MerkleTree {
-    /// 从 piece 哈希列表构建 Merkle 树
-    /// piece_hashes：每个 piece 的 SHA-256（32 字节）
+    /// 从 piece 哈希列表构建（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub fn new(piece_hashes: Vec<String>, piece_size: u64) -> Self {
         // 将 hex string 转为字节
         let piece_hashes: Vec<Vec<u8>> = piece_hashes
@@ -207,7 +226,7 @@ impl MerkleTree {
             Self::compute_root(&piece_hashes)
         };
 
-        Self { piece_hashes, root_hash, piece_size }
+        Self { piece_hashes, root_hash, piece_size, file_sha256: None }
     }
 
     /// 从文件内容构建 Merkle 树（分块计算叶子节点）
@@ -215,8 +234,6 @@ impl MerkleTree {
         path: P,
         piece_size: u64,
     ) -> Result<Self, AppError> {
-        use std::io::Read;
-
         let path = path.as_ref();
         let metadata = std::fs::metadata(path)
             .map_err(|e| AppError(format!("读取文件元数据失败 {}: {}", path.display(), e)))?;
@@ -229,13 +246,15 @@ impl MerkleTree {
         let block_size: u64 = 16 * 1024; // 16KiB leaf block
         let mut file = std::fs::File::open(path)
             .map_err(|e| AppError(format!("打开文件失败 {}: {}", path.display(), e)))?;
-        let mut buf = vec![0u8; block_size as usize];
+        // P3-307：叶片块缓冲在循环外复用，避免每块重复分配（大文件节省数十万次分配）
+        let mut block_buf = vec![0u8; block_size as usize];
+        // P3-44：整文件 SHA-256（跨 piece 连续读取累加，与 Merkle piece 哈希同一次 I/O）
+        let mut file_hasher = sha2::Sha256::new();
 
         for piece_idx in 0..total_pieces {
             // 计算这个 piece 的 Merkle 根 = 该 piece 内所有 16KiB block 的 SHA-256 的树根
             let piece_start = piece_idx as u64 * piece_size;
             let piece_end = (piece_start + piece_size).min(file_size);
-            let piece_len = piece_end - piece_start;
 
             // 构建这个 piece 的叶子节点（16KiB block SHA-256）
             let mut leaf_hashes: Vec<Vec<u8>> = Vec::new();
@@ -243,13 +262,14 @@ impl MerkleTree {
 
             while offset < piece_end {
                 let read_size = (block_size as u64).min(piece_end - offset) as usize;
-                // 读取块
-                let mut block_buf = vec![0u8; read_size];
-                std::io::Read::read_exact(&mut file, &mut block_buf)
+                // 读取块（复用循环外 buffer）
+                std::io::Read::read_exact(&mut file, &mut block_buf[..read_size])
                     .map_err(|e| AppError(format!("读取块失败 {}: {}", path.display(), e)))?;
+                // P3-44：整文件 hasher 随块累加，一次读取同时算出文件 SHA-256 与 Merkle 哈希
+                file_hasher.update(&block_buf[..read_size]);
 
                 // 计算叶子哈希（16KiB block SHA-256）
-                let leaf_hash = sha2::Sha256::digest(&block_buf).to_vec();
+                let leaf_hash = sha2::Sha256::digest(&block_buf[..read_size]).to_vec();
                 leaf_hashes.push(leaf_hash);
                 offset += block_size as u64;
             }
@@ -279,14 +299,20 @@ impl MerkleTree {
             Self::compute_root(&piece_hashes_decoded)
         };
 
+        // P3-44：整文件 SHA-256（hex）；空文件时 Digest 对空输入仍得出正确哈希
+        let file_sha256 = hex::encode(sha2::Digest::finalize(file_hasher));
+
         Ok(Self {
             piece_hashes: piece_hashes_decoded,
             root_hash,
             piece_size,
+            file_sha256: Some(file_sha256),
         })
     }
 
     /// 计算一组哈希的 Merkle 根（两两串联 SHA-256）
+    /// 计算 Merkle 根（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     fn compute_root(hashes: &[Vec<u8>]) -> Vec<u8> {
         if hashes.is_empty() {
             return vec![0u8; 32];
@@ -316,11 +342,15 @@ impl MerkleTree {
     }
 
     /// 获取 Merkle 根（hex string）
+    /// 获取 Merkle 根 hex（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub fn root_hex(&self) -> String {
         hex::encode(&self.root_hash)
     }
 
     /// 获取所有 piece 哈希（hex string）
+    /// 获取所有 piece 哈希 hex（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub fn piece_hashes_hex(&self) -> Vec<String> {
         self.piece_hashes.iter().map(|h| hex::encode(h)).collect()
     }
@@ -330,13 +360,14 @@ impl MerkleTree {
 // 双校验（弱校验 xxHash64 快筛 + 强校验 SHA-256）
 // ============================================================
 
-/// xxHash64 弱校验（用于快速排除，非加密）
-/// 注意：仅用于 trusted 输入场景（局域网备份符合）
+/// xxHash64 弱校验（allow(dead_code)：scheduler 差异同步引擎用）
+#[allow(dead_code)]
 pub fn weak_checksum(data: &[u8]) -> u64 {
     xxhash_rust::xxh64::xxh64(data, 0)
 }
 
-/// 用 SHA-256 做强校验
+/// 用 SHA-256 做强校验（allow(dead_code)：scheduler 差异同步引擎用）
+#[allow(dead_code)]
 pub fn strong_checksum(data: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(data))
 }
@@ -371,7 +402,8 @@ pub fn is_checksum_failure_retryable(status_code: u16) -> bool {
 // SendScheduler（全局调度器）
 // ============================================================
 
-/// 全局调度器：管理多个 PeerSession 并发传输
+/// 全局调度器：管理多个 PeerSession 并发传输（scheduler 差异同步引擎用）
+#[allow(dead_code)]
 pub struct SendScheduler {
     /// 所有活跃的接收端会话（key = "{ip}:{port}"）
     peers: RwLock<HashMap<String, Arc<RwLock<PeerSession>>>>,
@@ -386,6 +418,8 @@ pub struct SendScheduler {
 }
 
 impl SendScheduler {
+    /// 创建调度器（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             peers: RwLock::new(HashMap::new()),
@@ -397,6 +431,8 @@ impl SendScheduler {
     }
 
     /// 注册一个接收端会话
+    /// 添加对等节点（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub async fn add_peer(&self, ip: String, port: u16) -> String {
         let key = format!("{}:{}", ip, port);
         let session = PeerSession::new(ip.clone(), port);
@@ -407,6 +443,8 @@ impl SendScheduler {
     }
 
     /// 获取一个 PeerSession
+    /// 获取对等节点（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub async fn get_peer(&self, ip: &str, port: u16) -> Option<Arc<RwLock<PeerSession>>> {
         let key = format!("{}:{}", ip, port);
         let peers = self.peers.read().await;
@@ -414,6 +452,8 @@ impl SendScheduler {
     }
 
     /// 移除一个 PeerSession
+    /// 移除对等节点（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub async fn remove_peer(&self, ip: &str, port: u16) {
         let key = format!("{}:{}", ip, port);
         let mut peers = self.peers.write().await;
@@ -421,12 +461,16 @@ impl SendScheduler {
     }
 
     /// 获取当前所有活跃会话数
+    /// 活跃对等数（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub async fn active_peer_count(&self) -> usize {
         let peers = self.peers.read().await;
         peers.len()
     }
 
     /// 标记会话状态
+    /// 更新对等状态（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub async fn set_peer_state(&self, ip: &str, port: u16, state: SessionState) {
         if let Some(session) = self.get_peer(ip, port).await {
             let mut s = session.write().await;
@@ -435,6 +479,8 @@ impl SendScheduler {
     }
 
     /// 更新心跳
+    /// 更新心跳（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub async fn touch_peer(&self, ip: &str, port: u16) {
         if let Some(session) = self.get_peer(ip, port).await {
             let mut s = session.write().await;
@@ -443,6 +489,8 @@ impl SendScheduler {
     }
 
     /// 获取超时会话并标记为 PAUSED
+    /// 检查超时（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub async fn check_timeouts(&self, timeout_secs: u64) -> Vec<String> {
         let mut timed_out = Vec::new();
         let peers = self.peers.read().await;
@@ -464,19 +512,26 @@ impl SendScheduler {
         timed_out
     }
 
-    /// 全局信号量引用（供 upload 阶段使用）
+    /// 全局分片信号量（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub fn global_chunks(&self) -> Arc<Semaphore> {
         self.global_chunks.clone()
     }
 
+    /// 重试令牌桶（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub fn retry_bucket(&self) -> Arc<Semaphore> {
         self.retry_bucket.clone()
     }
 
+    /// 最大并发接收端数（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub fn max_concurrent_receivers(&self) -> usize {
         self.max_concurrent_receivers
     }
 
+    /// 每接收端并发分片数（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub fn concurrent_chunks_per_peer(&self) -> usize {
         self.concurrent_chunks_per_peer
     }
@@ -492,7 +547,24 @@ impl Default for SendScheduler {
 // FileManifest 构建工具
 // ============================================================
 
-/// 从文件路径构建 FileManifest（计算 Merkle 树）
+/// 整文件 SHA-256（hex）。作为 Merkle 构建兜底；正常路径由 from_file_content 顺带算出。
+fn hash_file_sha256(abs_path: &Path) -> String {
+    use std::io::Read as _;
+    let mut hasher = sha2::Sha256::new();
+    if let Ok(mut file) = std::fs::File::open(abs_path) {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => hasher.update(&buf[..n]),
+            }
+        }
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// 从文件路径构建 FileManifest（计算 Merkle 树，allow(dead_code)：scheduler 差异同步引擎用）
+#[allow(dead_code)]
 pub fn build_manifest(
     file_id: String,
     file_name: String,
@@ -502,30 +574,24 @@ pub fn build_manifest(
     let metadata = std::fs::metadata(abs_path)
         .map_err(|e| AppError(format!("读取文件元数据失败 {}: {}", abs_path.display(), e)))?;
     let file_size = metadata.len();
+    // 输入契约守卫：chunk_size=0 会让下方除法 panic；file_size 接近 u64::MAX 时
+    // file_size + chunk_size - 1 加法溢出（debug panic / release 回绕）
+    if chunk_size == 0 {
+        return Err(AppError("build_manifest: chunk_size 不能为 0".to_string()));
+    }
+    let total_chunks = u32::try_from(file_size / chunk_size + u64::from(file_size % chunk_size != 0))
+        .map_err(|_| AppError("build_manifest: 分块数超出 u32 范围".to_string()))?;
 
-    let total_chunks = ((file_size + chunk_size - 1) / chunk_size) as u32;
-
-    // 计算整个文件的 SHA-256
-    let file_sha256 = {
-        use std::io::Read;
-        let mut file = std::fs::File::open(abs_path)
-            .map_err(|e| AppError(format!("打开文件失败 {}: {}", abs_path.display(), e)))?;
-        let mut hasher = sha2::Sha256::new();
-        let mut buf = vec![0u8; 8192]; // 8KB 缓冲区（最优性能/内存平衡）
-        loop {
-            let n = std::io::Read::read(&mut file, &mut buf)
-                .map_err(|e| AppError(format!("计算 SHA-256 失败 {}: {}", abs_path.display(), e)))?;
-            if n == 0 { break; }
-            hasher.update(&buf[..n]);
-        }
-        hex::encode(hasher.finalize())
-    };
-
-    // 构建 Merkle 树
+    // 构建 Merkle 树（同时顺带算出整文件 SHA-256，避免二次全量读取——P3-44）
     let merkle = MerkleTree::from_file_content(abs_path, chunk_size)
         .map_err(|e| AppError(format!("构建 Merkle 树失败 {}: {}", abs_path.display(), e)))?;
     let merkle_root = merkle.root_hex();
     let piece_hashes = merkle.piece_hashes_hex();
+    // 整文件 SHA-256 直接取自 Merkle 构建过程，不再单独读一遍文件
+    let file_sha256 = merkle.file_sha256.clone().unwrap_or_else(|| {
+        // 兜底：极罕见（非 from_file_content 构建路径）才回退到二次读取
+        hash_file_sha256(abs_path)
+    });
 
     Ok(FileManifest {
         file_id,
@@ -540,7 +606,8 @@ pub fn build_manifest(
     })
 }
 
-/// 大文件（>100MB）才需要 Merkle 树，小文件直接返回 file_sha256
+/// 大文件（>100MB）才需要 Merkle 树（allow(dead_code)：scheduler 差异同步引擎用）
+#[allow(dead_code)]
 pub fn build_manifest_if_needed(
     file_id: String,
     file_name: String,
@@ -565,13 +632,14 @@ pub fn build_manifest_if_needed(
 // ETag 格式化工具（协议契约：双引号强校验器）
 // ============================================================
 
-/// 将 SHA-256 hex string 格式化为带双引号的 ETag
-/// 协议契约：ETag / If-Range 必须为带双引号的 SHA-256 字符串，不加 W/ 前缀
+/// 将 SHA-256 hex string 格式化为带双引号的 ETag（allow(dead_code)：scheduler 差异同步引擎用）
+#[allow(dead_code)]
 pub fn format_etag(sha256_hex: &str) -> String {
     format!("\"{}\"", sha256_hex)
 }
 
-/// 解析带双引号的 ETag（去掉引号）
+/// 解析带双引号的 ETag（allow(dead_code)：scheduler 差异同步引擎用）
+#[allow(dead_code)]
 pub fn parse_etag(etag: &str) -> Option<String> {
     let trimmed = etag.trim();
     if trimmed.starts_with('"') && trimmed.ends_with('"') {
@@ -588,21 +656,25 @@ pub fn parse_etag(etag: &str) -> Option<String> {
 use localsend::reqwest::Client;
 
 /// Scheduler HTTP 客户端：用于发送 scheduler v1 扩展协议请求
+#[allow(dead_code)]
 pub struct SchedulerHttpClient {
     client: Client,
 }
 
 impl SchedulerHttpClient {
+    /// 创建客户端（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub fn new() -> Result<Self, AppError> {
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            // prepare-upload 可能阻塞等待接收端用户确认（最长 45s），超时必须留足余量
+            .timeout(std::time::Duration::from_secs(70))
             .build()
             .map_err(|e| AppError(format!("创建 HTTP 客户端失败: {e}")))?;
         Ok(Self { client })
     }
 
-    /// 构建 scheduler v1 扩展的 prepare-upload 请求体（JSON）
-    /// 在标准 FileDto 基础上添加 scheduler 扩展字段
+    /// 构建 scheduler v1 扩展 prepare-upload JSON（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub fn build_extended_prepare_upload_json(
         info: &localsend::http::dto_v2::RegisterDtoV2,
         files: &std::collections::HashMap<String, localsend::model::transfer::FileDto>,
@@ -618,7 +690,7 @@ impl SchedulerHttpClient {
         let files_with_ext = if let Some(m) = manifest {
             let mut files_ext = files_json;
             if let Some(obj) = files_ext.as_object_mut() {
-                for (file_id, file_val) in obj.iter_mut() {
+                for (_file_id, file_val) in obj.iter_mut() {
                     if let Some(map) = file_val.as_object_mut() {
                         map.insert("protocolExtensions".to_string(), json!(["scheduler-v1"]));
                         map.insert("merkleRoot".to_string(), json!(m.merkle_root));
@@ -641,7 +713,8 @@ impl SchedulerHttpClient {
         }))
     }
 
-    /// 发送 scheduler v1 扩展的 prepare-upload 请求
+    /// 发送 scheduler v1 prepare-upload 请求（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub async fn prepare_upload_extended(
         &self,
         protocol: localsend::model::discovery::ProtocolType,
@@ -654,6 +727,8 @@ impl SchedulerHttpClient {
             localsend::model::discovery::ProtocolType::Https => "https",
         };
         let url = format!("{}://{}:{}/api/localsend/v2/prepare-upload", scheme, ip, port);
+        let file_count = body.get("files").and_then(|v| v.as_object()).map(|o| o.len()).unwrap_or(0);
+        crate::log_info!("prepare_upload_extended 发送 对端={}:{} 文件数={}", ip, port, file_count);
 
         let resp = self.client
             .post(&url)
@@ -664,14 +739,22 @@ impl SchedulerHttpClient {
             .map_err(|e| AppError(format!("prepare-upload 请求失败: {e}")))?;
 
         let status = resp.status().as_u16();
+        crate::log_info!("prepare_upload_extended 响应 status={} 对端={}:{}", status, ip, port);
+
+        // 非 2xx：拒绝/冲突等，直接报错（与 LsHttpClientV2.prepare_upload 语义一致）
+        if status >= 300 {
+            return Err(AppError(format!("prepare-upload 被接收端拒绝: status={status}")));
+        }
 
         // 204：无文件需要传输
         if status == 204 {
+            crate::log_info!("prepare_upload_extended: 204 无文件需传输 对端={}:{}", ip, port);
             return Ok(SchedulerPrepareResponse {
                 status_code: status,
                 session_id: String::new(),
                 files: std::collections::HashMap::new(),
                 chunk_diff: None,
+                ecdh_pub_key: None,
             });
         }
 
@@ -683,33 +766,53 @@ impl SchedulerHttpClient {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        if session_id.is_empty() && status != 204 {
+            // 空会话 id 会让后续 upload 全部失败且根因丢失——显式告警而非静默
+            crate::log_warn!("prepare_upload_extended 响应缺少 sessionId（status={status}），后续上传将失败");
+        }
 
         // 解析 files 字段（标准 LocalSend v2 格式）
-        let files: std::collections::HashMap<String, String> = body.get("files")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+        let files: std::collections::HashMap<String, String> = match body.get("files") {
+            Some(v) => match serde_json::from_value(v.clone()) {
+                Ok(m) => m,
+                Err(e) => {
+                    // 接收端明明拒绝了所有文件，静默变空 map 会伪装成"接受了 0 个"照常推进
+                    crate::log_warn!("prepare_upload_extended files 字段解析失败: {e}");
+                    std::collections::HashMap::new()
+                }
+            },
+            None => {
+                crate::log_warn!("prepare_upload_extended 响应缺少 files 字段");
+                std::collections::HashMap::new()
+            }
+        };
+        crate::log_info!("prepare_upload_extended 完成 session={} 接受文件数={} 对端={}:{}",
+            crate::logger::mask(&session_id), files.len(), ip, port);
 
         // 解析 scheduler v1 扩展的 chunkDiff（可选）
         let chunk_diff = body.get("chunkDiff")
             .or_else(|| body.get("chunk_diff"))
             .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+        // 加密 v2 扩展：接收端 ECDH 公钥（复杂加密协商）
+        let ecdh_pub_key = body.get("ecdhPubKey")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         Ok(SchedulerPrepareResponse {
             status_code: status,
             session_id,
             files,
             chunk_diff,
+            ecdh_pub_key,
         })
     }
 
-    /// GET /diff 端点：探测块是否存在 + SHA-256 校验
-    /// 协议契约：
-    /// - 206 + Content-Range: 块存在且 ETag 匹配
-    /// - 412: 块存在但 SHA-256 不匹配（NACK）
-    /// - 416 + Content-Range: bytes */{total}: 块不存在（Range 超范围）
-    /// - 200: ETag 不匹配（文件已变），需全量重传
+    /// GET /diff 端点（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub async fn get_diff(
         &self,
+        protocol: localsend::model::discovery::ProtocolType,
         ip: &str,
         port: u16,
         session_id: &str,
@@ -718,11 +821,20 @@ impl SchedulerHttpClient {
         chunk_size: u64,
         etag: &str, // 必须是带双引号的 ETag 字符串
     ) -> Result<DiffResponse, AppError> {
+        if chunk_size == 0 {
+            return Err(AppError("get_diff: chunk_size 不能为 0".to_string()));
+        }
+        // scheme 与 prepare_upload_extended 一致按对端协议选择——此前硬编码 http://
+        // 会对 HTTPS 对端明文降级或直连失败
+        let scheme = match protocol {
+            localsend::model::discovery::ProtocolType::Http => "http",
+            localsend::model::discovery::ProtocolType::Https => "https",
+        };
         let range_start = chunk_index as u64 * chunk_size;
         let range_end = range_start + chunk_size - 1;
         let url = format!(
-            "http://{}:{}/api/localsend/v2/file/{}/diff",
-            ip, port, file_id
+            "{}://{}:{}/api/localsend/v2/file/{}/diff",
+            scheme, ip, port, file_id
         );
 
         let resp = self.client
@@ -784,8 +896,11 @@ impl SchedulerHttpClient {
 
     /// 上传单个块（POST /upload 片段）
     /// 注意：这是 scheduler v1 的扩展接口，接收端必须实现
+    /// POST /upload 块上传（allow(dead_code)：scheduler 差异同步引擎用）
+    #[allow(dead_code)]
     pub async fn upload_chunk(
         &self,
+        protocol: localsend::model::discovery::ProtocolType,
         ip: &str,
         port: u16,
         session_id: &str,
@@ -794,8 +909,13 @@ impl SchedulerHttpClient {
         chunk_index: u32,
         data: Vec<u8>,
     ) -> Result<UploadChunkResponse, AppError> {
+        let scheme = match protocol {
+            localsend::model::discovery::ProtocolType::Http => "http",
+            localsend::model::discovery::ProtocolType::Https => "https",
+        };
         let url = format!(
-            "http://{}:{}/api/localsend/v2/upload?sessionId={}&fileId={}&token={}&chunkIndex={}",
+            "{}://{}:{}/api/localsend/v2/upload?sessionId={}&fileId={}&token={}&chunkIndex={}",
+            scheme,
             ip, port,
             urlencoding::encode(session_id),
             urlencoding::encode(file_id),
@@ -839,7 +959,8 @@ impl Default for SchedulerHttpClient {
 // 响应类型
 // ============================================================
 
-/// Scheduler v1 prepare-upload 响应
+/// Scheduler v1 prepare-upload 响应（allow(dead_code)：scheduler 差异同步引擎用）
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct SchedulerPrepareResponse {
     pub status_code: u16,
@@ -847,9 +968,13 @@ pub struct SchedulerPrepareResponse {
     pub files: std::collections::HashMap<String, String>,
     /// Scheduler v1 扩展：每个文件的块差异（可选）
     pub chunk_diff: Option<std::collections::HashMap<String, ChunkDiff>>,
+    /// 加密 v2 扩展：接收端 ECDH 公钥（复杂加密协商，可选）
+    pub ecdh_pub_key: Option<String>,
 }
 
 /// GET /diff 响应
+/// GET /diff 响应（allow(dead_code)：scheduler 差异同步引擎用）
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum DiffResponse {
     /// 206: 块存在且 ETag 匹配，返回块数据
@@ -863,6 +988,8 @@ pub enum DiffResponse {
 }
 
 /// upload_chunk 响应
+/// POST /upload 块上传响应（allow(dead_code)：scheduler 差异同步引擎用）
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum UploadChunkResponse {
     Ok,

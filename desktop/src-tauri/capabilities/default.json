@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "默认能力：核心 + 对话框插件 + 自定义标题栏窗口控制",
-  "windows": ["main"],
+  "windows": ["main", "ball"],
   "permissions": [
     "core:default",
     "dialog:default",

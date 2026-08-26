@@ -36,8 +36,12 @@ test('连接码：同一特征码生成同一连接码，且为 8 位字母数�
   assert.ok(isValidConnectionCode(code1), '连接码应合法');
 });
 
-test('连接码：空特征码应抛错', () => {
-  assert.throws(() => generateConnectionCode(''), '空特征码应抛错');
+test('连接码：空特征码走确定性兜底（与 Rust 端对齐，不抛错）', () => {
+  // P3-315：空 stableId 不再抛异常，而是使用固定兜底派生（避免设备标识损坏时崩溃）
+  const code1 = generateConnectionCode('');
+  const code2 = generateConnectionCode('');
+  assert.strictEqual(code1, code2, '空特征码应生成确定性的同一连接码');
+  assert.ok(isValidConnectionCode(code1), '空特征码生成的码应合法');
 });
 
 test('连接码：非 ASCII 特征码生成合法连接码（UTF-8 编码一致性）', () => {

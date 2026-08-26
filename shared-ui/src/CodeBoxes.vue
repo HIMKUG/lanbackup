@@ -7,6 +7,7 @@
       :ref="(el) => setBox(i, el)"
       class="codebox"
       :value="ch"
+      :placeholder="PLACEHOLDER[i] ?? ''"
       maxlength="2"
       inputmode="text"
       autocomplete="off"
@@ -21,6 +22,9 @@
 
 <script setup lang="ts">
 import { computed, nextTick, ref } from 'vue';
+
+/** 8 格占位提示：每格一个字，提示用户在此输入连接码 */
+const PLACEHOLDER = '请在此输入连接码';
 
 const props = withDefaults(
   defineProps<{ modelValue: string; length?: number; label?: string }>(),

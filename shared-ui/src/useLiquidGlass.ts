@@ -9,7 +9,12 @@ export const polarDisplacementMap =
 
 export function useLiquidGlass() {
   const generateId = () => {
-    return Math.random().toString(36).substr(2, 9);
+    // CSPRNG：crypto.randomUUID 在 Tauri WebView2 与 Android WebView 均可用；
+    // 旧环境回退到时间戳+随机串（保持唯一性即可，此 ID 非安全用途）
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 11)}`;
   };
 
   const isFirefox = () => {

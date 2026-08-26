@@ -30,25 +30,35 @@
           :class="{ active: modelValue === t.id }"
           role="tab"
           :aria-selected="modelValue === t.id"
+          :tabindex="modelValue === t.id ? 0 : -1"
           @click="$emit('update:modelValue', t.id)"
+          @keydown.left.prevent="onTabKey(-1)"
+          @keydown.right.prevent="onTabKey(1)"
         >
-          <span class="tab-icon" aria-hidden="true">{{ t.icon }}</span>
+          <span class="tab-icon" aria-hidden="true"><AppIcon :name="(t.icon as never)" :size="30" /></span>
           <span class="tab-label">{{ t.label }}</span>
         </button>
       </div>
 
       <button
         class="dock-bubble dock-status"
+        :class="{ 'is-dual': dual, hold: statusHolding }"
         :aria-expanded="expanded"
         aria-label="展开状态面板"
-        @click="expanded = !expanded"
+        @pointerdown="onStatusDown"
+        @pointerup="onStatusUp"
+        @pointerleave="onStatusCancel"
+        @pointercancel="onStatusCancel"
       >
+        <span class="hold-fill" aria-hidden="true"></span>
         <span class="status-dot" :class="{ on: statusOn }" aria-hidden="true"></span>
         <span class="dock-status-text">
           <strong>{{ statusTitle }}</strong>
           <small>{{ statusSub }}</small>
         </span>
         <span class="dock-caret" aria-hidden="true">⌃</span>
+        <!-- 双向模式：右 1/4 热区点击展开面板（与左 3/4 同步动作分离） -->
+        <span v-if="dual" class="status-panel-zone" aria-hidden="true" @pointerdown.stop @click.stop="expanded = true"></span>
       </button>
     </div>
   </div>
@@ -56,6 +66,7 @@
 
 <script setup lang="ts" generic="T extends string">
 import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+import AppIcon from './AppIcon.vue';
 
 interface DockTab {
   id: T;
@@ -70,11 +81,56 @@ const props = withDefaults(
     statusTitle?: string;
     statusSub?: string;
     statusOn?: boolean;
+    /** 双向模式（收+发都开）：状态按钮左3/4=同步动作 / 右1/4=展开面板 */
+    dual?: boolean;
+    /** 长按1.7s进入状态（只收→切换自动接收；只发/双向→发件） */
+    onSyncLongPress?: () => void;
+    /** 双向模式左3/4点击：切换自动接收 */
+    onSyncClick?: () => void;
   }>(),
-  { statusTitle: '', statusSub: '', statusOn: false },
+  { statusTitle: '', statusSub: '', statusOn: false, dual: false },
 );
 
-defineEmits<{ 'update:modelValue': [value: T] }>();
+/** 状态按钮：单向/双向都支持长按1.7s=动作（收=切换自动接收 / 发=发件）；点击=展开状态面板 */
+const statusHolding = ref(false);
+let statusTimer: ReturnType<typeof setTimeout> | null = null;
+function onStatusDown() {
+  if (statusTimer) return;
+  statusHolding.value = true;
+  statusTimer = setTimeout(() => {
+    statusTimer = null;
+    statusHolding.value = false;
+    props.onSyncLongPress?.();
+  }, 1700);
+}
+function onStatusUp() {
+  if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; }
+  if (!statusHolding.value) return;
+  statusHolding.value = false;
+  // 短按（未满1.7s）：点击展开面板
+  expanded.value = !expanded.value;
+}
+function onStatusCancel() {
+  if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; }
+  statusHolding.value = false;
+}
+
+const emit = defineEmits<{ 'update:modelValue': [value: T] }>();
+
+/** P1-UA3：tablist 键盘导航（roving tabindex）。dir=-1 上一项 / 1 下一项，循环滚动 */
+function onTabKey(dir: number) {
+  const idx = props.tabs.findIndex((t) => t.id === props.modelValue);
+  if (idx < 0) return;
+  const next = props.tabs[(idx + dir + props.tabs.length) % props.tabs.length];
+  if (next) {
+    // 用事件对象代理：实际由父组件监听 update:modelValue 更新高亮；focus 由 tabindex 变化驱动
+    emit('update:modelValue', next.id);
+    // roving: 下一轮 focus 到新激活项（等 DOM 渲染）
+    void nextTick(() => {
+      navRef.value?.querySelector<HTMLElement>('.dock-tab.active')?.focus();
+    });
+  }
+}
 
 const expanded = ref(false);
 const collapsed = ref(false);

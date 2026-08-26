@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://localsend-v3/schemas/handshake.challenge.schema.json",
+  "title": "POST /api/v3/handshake/challenge 请求与响应（重连路径 B）",
+  "description": "重连（已知设备）：签发 challenge_token(JWT) + 服务端临时公钥。服务端验完即焚，不存状态。",
+  "request": {
+    "type": "object",
+    "required": ["deviceId"],
+    "properties": {
+      "deviceId": { "type": "string", "format": "uuid" }
+    },
+    "additionalProperties": false
+  },
+  "response": {
+    "type": "object",
+    "required": ["challengeToken", "serverEphPub"],
+    "properties": {
+      "challengeToken": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$",
+        "description": "JWT: header.payload.signature，HMAC-SHA256(pairing_secret) 签名；payload 含 jti/deviceId/serverNonce/staticPub/iat/exp"
+      },
+      "serverEphPub": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_-]{80,}$",
+        "description": "本次握手临时 P-256 公钥，SEC1 未压缩 base64url"
+      }
+    },
+    "additionalProperties": false
+  }
+}

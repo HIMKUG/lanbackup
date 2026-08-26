@@ -53,7 +53,8 @@ export function updateAnchors(anchors: AnchorMap, entries: AnchorEntry[]): Ancho
  */
 export function getAnchorMtime(anchors: AnchorMap, relPath: string): number | null {
   const entry = anchors[relPath];
-  return entry ? entry.lastMtime : null;
+  // lastMtime <= 0 视为无效锚点（未初始化或损坏数据）
+  return entry && entry.lastMtime > 0 ? entry.lastMtime : null;
 }
 
 /**

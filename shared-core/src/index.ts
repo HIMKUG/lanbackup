@@ -19,3 +19,5 @@ export * from './autopolicy.js';
 export * from './logger.js';
 export * from './scheduler.js';
 export * from './session-store.js';
+export * from './crypto.js';
+export { initTelemetry, getTracer, currentTraceId, setTelemetryEnabled, isTelemetryEnabled, shutdownTelemetry } from './telemetry.js';

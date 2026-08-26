@@ -20,19 +20,46 @@
   --lg-ctl-shadow: 0 6px 6px rgba(0, 0, 0, 0.18), 0 0 20px rgba(0, 0, 0, 0.1);
   --ease-glass: cubic-bezier(0.22, 1, 0.36, 1);
   --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+  /* 质量档驱动变量（架构核心）：全部玻璃控件共享同一套强度与折射开关，
+     切换画质只需改这两个变量，控件规则不再按画质重复声明 */
+  --lg-b: 2px;                  /* effect backdrop-filter 模糊半径 */
+  --lg-refract: none;           /* 折射滤镜（低/中画质关闭，高画质开启 SVG） */
+  --lg-b-lg: 8px;               /* 行级/大控件模糊强化值 */
   /* Dock 悬浮气泡（圆角与窗口圆角同心） */
   --dock-max: 620px;
   --dock-inset: 10px;
   --dock-radius: 26px;
   --dock-gap: 10px;
+  /* P2-TH2：按钮色作为设计令牌（设计令牌断裂修复），dark 层覆盖 */
+  --btn-primary-color: #ffffff;
+  --btn-danger-color: #d93b2b;
+  --btn-danger-color-dark: #ff6961;
+}
+
+/* 画质档位 → 变量（集中管理，一处切换全局生效） */
+html.quality-medium {
+  --lg-b: 4px;
+  --lg-b-lg: 6px;
+}
+
+html.quality-high {
+  --lg-b: 6px;
+  --lg-b-lg: 8px;
+  --lg-refract: url(#glass-distortion);
 }
 
 html.dark {
-  --lg-tint: rgba(28, 30, 38, 0.42);
+  --lg-tint: rgba(28, 30, 38, 0.35);
   --lg-tint-strong: rgba(24, 26, 34, 0.62);
   --lg-solid: rgba(24, 25, 30, 0.96);
   --lg-card-shadow: 0 6px 6px rgba(0, 0, 0, 0.4), 0 0 20px rgba(0, 0, 0, 0.3);
   --lg-ctl-shadow: 0 6px 6px rgba(0, 0, 0, 0.38), 0 0 20px rgba(0, 0, 0, 0.28);
+  /* 深色主题嵌套子层光学补偿：白色高光在暗色壁纸下更收敛 */
+  --glass-nest-highlight: rgba(255, 255, 255, 0.08);
+  --glass-nest-shadow:    rgba(0,   0,   0,   0.10);
+  --glass-nest-border:    rgba(255, 255, 255, 0.10);
+  /* P2-TH2：覆盖按钮危险色为暗色可读值 */
+  --btn-danger-color: var(--btn-danger-color-dark);
 }
 
 /* ---------- 滚动边缘效果（GlassDock 监听滚动给 <html> 打标） ---------- */
@@ -57,6 +84,17 @@ html.lg-is-scrolled {
   transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 2.2); /* 示例原曲线 */
 }
 
+/* 卡片效果层（照搬示例 styles.css）：backdrop-filter 模糊 + SVG 折射，
+   桌面端 canvas 因 WebView CORS 失效时纯 CSS 提供液态玻璃效果 */
+.liquidGlass-effect {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  border-radius: inherit;
+  overflow: hidden;
+  isolation: isolate;
+}
+
 /* 卡片模糊底：canvas 按 3/5fps 采样视频帧（壁纸本身全帧率，不锁帧） */
 .liquidGlass-blur {
   position: absolute;
@@ -68,8 +106,40 @@ html.lg-is-scrolled {
   pointer-events: none;
 }
 
-html.quality-low .liquidGlass-blur {
-  display: none; /* 低档无玻璃 */
+html.quality-low .liquidGlass-blur,
+html.quality-high .liquidGlass-blur {
+  display: none !important; /* 低档无玻璃 / 高档纯 CSS 液态玻璃都不用 canvas */
+}
+
+/* 中画质：effect 层 backdrop-filter 普通模糊（canvas 在上层提供视频模糊） */
+html.quality-medium .liquidGlass-effect {
+  backdrop-filter: blur(12px) saturate(1.4);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+}
+
+/* 高画质：完全照搬示例 styles.css —— backdrop-filter + SVG 折射同层（液态玻璃） */
+html.quality-high .liquidGlass-effect {
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  filter: url(#glass-distortion);
+}
+
+/* 性能优化 C（已确认）：折射滤镜仅大卡片保留（小控件在低模糊下折射不可见，
+   去掉可省大量 SVG 滤镜计算）；小控件的 filter 由 --lg-refract 兜底为 none */
+html.quality-high .gmodal::before,
+html.quality-high .dock-panel::before {
+  filter: url(#glass-distortion);
+}
+
+/* 中/高画质：tint 半透明白玻璃蒙层（日间），夜间自动切换深色玻璃 */
+html.quality-medium .liquidGlass-tint,
+html.quality-high .liquidGlass-tint {
+  background: rgba(255, 255, 255, 0.22) !important;
+}
+
+html.dark.quality-medium .liquidGlass-tint,
+html.dark.quality-high .liquidGlass-tint {
+  background: rgba(30, 32, 40, 0.35) !important;
 }
 
 .liquidGlass-tint {
@@ -85,10 +155,11 @@ html.quality-low .liquidGlass-blur {
   position: absolute;
   inset: 0;
   z-index: 2;
-  border-radius: inherit; /* 白边沿圆角渲染，四角同样有辉光 */
+  border-radius: inherit;
   overflow: hidden;
-  /* 均匀一周的镜面高光（四角同样有高光，不再只亮两个角） */
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.4), inset 0 2px 10px rgba(255, 255, 255, 0.16);
+  /* 照搬示例 styles.css 四边镜面高光：左上亮 + 右下反光 = 液态玻璃边缘折射感 */
+  box-shadow: inset 2px 2px 1px 0 rgba(255, 255, 255, 0.5),
+    inset -1px -1px 1px 1px rgba(255, 255, 255, 0.5);
 }
 
 .liquidGlass-text {
@@ -97,17 +168,17 @@ html.quality-low .liquidGlass-blur {
 }
 
 /* ============================================================
-   二、控件伪元素配方（按钮/分段/开关/Dock/弹窗与卡片同一材质）
-   ::before = effect（模糊+折射）；::after = tint + shine
+   二、液态玻璃控件配方（架构化）
+   三明治结构：::before(effect: 模糊+折射) + 元素(内容) + ::after(tint+shine)
+   :is() 分组一次声明全部玻璃控件，模糊/折射由质量变量(--lg-b/--lg-refract)驱动
    ============================================================ */
-.glass-btn,
-.glass-chip,
-.dock-bubble,
-.dock-panel,
-.incoming-card,
-.gmodal,
-.gswitch,
-.gseg {
+
+/* ① 标准玻璃控件基础（按钮/芯片/开关/分段/Dock/弹窗/标题栏/下拉/连接码） */
+:is(
+  .glass-btn, .glass-chip, .gswitch, .gseg,
+  .dock-bubble, .dock-panel, .incoming-card, .gmodal,
+  .titlebar, .dd-panel, .code-copy, .dock-tab
+) {
   position: relative;
   isolation: isolate;
   overflow: hidden;
@@ -115,40 +186,111 @@ html.quality-low .liquidGlass-blur {
   box-shadow: var(--lg-ctl-shadow);
 }
 
-.glass-btn::before,
-.glass-chip::before,
-.dock-bubble::before,
-.dock-panel::before,
-.incoming-card::before,
-.gmodal::before,
-.gswitch::before,
-.gseg::before {
+/* ② effect 层 ::before（模糊强度与折射随画质变量切换） */
+:is(
+  .glass-btn, .glass-chip, .gswitch, .gseg,
+  .dock-bubble, .dock-panel, .incoming-card, .gmodal,
+  .titlebar, .dd-panel, .code-copy, .dock-tab
+)::before {
   content: "";
   position: absolute;
   z-index: -1;
   inset: 0;
   border-radius: inherit;
-  backdrop-filter: blur(2px);
-  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(var(--lg-b));
+  -webkit-backdrop-filter: blur(var(--lg-b));
+  filter: var(--lg-refract);
 }
 
-/* 选择性折射：大表面（Dock/弹窗）保留 SVG 折射；小控件（按钮/分段/开关）只磨砂不折射，
-   视觉损耗 <10%，折射滤镜实例数减半（高档优化①） */
-.dock-bubble::before,
-.dock-panel::before,
-.incoming-card::before,
-.gmodal::before {
-  filter: url(#glass-distortion);
+/* ============================================================
+   三、行级玻璃控件（输入框/设备行/配对行/目录行/窗口按钮/通知）
+   与标准控件同配方，模糊用 --lg-b-lg 强化值
+   ============================================================ */
+:is(.glass-input, .device-item, .paired-row, .root-row, .win-btn, .toast,
+    .status-cell, .hist-group, .about-dev, .mini-btn,
+    /* 新增：桌面端连接码行 / Dock 面板内容 / 状态列 */
+    .app-codebar, .dock-panel-title, .dock-kv, .dock-visibility, .dock-visibility-info,
+    .header-name) {
+  position: relative;
+  isolation: isolate;
 }
 
-.glass-btn::after,
-.glass-chip::after,
-.dock-bubble::after,
-.dock-panel::after,
-.incoming-card::after,
-.gmodal::after,
-.gswitch::after,
-.gseg::after {
+:is(.glass-input, .device-item, .paired-row, .root-row, .win-btn, .toast,
+    .status-cell, .hist-group, .about-dev, .mini-btn,
+    .app-codebar, .dock-panel-title, .dock-kv, .dock-visibility, .dock-visibility-info,
+    .header-name)::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  border-radius: inherit;
+  backdrop-filter: blur(var(--lg-b-lg)) saturate(1.3);
+  -webkit-backdrop-filter: blur(var(--lg-b-lg)) saturate(1.3);
+  filter: var(--lg-refract);
+}
+
+/* per-selector 模糊值覆盖（保持与各端 style.css 旧值一致，只集中到一处维护） */
+.win-btn { --lg-b-lg: 8px; }
+.toast { --lg-b-lg: 14px; }
+.status-cell { --lg-b-lg: 6px; }
+.hist-group { --lg-b-lg: 6px; }
+.about-dev { --lg-b-lg: 6px; }
+.mini-btn { --lg-b-lg: 6px; }
+.app-codebar { --lg-b-lg: 8px; }
+.dock-panel-title { --lg-b-lg: 8px; }
+.dock-kv { --lg-b-lg: 6px; }
+.dock-visibility { --lg-b-lg: 6px; }
+.dock-visibility-info { --lg-b-lg: 6px; }
+.header-name { --lg-b-lg: 6px; }
+.code-copy { --lg-b: 6px; }
+.dock-tab { --lg-b: 6px; }
+
+:is(.glass-input, .device-item, .paired-row, .root-row, .win-btn, .toast,
+    .status-cell, .hist-group, .about-dev, .mini-btn,
+    .app-codebar, .dock-panel-title, .dock-kv, .dock-visibility, .dock-visibility-info,
+    .header-name)::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--lg-tint);
+}
+
+/* 中/高画质：行级控件背景交给玻璃层（覆盖 style.css 自身 chip-bg） */
+html.quality-medium :is(.glass-input, .device-item, .paired-row, .root-row, .win-btn, .toast,
+    .status-cell, .hist-group, .about-dev, .mini-btn,
+    .app-codebar, .dock-panel-title, .dock-kv, .dock-visibility, .dock-visibility-info,
+    .header-name),
+html.quality-high :is(.glass-input, .device-item, .paired-row, .root-row, .win-btn, .toast,
+    .status-cell, .hist-group, .about-dev, .mini-btn,
+    .app-codebar, .dock-panel-title, .dock-kv, .dock-visibility, .dock-visibility-info,
+    .header-name) {
+  background: transparent;
+}
+
+/* 高画质：输入框圆角描边保持可读 */
+html.quality-high .glass-input::after {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.25);
+}
+
+/* 低画质：行级控件玻璃层隐藏，恢复自身实色背景 */
+html.quality-low :is(.glass-input, .device-item, .paired-row, .root-row, .win-btn, .toast,
+    .status-cell, .hist-group, .about-dev, .mini-btn,
+    .app-codebar, .dock-panel-title, .dock-kv, .dock-visibility, .dock-visibility-info,
+    .header-name)::before,
+html.quality-low :is(.glass-input, .device-item, .paired-row, .root-row, .win-btn, .toast,
+    .status-cell, .hist-group, .about-dev, .mini-btn,
+    .app-codebar, .dock-panel-title, .dock-kv, .dock-visibility, .dock-visibility-info,
+    .header-name)::after {
+  display: none;
+}
+
+/* ③ tint + shine 层 ::after（标准控件） */
+:is(.glass-btn, .glass-chip, .gswitch, .gseg,
+    .dock-bubble, .dock-panel, .incoming-card, .gmodal,
+    .code-copy, .dock-tab,
+    .codebox, .ipbox)::after {
   content: "";
   position: absolute;
   z-index: -1;
@@ -159,14 +301,8 @@ html.quality-low .liquidGlass-blur {
   transition: background 0.3s ease;
 }
 
-html.dark .glass-btn::after,
-html.dark .glass-chip::after,
-html.dark .dock-bubble::after,
-html.dark .dock-panel::after,
-html.dark .incoming-card::after,
-html.dark .gmodal::after,
-html.dark .gswitch::after,
-html.dark .gseg::after {
+html.dark :is(.glass-btn, .glass-chip, .gswitch, .gseg,
+    .dock-bubble, .dock-panel, .incoming-card, .gmodal)::after {
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16), inset 0 2px 10px rgba(255, 255, 255, 0.08);
 }
 
@@ -226,7 +362,7 @@ html.dark .gseg::after {
 }
 
 .glass-btn.primary {
-  color: #fff;
+  color: var(--btn-primary-color, #fff);
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
 }
 
@@ -239,12 +375,12 @@ html.dark .glass-btn.primary::after {
 }
 
 .glass-btn.danger {
-  color: #d93b2b;
+  color: var(--btn-danger-color, #d93b2b);
   text-shadow: none;
 }
 
 html.dark .glass-btn.danger {
-  color: #ff6961;
+  color: var(--btn-danger-color, #ff6961);
 }
 
 .execute-btn.ready::after {
@@ -434,10 +570,35 @@ html.dark .gseg-glider {
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
   transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  position: relative;
 }
 
 html.dark .codebox {
-  background: rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+html.dark .codebox::after {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--lg-tint);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16), inset 0 2px 10px rgba(255, 255, 255, 0.08);
+  pointer-events: none;
+}
+
+html.dark .ipbox::after {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--lg-tint);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16), inset 0 2px 10px rgba(255, 255, 255, 0.08);
+  pointer-events: none;
 }
 
 .codebox:focus {
@@ -469,10 +630,13 @@ html.dark .codebox {
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
   transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  position: relative;
 }
 
 html.dark .ipbox {
-  background: rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
 }
 
 .ipbox:focus {
@@ -560,6 +724,7 @@ html.dark .ipbox {
   bottom: calc(var(--dock-inset) + env(safe-area-inset-bottom, 0px));
   margin: 0 auto;
   width: min(var(--dock-max), calc(100% - var(--dock-inset) * 2));
+  max-width: 100%; /* P2-RS2：超窄屏/自定义 --dock-max 过大时兜底防溢出 */
   z-index: 120;
   transition: width 0.45s var(--ease-glass);
 }
@@ -745,6 +910,7 @@ html.dark .dock-tab-glider {
 
 /* 气泡二：状态 / 展开触发 */
 .dock-status {
+  align-self: stretch; /* 强制与导航气泡等高（flex 子项为 button 时需显式撑高） */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -756,12 +922,50 @@ html.dark .dock-tab-glider {
   touch-action: manipulation;
   color: var(--text-primary, #1d1d1f);
   max-width: 46%;
+  position: relative; /* 承载长按发光层与右1/4热区 */
+  overflow: hidden;
   transition:
     transform 0.45s var(--ease-bounce),
     box-shadow 0.35s var(--ease-glass),
     padding 0.45s var(--ease-glass),
     gap 0.45s var(--ease-glass),
     border-radius 0.45s var(--ease-glass);
+}
+
+/* 状态按钮长按 1.7s：白光从左到右填满（复用参考页扫光思路，不改液态玻璃） */
+.dock-status .hold-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-radius: 0; /* 推进前沿为直线分割，非圆角弧线（外角由按钮圆角裁剪） */
+  background: linear-gradient(to right, rgba(255, 255, 255, 0.3), rgba(255, 255, 255, 0.85));
+  box-shadow: 0 0 18px rgba(255, 255, 255, 0.5);
+  pointer-events: none;
+  opacity: 0;
+  z-index: 0;
+}
+.dock-status.hold .hold-fill {
+  opacity: 1;
+  animation: hold-fill 1.7s cubic-bezier(0.16, 1, 0.3, 1) forwards; /* 非线性缓动 */
+}
+/* 双向模式：右 1/4 热区（点击展开面板，与左 3/4 同步动作分离）；竖线隐藏，仅保留可点区域 */
+.dock-status .status-panel-zone {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 25%;
+  cursor: pointer;
+}
+@keyframes hold-fill {
+  from {
+    width: 0;
+  }
+  to {
+    width: 100%;
+  }
 }
 
 .dock-status-text {
@@ -951,6 +1155,18 @@ html.dark .dock-tab-glider {
   transition: none !important;
 }
 
+/* 删除烟雾字符粒子：fixed 层定位，逐字符独立向右上扩散（由 smokeDissolve/spawnSmokeChars 生成并驱动） */
+.smoke-char {
+  position: fixed;
+  left: 0;
+  top: 0;
+  transform-origin: 50% 50%;
+  pointer-events: none;
+  z-index: 3000;
+  line-height: 1;
+  will-change: transform, opacity, filter;
+}
+
 /* ---------- 下拉从上向下展开 ---------- */
 .drop-down-enter-active {
   transition: opacity 0.25s ease, transform 0.3s var(--ease-glass);
@@ -970,15 +1186,15 @@ html.dark .dock-tab-glider {
   transform: translateY(-6px);
 }
 
-/* ---------- 记录删除：灰烟消散（文字先隐，整框化作灰烟随风飘散） ---------- */
-.smoke-puff {
-  position: fixed;
-  border-radius: 50%;
-  pointer-events: none;
-  /* 理论顶层：不设 filter（独立合成层会被 Chromium 的 backdrop-filter 背景捕获吞进下方玻璃），
-     柔和度直接烘进渐变，保证永远在玻璃之上 */
-  z-index: 2147483000;
-  background: radial-gradient(circle, rgba(158, 164, 174, 0.5), rgba(158, 164, 174, 0.28) 45%, rgba(158, 164, 174, 0) 68%);
+/* ---------- 浏览器表面：文本选区 / 光标纳入材质体系（craft-floor） ---------- */
+::selection {
+  background: var(--accent-soft);
+  color: inherit;
+}
+
+input,
+textarea {
+  caret-color: var(--accent);
 }
 
 /* ============================================================
@@ -1078,6 +1294,8 @@ html.quality-low .incoming-card::before,
 html.quality-low .gmodal::before,
 html.quality-low .gswitch::before,
 html.quality-low .gseg::before,
+html.quality-low .code-copy::before,
+html.quality-low .dock-tab::before,
 html.quality-low .glass__warp {
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
@@ -1092,7 +1310,9 @@ html.quality-low .dock-panel::after,
 html.quality-low .incoming-card::after,
 html.quality-low .gmodal::after,
 html.quality-low .gswitch::after,
-html.quality-low .gseg::after {
+html.quality-low .gseg::after,
+html.quality-low .code-copy::after,
+html.quality-low .dock-tab::after {
   background: rgba(255, 255, 255, 0.2) !important;
   box-shadow: none !important;
 }
@@ -1131,7 +1351,8 @@ html.dark.quality-low .incoming-card::after,
 html.dark.quality-low .gmodal::after,
 html.dark.quality-low .gswitch::after,
 html.dark.quality-low .gseg::after {
-  background: rgba(28, 30, 38, 0.2) !important;
+  /* 低画质深色视觉优化（已确认）：更不透明（0.2→0.35），压住背景保可读 */
+  background: rgba(28, 30, 38, 0.35) !important;
 }
 
 /* 中档：保留半透明+blur+（已降采样的）折射，仅去除行级重复模糊（见下） */
@@ -1148,6 +1369,56 @@ html.quality-low .dd-panel {
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+
+/* ============================================================
+   嵌套玻璃层优化 — 子层摘除 blur + 光学补偿
+   ============================================================
+   原理：父层 ::before 已对页面内容执行 blur，
+   子层 ::before 再 blur 只是对"已模糊结果"二次模糊，
+   GPU 开销翻倍但视觉增益 < 3%。
+   摘除子层 blur，用 border + inset highlight 补偿深度。
+   */
+
+/* ── 1. 精确摘除嵌套子层的 backdrop-filter ── */
+
+.dock-bubble  .dock-tab::before,
+.dock-bubble  .code-copy::before,
+.titlebar     .code-copy::before,
+.app-codebar  .mini-btn::before,
+.app-codebar  .code-copy::before,
+.app-codebar  .header-name::before,
+.dock-panel   .dock-kv::before,
+.dock-panel   .dock-visibility::before {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* ── 2. 光学补偿：让子层"浮起来" ── */
+/* 原来靠 blur 差异产生的深度感，改用边缘光学模拟 */
+/* dock-panel 子元素为内容容器，需要边框+高光制造厚度感 */
+.dock-bubble  .dock-tab,
+.dock-bubble  .code-copy,
+.titlebar     .code-copy,
+.app-codebar  .mini-btn,
+.app-codebar  .code-copy {
+  box-shadow:
+    inset 0  1px 0 var(--glass-nest-highlight, rgba(255, 255, 255, 0.14)),
+    inset 0 -1px 0 var(--glass-nest-shadow,    rgba(0,   0,   0,   0.06));
+  border-color: var(--glass-nest-border, rgba(255, 255, 255, 0.18));
+}
+
+.dock-panel   .dock-kv,
+.dock-panel   .dock-visibility {
+  box-shadow:
+    inset 0  1px 0 var(--glass-nest-highlight, rgba(255, 255, 255, 0.10)),
+    inset 0 -1px 0 var(--glass-nest-shadow,    rgba(0,   0,   0,   0.08));
+  border-color: var(--glass-nest-border, rgba(255, 255, 255, 0.12));
+}
+
+/* header-name 无独立容器样式（纯文字），仅摘除 blur 即可 */
+.app-codebar  .header-name {
+  /* 无需 box-shadow/border — 文字不需要厚度模拟 */
 }
 
 /* ============================================================
@@ -1179,46 +1450,9 @@ html.quality-low .dd-panel {
 }
 
 /* ============================================================
-   十二、标题栏 / 目标设备下拉面板（同一玻璃配方，含质量档与降级）
+   十二、下拉面板（标题栏玻璃配方统一由「二、控件配方」覆盖，
+   此处仅保留下拉专属布局与低画质降级）
    ============================================================ */
-.titlebar,
-.dd-panel {
-  position: relative;
-  isolation: isolate;
-  overflow: hidden;
-  background: transparent;
-  box-shadow: var(--lg-ctl-shadow);
-}
-
-.titlebar::before,
-.dd-panel::before {
-  content: "";
-  position: absolute;
-  z-index: -1;
-  inset: 0;
-  border-radius: inherit;
-  backdrop-filter: blur(2px);
-  -webkit-backdrop-filter: blur(2px);
-  filter: url(#glass-distortion);
-}
-
-.titlebar::after,
-.dd-panel::after {
-  content: "";
-  position: absolute;
-  z-index: -1;
-  inset: 0;
-  border-radius: inherit;
-  background: var(--lg-tint);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.4), inset 0 2px 10px rgba(255, 255, 255, 0.16);
-  transition: background 0.3s ease;
-}
-
-html.dark .titlebar::after,
-html.dark .dd-panel::after {
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16), inset 0 2px 10px rgba(255, 255, 255, 0.08);
-}
-
 /* 下拉面板内滚动区（外层管玻璃裁切，内层管滚动） */
 .dd-list {
   max-height: 236px;
@@ -1226,7 +1460,7 @@ html.dark .dd-panel::after {
   overflow-x: hidden;
 }
 
-/* 质量档 / 降级与既有配方一致 */
+/* 低画质：标题栏/下拉面板降级（关闭模糊与折射，恢复实色） */
 html.quality-low .titlebar::before,
 html.quality-low .dd-panel::before {
   backdrop-filter: none !important;
@@ -1280,33 +1514,70 @@ html.quality-low .dd-panel {
   }
 }
 
-/* ---------- 透明度减弱偏好：玻璃降级为实底 ----------
-   tint 直接换成 --lg-solid（亮暗各自定义），折射/模糊层全关，
-   卡片画布采样隐藏 —— 与 quality-low 档同一策略，仅由系统偏好触发 */
-@media (prefers-reduced-transparency: reduce) {
-  :root,
-  html.dark {
-    --lg-tint: var(--lg-solid);
-    --lg-tint-strong: var(--lg-solid);
-  }
+/* ---------- 透明度减弱偏好（已按产品需求移除实色降级） ----------
+   系统开启「减少透明度」(prefers-reduced-transparency) 时，旧实现会把
+   --lg-tint 覆盖为 --lg-solid 实色，导致所有玻璃控件变成不透明黑/白块。
+   本产品明确要求始终呈现液态玻璃效果，故移除该降级，玻璃半透明始终保留。 */
 
-  .liquidGlass-blur {
-    display: none !important;
-  }
+/* ============================================================
+   十三、UI 细节调整（产品反馈）
+   ============================================================ */
 
-  .glass-btn::before,
-  .glass-chip::before,
-  .dock-bubble::before,
-  .dock-panel::before,
-  .incoming-card::before,
-  .gmodal::before,
-  .gswitch::before,
-  .gseg::before,
-  .titlebar::before,
-  .dd-panel::before {
-    display: none !important;
-    backdrop-filter: none !important;
-    -webkit-backdrop-filter: none !important;
-    filter: none !important;
-  }
+/* ① Dock 页签去玻璃框：仅保留文字 + glider 激活滑动指示（4 个页签同规则） */
+.dock-tab::before,
+.dock-tab::after {
+  display: none !important;
+}
+.dock-tab {
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+/* ② 顶部连接码栏去玻璃框：纯文字内容区（内部 code-copy/mini-btn 仍保留玻璃） */
+.app-codebar::before,
+.app-codebar::after {
+  display: none !important;
+}
+.app-codebar {
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+/* ③ 行内分段选择器伸展（避免「加密强度 / 画面质量」等过窄） */
+.row > .gseg {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ④ Dock 状态气泡收缩为正圆：stretch 撑到与导航气泡等高（高度动态跟随），宽度取设计直径匹配导航高（正圆，上下对齐） */
+.dock.is-collapsed .dock-status {
+  width: 60px;
+  height: auto;
+  align-self: stretch;
+  padding: 0;
+}
+
+/* ⑤ Dock 面板标题 / 信息行去黑框：纯文字（标题 h3 / 可见性说明行） */
+.dock-panel-title::before,
+.dock-panel-title::after,
+.dock-visibility-info::before,
+.dock-visibility-info::after {
+  display: none !important;
+}
+.dock-panel-title,
+.dock-visibility-info {
+  background: transparent !important;
+  box-shadow: none !important;
+  border: none !important;
+}
+
+/* ⑥ 连接码按钮无边框：纯文字可点（点击复制提示已单独表达） */
+.code-copy::before,
+.code-copy::after {
+  display: none !important;
+}
+.code-copy {
+  background: transparent !important;
+  box-shadow: none !important;
+  border: none !important;
 }

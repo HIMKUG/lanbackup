@@ -1,9 +1,10 @@
 import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
+import { VueMcp } from 'vite-plugin-vue-mcp';
 import { fileURLToPath, URL } from 'node:url';
 
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [vue(), VueMcp()],
   resolve: {
     alias: {
       'shared-core': fileURLToPath(new URL('../shared-core/src/index.ts', import.meta.url)),

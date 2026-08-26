@@ -17,8 +17,8 @@
     "@capacitor/network": "^6.0.0",
     "gsap": "^3.15.0",
     "local-receiver": "file:./local-receiver",
-    "shared-core": "file:../shared-core",
-    "shared-ui": "file:../shared-ui",
+    "shared-core": "workspace:*",
+    "shared-ui": "workspace:*",
     "vue": "^3.4.0"
   },
   "devDependencies": {
@@ -26,6 +26,7 @@
     "@vitejs/plugin-vue": "^5.0.0",
     "typescript": "^5.5.0",
     "vite": "^5.0.0",
+    "vite-plugin-vue-mcp": "^0.3.2",
     "vue-tsc": "^2.0.0"
   }
 }

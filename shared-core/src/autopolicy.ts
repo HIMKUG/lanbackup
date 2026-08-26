@@ -71,7 +71,11 @@ export function isSameWifi(selfIp: string, peerIp: string, prefixLen = 24): bool
   // 按 prefixLen 比较前若干段（每段 8 位）
   const segments = Math.ceil(prefixLen / 8);
   for (let i = 0; i < segments; i++) {
-    if (selfParts[i] !== peerParts[i]) return false;
+    // P2-PF8：显式 parseInt 后比较，避免非法/带前导零的段被隐式类型转换误判。
+    // parseInt 对 "08"→8 正确，对非数字→NaN，NaN 与任何数不等→安全返 false。
+    const a = parseInt(selfParts[i], 10);
+    const b = parseInt(peerParts[i], 10);
+    if (a !== b) return false;
   }
   return true;
 }

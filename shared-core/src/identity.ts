@@ -4,11 +4,28 @@
  * 每台设备首次启动，基于系统稳定特征码计算一个永久 8 位连接码。
  * 连接码由不分大小写的字母和数字组成（去掉易混淆字符），共 31^8 种可能。
  * 连接码是哈希后的展示码，不暴露原始特征码。
+ *
+ * 协议版本常量（与 Rust/Java 端一致）：
+ * - PROTOCOL_VERSION: 当前协议版本
+ * - MIN_PROTOCOL_VERSION: 最低兼容版本
+ * - KDF_VERSION: KDF 版本（1=SHA-256, 2=PBKDF2）
+ * - CRYPTO_VERSION: 加密版本（1=连接码直接派生, 2=ECDH）
  */
 
 // 去掉易混淆字符（0/O、1/I/L 等），保证可读性
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const CODE_LENGTH = 8;
+
+/** 当前协议版本 */
+export const PROTOCOL_VERSION = '1.1';
+/** 最低兼容协议版本 */
+export const MIN_PROTOCOL_VERSION = '1.0';
+/** KDF 版本：1=SHA-256（原始），2=PBKDF2（加固） */
+export const KDF_VERSION = 2;
+/** 加密版本：1=连接码直接派生，2=ECDH 密钥交换 */
+export const CRYPTO_VERSION = 2;
+/** PBKDF2 迭代次数（OWASP 2023 建议下限，2026 年适用） */
+export const PBKDF2_ITERATIONS = 600000;
 
 import { logger, maskSecret } from './logger.js';
 
@@ -24,17 +41,16 @@ import { logger, maskSecret } from './logger.js';
  * @returns 8 位连接码（大写字母+数字）
  */
 export function generateConnectionCode(stableId: string): string {
-  if (!stableId) {
-    throw new Error('stableId cannot be empty');
-  }
+  // P3-315：与 Rust 端对齐——空 stableId 走确定性兜底而非抛异常，避免设备标识损坏时前端崩溃
+  const stable = stableId && stableId.length > 0 ? stableId : 'unknown-device';
   // 记录输入特征（脱敏：不落盘完整特征码）
   logger.debug(
     'identity',
-    `generateConnectionCode 输入特征: 长度=${stableId.length} 前缀=${maskSecret(stableId)}`,
+    `generateConnectionCode 输入特征: 长度=${stable.length} 前缀=${maskSecret(stable)}`,
   );
   // FNV-1a 32-bit 哈希，迭代多次以充分扩散
   let hash = 0x811c9dc5;
-  const input = stableId + '|localsend-backup|v1';
+  const input = stable + '|localsend-backup|v1';
   // 按 UTF-8 字节遍历，与 Rust 端 input.bytes() 一致
   const bytes = new TextEncoder().encode(input);
   for (let i = 0; i < bytes.length; i++) {

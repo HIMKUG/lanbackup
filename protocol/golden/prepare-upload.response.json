@@ -1,0 +1,16 @@
+{
+  "sessionId": "b4a7c3f2-6d1e-4a8b-9c0d-2e5f7a1b3c4d",
+  "files": {
+    "f0": "tok_f0_8f2a",
+    "f1": "tok_f1_c91b"
+  },
+  "chunkDiff": {
+    "f1": {
+      "fileComplete": false,
+      "missingChunks": [1, 2, 5],
+      "matchedChunks": [0],
+      "mismatchedChunks": [3, 4]
+    }
+  },
+  "ecdhPubKey": "BPaWj6X3lQm8Tz2RbKd9VnY4sUe7GaH5cF0bN1iMwO2xPqR8tSvA3uBzC4dEf5GhI6JkL7mN8oP9qR0sT1uV2wX"
+}

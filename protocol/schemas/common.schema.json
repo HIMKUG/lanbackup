@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://localsend-v3/schemas/common.schema.json",
+  "title": "LocalSend v3 公共定义",
+  "description": "错误信封、能力协商、设备信息等跨端点复用的公共结构",
+  "$defs": {
+    "error": {
+      "type": "object",
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "required": ["code", "message"],
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "INVALID_REQUEST",
+                "INVALID_CODE",
+                "HMAC_MISMATCH",
+                "UNTRUSTED",
+                "RATE_LIMIT_EXCEEDED",
+                "NOT_FOUND",
+                "VERSION_UNSUPPORTED",
+                "UNKNOWN_DEVICE",
+                "TOKEN_EXPIRED"
+              ]
+            },
+            "message": { "type": "string" },
+            "requestId": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "capabilities": {
+      "type": "object",
+      "required": ["maxChunkSize", "supportedEncryption", "supportsResume"],
+      "properties": {
+        "maxChunkSize": { "type": "integer", "minimum": 1 },
+        "supportedEncryption": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["aes-256-gcm"] },
+          "minItems": 1
+        },
+        "supportsResume": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "deviceInfo": {
+      "type": "object",
+      "required": ["deviceId", "alias", "deviceType", "port", "protocolVersion"],
+      "properties": {
+        "deviceId": { "type": "string", "format": "uuid" },
+        "alias": { "type": "string", "minLength": 1 },
+        "deviceType": { "type": "string", "enum": ["desktop", "mobile"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "protocolVersion": { "type": "string", "const": "3.0" },
+        "capabilities": { "$ref": "#/$defs/capabilities" }
+      },
+      "additionalProperties": false
+    },
+    "ecdhPubKey": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{80,}$",
+      "description": "P-256 ECDH 公钥，SEC1 未压缩编码（0x04 前缀 + 64B）base64url；双端字节表示必须一致（P-256 交叉协商测试约束）"
+    },
+    "nonceHex": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$",
+      "description": "32 字节随机 nonce 的 hex 编码"
+    },
+    "jwt": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$",
+      "description": "JWT: header.payload.signature（HS256，key=pairing_secret）"
+    },
+    "requestIdHeader": { "type": "string", "format": "uuid" }
+  }
+}

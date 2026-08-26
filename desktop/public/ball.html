@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Floating Ball</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%;
+      background: transparent !important;
+      overflow: visible;               /* 不额外裁剪，窗口本身已 200×200 */
+      user-select: none;
+      cursor: grab;
+    }
+    /* 全窗口容器：只负责铺满 200×200 并把球体居中，本身不接收事件 */
+    #ball-root {
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      display: flex; align-items: center; justify-content: center;
+      background: transparent;
+      pointer-events: none;
+    }
+    /* 球体本体：80×80，所有交互（拖拽/点击/长按）与动效都集中在它身上 */
+    #ball-body {
+      position: relative;
+      width: 80px; height: 80px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      background: transparent;
+      cursor: grab;
+      touch-action: none;
+      transition: box-shadow 0.3s;
+      pointer-events: auto;
+    }
+    #ball-body:active { cursor: grabbing; }
+    #ball-body:hover { box-shadow: 0 0 20px rgba(138,99,244,0.4); }
+    #bot { width: 72px; height: 72px; display: flex; align-items: center; justify-content: center; }
+    /* 头顶思考气泡：由 GSAP 控制 transform（xPercent:-50 居中 + y/scale/opacity 动画），
+       所以这里不写 transform，避免与 GSAP 冲突 */
+    .thought-bubble {
+      position: absolute;
+      left: 50%;
+      bottom: calc(100% + 6px);   /* 球顶上方 6px */
+      display: none;
+      max-width: 160px;
+      padding: 6px 11px;
+      background: rgba(255, 255, 255, 0.94);
+      color: #3a3a3a;
+      font-size: 12px;
+      line-height: 1.4;
+      border-radius: 11px;
+      box-shadow: 0 3px 10px rgba(0, 0, 0, 0.16);
+      white-space: nowrap;
+      z-index: 10;
+      pointer-events: none;
+      user-select: none;
+    }
+    .thought-bubble::after {
+      content: '';
+      position: absolute;
+      left: 50%;
+      bottom: -5px;
+      width: 10px; height: 10px;
+      background: inherit;
+      transform: translateX(-50%) rotate(45deg);
+      border-radius: 2px;
+    }
+    /* 雷达扫描特效：仅「开始发现 → 停止发现」期间（discovering 状态）显示，由 ball:state 控制 */
+    #ball-body.scan-radar::after {
+      content: '';
+      position: absolute; inset: -4px;
+      border-radius: 50%;
+      background: conic-gradient(transparent 80%, rgba(138,99,244,0.6) 100%);
+      animation: spin 1s linear infinite;
+      pointer-events: none;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <!-- 窗口放大到 200×200，球体 #ball-body 居中，四周透明区给大范围动效留扩散空间。
+       透明区域由 Rust 光标线程动态穿透，不挡桌面点击。 -->
+  <div id="ball-root">
+    <div id="ball-body">
+      <!-- 头顶思考气泡：相对球体定位，状态/投喂时用 GSAP 从球顶冒出来 -->
+      <div id="thought-bubble" class="thought-bubble"></div>
+      <div id="bot"></div>
+    </div>
+  </div>
+
+  <!-- 非 Tauri 预览降级层：纯浏览器打开时 mock 掉 Tauri 全局桥，暴露 BALL_DEBUG 调试入口。
+       仅用于「不构建程序」测试行为机；Tauri 正式运行时 window.__TAURI_INTERNALS__ 存在，本块跳过。 -->
+  <script>
+  if (window.__TAURI_INTERNALS__ === undefined) {
+    (function () {
+      var __handlers = {};
+      window.listen = function (evt, cb) {
+        (__handlers[evt] = __handlers[evt] || []).push(cb);
+        return function () {};
+      };
+      window.emit = function (evt, payload) {
+        if (window.__BALL_DEBUG_VERBOSE__) console.log('[ball:emit]', evt, payload);
+        return true;
+      };
+      /* 浏览器控制台调试入口：BALL_DEBUG.state('syncing') / emotion('10') / visible(false) / enabled(false) */
+      window.BALL_DEBUG = {
+        state:   function (k)   { fire('ball:state',   { payload: { stateId: k } }); },
+        emotion: function (id, tips) { fire('ball:emotion', { payload: { emotionId: id, tips: tips || '' } }); },
+        visible: function (v)   { fire('ball:visible', { payload: v }); },
+        enabled: function (v)   { fire('ball:enabled', { payload: v }); },
+        cursor:  function (nx, ny) { fire('ball:cursor', { payload: { nx: nx, ny: ny } }); }
+      };
+      function fire(evt, obj) {
+        var hs = __handlers[evt] || [];
+        hs.forEach(function (cb) { try { cb(obj); } catch (e) { console.error('[ball:debug]', evt, e); } });
+      }
+    })();
+  }
+  </script>
+
+  <script>
+  /* 统一 Tauri 桥：正式环境用 withGlobalTauri 注入的 window.__TAURI__（事件/窗口 API），
+     纯浏览器预览回退到上面 mock 的 window.listen/emit。 */
+  var ballTAURI = (function () {
+    var ev = window.__TAURI__ && window.__TAURI__.event;
+    var win = window.__TAURI__ && window.__TAURI__.window;
+    return {
+      isTauri: !!(window.__TAURI_INTERNALS__ || ev),
+      listen: function (evt, cb) {
+        if (ev) return ev.listen(evt, function (e) { cb({ payload: e.payload }); });
+        if (window.listen) return window.listen(evt, cb);
+        return function () {};
+      },
+      emit: function (evt, payload) {
+        if (ev) return ev.emit(evt, payload);
+        if (window.emit) return window.emit(evt, payload);
+      },
+      getWindow: function () { return win && win.getCurrentWindow(); }
+    };
+  })();
+  </script>
+
+  <script src="/emotion-ball/rings.js"></script>
+  <script src="/emotion-ball/emotions.js"></script>
+  <script src="/emotion-ball/ball.js"></script>
+  <script src="/emotion-ball/engine.js"></script>
+  <script src="/emotion-ball/i18n.js"></script>
+  <script src="/ball-scripts.js"></script>
+  <script src="/vendor/gsap.min.js"></script>
+
+  <script>
+  (function () {
+    'use strict';
+
+    var ball = null;
+    var root = document.getElementById('ball-root');
+    var ballBody = document.getElementById('ball-body');
+    var bot  = document.getElementById('bot');
+    var lang = navigator.language.startsWith('zh') ? 'zh' : 'en';
+
+    // ---- 思考气泡文案：状态 → 它在想什么（随机挑一句） ----
+    var THOUGHTS = {
+      boot:       ['唔……我醒过来了', '哈啊～开始营业', '新的一天，冲！'],
+      loading:    ['启动中，别急……'],
+      ready:      ['我准备好了！', '随时可以开工哦'],
+      discovering:['在找设备……', '咦，附近好像有东西', '扫描中，稍等一下'],
+      found:      ['咦？发现新朋友！', '那边有个设备！'],
+      pairing:    ['密码是什么来着……', '正在核对身份'],
+      solving:    ['让我想想……', '在算差异中'],
+      scanning:   ['准备同步咯', '看看有什么要传'],
+      syncing:    ['努力搬运中……', '文件有点多，加油！'],
+      receiving:  ['收到啦收到啦', '正在接收文件'],
+      success:    ['搞定！太棒了！', '耶～全部完成！'],
+      failure:    ['呜……出错了', '怎么会失败，好难过'],
+      idle:       ['发呆中……', '今天要做什么呢', '好无聊呀'],
+      lonely:     ['没人陪我……', '好孤单哦'],
+      idleWake:   ['嗯？有人来了？'],
+    };
+    var FEED_THOUGHTS = ['哇！谢谢投喂！', '最爱你了！', '收到礼物，开心！', '这个文件夹交给我吧！'];
+
+    // ---- Boot: create ball, then start boot behaviour ----
+    function initBall(emotionId, autostart) {
+      ball = window.EmotionBall.create(bot, {
+        emotion: emotionId || '02',
+        idle: true,
+        shape: 'blob',
+      });
+
+      // State: visible / enabled / behaviour engine
+      var enabled = true;
+      var engine = null;
+
+      // ---- 思考气泡：GSAP 从球顶冒出来（back.out 弹跳 → 停留 → power2.in 缩回） ----
+      var thought = document.getElementById('thought-bubble');
+      var thoughtTl = null;
+      function showThought(text, holdMs) {
+        if (!window.gsap || !thought || !enabled) return;
+        holdMs = holdMs || 2200;
+        if (thoughtTl) thoughtTl.kill();
+        thought.textContent = text;
+        thought.style.display = 'block';
+        thoughtTl = window.gsap.timeline();
+        thoughtTl
+          .fromTo(
+            thought,
+            { xPercent: -50, y: 10, scale: 0.4, opacity: 0, transformOrigin: '50% 100%' },
+            { xPercent: -50, y: 0, scale: 1, opacity: 1, duration: 0.45, ease: 'back.out(2)' },
+          )
+          .to(thought, { y: -8, scale: 0.7, opacity: 0, duration: 0.4, ease: 'power2.in', delay: holdMs / 1000 });
+        thoughtTl.eventCallback('onComplete', function () {
+          thought.style.display = 'none';
+          thought.textContent = '';
+        });
+      }
+      function pickThought(list) {
+        if (!list || !list.length) return null;
+        return list[(Math.random() * list.length) | 0];
+      }
+
+      // ---- Rust → ball: state (行为机：按状态脚本演出) ----
+      ballTAURI.listen('ball:state', function (ev) {
+        if (!ball || !enabled) return;
+        var payload = ev.payload;
+        if (typeof payload === 'string') { try { payload = JSON.parse(payload); } catch { return; } }
+        var stateKey = payload && (payload.stateId || payload.state);
+        // 雷达扫描特效：仅在「开始发现 → 停止发现」（discovering）期间显示，其余状态关闭
+        if (stateKey === 'discovering') ballBody.classList.add('scan-radar');
+        else ballBody.classList.remove('scan-radar');
+        if (!stateKey || !window.BallScript) return;
+        if (!engine) engine = window.BallScript.create(function (id) {
+          ball.handleAIMessage(JSON.stringify({ emotionId: id, tips: '' }));
+        });
+        engine.start(stateKey);
+      });
+
+      // ---- Rust → ball: emotion update（单表情直推，保留兼容） ----
+      ballTAURI.listen('ball:emotion', function (ev) {
+        if (!ball || !enabled) return;
+        var payload = ev.payload;
+        if (typeof payload === 'string') {
+          try { payload = JSON.parse(payload); } catch { return; }
+        }
+        if (payload.emotionId) {
+          // 有行为机时先停掉正在演出的脚本，再播放单脸
+          if (engine) engine.halt();
+          ball.handleAIMessage(JSON.stringify(payload));
+        }
+      });
+
+      // ---- Rust → ball: visibility ----
+      ballTAURI.listen('ball:visible', function (ev) {
+        var v = ev.payload;
+        root.style.display = (v === false || v === 'false') ? 'none' : 'flex';
+      });
+
+      // ---- Rust → ball: enabled toggle ----
+      // 关闭=真正停止运行：隐藏窗口 + 停掉 rAF 动画循环（后台不再空转耗 CPU）；
+      // 开启=显示 + 恢复动画
+      ballTAURI.listen('ball:enabled', function (ev) {
+        enabled = ev.payload !== false && ev.payload !== 'false';
+        if (!enabled) {
+          root.style.display = 'none';
+          if (ball && ball.setActive) ball.setActive(false);
+        } else {
+          root.style.display = 'flex';
+          if (ball && ball.setActive) ball.setActive(true);
+        }
+      });
+
+      // ---- 拖文件夹到悬浮球：悬停惊喜预览，drop 后转发 Rust 执行「单文件夹同步」 ----
+      var dropWin = ballTAURI.getWindow();
+      var dropHovered = false;
+      if (dropWin && typeof dropWin.onDragDropEvent === 'function') {
+        dropWin.onDragDropEvent(function (e) {
+          var p = e.payload || {};
+          if (!ball || !enabled) return;
+          if (p.type === 'over') {
+            if (!dropHovered) { dropHovered = true; ball.setEmotion('13'); } /* 惊讶：有人要丢东西过来 */
+          } else if (p.type === 'leave') {
+            dropHovered = false;
+          } else if (p.type === 'drop') {
+            dropHovered = false;
+            var paths = p.paths || [];
+            if (paths.length) {
+              ball.setEmotion('10'); /* 非常开心：接住文件夹了 */
+              showThought(pickThought(FEED_THOUGHTS) || '谢谢投喂！');
+              ballTAURI.emit('ball:action', { type: 'drop-folder', path: paths[0] });
+            }
+          }
+        });
+      }
+
+      // ---- ball → Rust: action events ----
+      function emitAction(type, extra) {
+        ballTAURI.emit('ball:action', Object.assign({ type: type }, extra || {}));
+      }
+
+      // ---- Rust → ball: cursor（全局鼠标跟随，Rust 每 33ms 轮询系统光标后推送）----
+      // 前端只负责把归一化偏移喂给 engine.setGaze。这样无论鼠标悬在哪、是否在球窗口内，
+      // 球都会看向它 —— 球是独立小窗口，纯前端收不到窗口外的鼠标事件。
+      ballTAURI.listen('ball:cursor', function (ev) {
+        if (!ball || !enabled) return;
+        var p = ev.payload;
+        if (typeof p === 'string') { try { p = JSON.parse(p); } catch { return; } }
+        if (p && typeof p.nx === 'number' && typeof p.ny === 'number') {
+          ball.setGaze(p.nx, p.ny);
+        }
+      });
+      // 非 Tauri 预览降级：纯浏览器打开时手动跟随光标（正式环境由 Rust 全局光标驱动）
+      if (window.__TAURI_INTERNALS__ === undefined) {
+        window.addEventListener('pointermove', function (e) {
+          if (!ball || !enabled) return;
+          var r = ballBody.getBoundingClientRect();
+          var nx = ((e.clientX - (r.left + r.width  / 2)) / (r.width  / 2));
+          var ny = ((e.clientY - (r.top  + r.height / 2)) / (r.height / 2));
+          ball.setGaze(nx, ny);
+        });
+      }
+
+      // Click: 单击换表情（快速点击未进入拖拽时才会触发 click）
+      ballBody.addEventListener('click', function () {
+        if (!enabled || !ball) return;
+        // Advance to next emotion in a short list for fun interaction
+        var cycle = ['02','10','15','21','34'];
+        var cur = (ball.emotionId || '02') + ''; // 引擎字段是 emotionId（非 _currentId）
+        var idx = cycle.indexOf(cur);
+        var next = cycle[(idx + 1) % cycle.length];
+        ball.setEmotion(next);
+        emitAction('click', { emotionId: next });
+      });
+
+      // ---- 初始位置 ----
+      // 整窗拖动模式：球窗口的位置由 Rust 在创建时定位到屏幕角落，DOM 内不再偏移。
+      // 仅非 Tauri 预览时用 CSS 初始摆到角落，便于纯浏览器调试。
+      if (!ballTAURI.isTauri) moveToCorner();
+
+      // ---- 行为机：由 autostart 调用方决定是否立即启动 boot 脚本 ----
+      if (autostart) {
+        engine = window.BallScript.create(function (id) {
+          ball.handleAIMessage(JSON.stringify({ emotionId: id, tips: '' }));
+        });
+        engine.start('boot', function () {
+          // boot 脚本演出完毕（最后一步是 02 idle），再移除 shimmer
+          root.classList.remove('loading');
+        });
+      } else {
+        // 非 autostart 模式（纯浏览器调试）：直接移除 loading
+        root.classList.remove('loading');
+      }
+    }
+
+    // ---- 统一交互：单击换表情 / 长按唤主窗 / 拖动 ----
+    // Tauri 正式环境：移动超过阈值后【同步】调用系统级 startDragging（且只调一次），
+    // 让球作为独立透明窗口被全局拖动——不再有“框死/只能在窗口内拖”的问题。
+    // 非 Tauri 预览（纯浏览器）：退化为 DOM 内移动，仅用于调试。
+    var longPressTimer = null;
+    var didDrag = false;
+    var dragStarted = false;
+    var dragging = false, dx = 0, dy = 0, pressX = 0, pressY = 0;
+
+    function clearLongPress() {
+      if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+    }
+
+    function domPointerDown(e) {
+      dragging = true;
+      // 非 Tauri 预览：在浏览器视口里拖动球体（需要绝对定位）
+      ballBody.style.position = 'absolute';
+      dx = e.clientX - ballBody.offsetLeft;
+      dy = e.clientY - ballBody.offsetTop;
+      ballBody.style.transition = 'none';
+      e.preventDefault();
+    }
+
+    ballBody.addEventListener('pointerdown', function (e) {
+      clearLongPress();
+      didDrag = false;
+      if (ballTAURI.isTauri) {
+        // 记录按下起点；是否拖动由 pointermove 位移阈值决定（避免吞掉单击/长按）
+        pressX = e.clientX; pressY = e.clientY;
+        dragStarted = false;
+        // 长按 600ms 且期间未进入拖动 → 唤起主窗口
+        longPressTimer = setTimeout(function () {
+          if (!didDrag) ballTAURI.emit('ball:action', { type: 'open-main' });
+        }, 600);
+        return;
+      }
+      domPointerDown(e);
+    });
+
+    ballBody.addEventListener('pointermove', function (e) {
+      if (ballTAURI.isTauri) {
+        if (dragStarted) return;                       // 已进入系统拖拽，忽略后续 move
+        if (!(e.buttons & 1)) return;                  // 已松开，忽略残留事件
+        var dxm = e.clientX - pressX, dym = e.clientY - pressY;
+        if (dxm * dxm + dym * dym > 36) {              // 位移超过 ~6px 判定为拖动
+          dragStarted = true;
+          didDrag = true;
+          clearLongPress();
+          var win = ballTAURI.getWindow();
+          if (win) { win.startDragging().catch(function () {}); }
+        }
+        return;
+      }
+      if (!dragging) return;
+      var x = e.clientX - dx;
+      var y = e.clientY - dy;
+      x = Math.max(0, Math.min(x, window.innerWidth  - ballBody.offsetWidth));
+      y = Math.max(0, Math.min(y, window.innerHeight - ballBody.offsetHeight));
+      ballBody.style.left = x + 'px';
+      ballBody.style.top  = y + 'px';
+    });
+
+    function endDrag() {
+      dragging = false; dragStarted = false;
+      clearLongPress();
+    }
+    document.addEventListener('pointerup', endDrag);
+    document.addEventListener('pointercancel', endDrag);
+    ballBody.addEventListener('pointerleave', endDrag);
+
+    function moveToCorner() {
+      // 仅非 Tauri 预览：把球体摆到浏览器右下角（绝对定位）
+      ballBody.style.position = 'absolute';
+      var x = window.innerWidth  - ballBody.offsetWidth  - 16;
+      var y = window.innerHeight - ballBody.offsetHeight - 16;
+      ballBody.style.left = x + 'px';
+      ballBody.style.top  = y + 'px';
+    }
+
+    // Fallback: wait for rings.js to set up window.EmotionBall
+    if (window.EmotionBall) {
+      initBall('02', ballTAURI.isTauri);
+    } else {
+      window.addEventListener('DOMContentLoaded', function () {
+        initBall('02', ballTAURI.isTauri);
+      });
+    }
+
+    // Tauri 下：窗口创建时是隐藏的（visible(false)），页面完全就绪后再显示，避免加载前白底闪烁
+    if (ballTAURI.isTauri) {
+      window.addEventListener('load', function () {
+        var win = ballTAURI.getWindow();
+        if (win) win.show();
+      });
+    }
+  })();
+  </script>
+</body>
+</html>

@@ -31,8 +31,6 @@ import {
   onUploadProgress,
   moveToDelete,
   getChunkStatus,
-  greetDevice,
-  pingDevice,
 } from './receiver';
 import { deviceDisplayName } from 'shared-core';
 
@@ -58,6 +56,24 @@ async function withRetry<T>(fn: () => Promise<T>, attempts: number, delayMs: num
     }
   }
   throw lastErr;
+}
+
+/**
+ * Rust percent-encoding 子集（与 Rust percent_encoding 库保留字符一致）。
+ * 修复：Rust pct_encode 保留 A-Za-z0-9-_.~，TS encodeURIComponent 额外保留 !~*'()。
+ * 差异字符 !~'() 会导致 getChunkStatus 查询路径与接收端分片目录名不匹配。
+ */
+function rustPctEncode(path: string): string {
+  const SAFE = new Set('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~');
+  let encoded = '';
+  for (const ch of path) {
+    if (SAFE.has(ch)) {
+      encoded += ch;
+    } else {
+      encoded += '%' + ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0');
+    }
+  }
+  return encoded;
 }
 
 /** 备份进度回调 */
@@ -111,6 +127,7 @@ export async function sendBackup(
   targetIp: string,
   targetPort: number,
   targetCode: string,
+  targetFingerprint: string,
   knownMissingOnPeer: string[],
   onProgress?: (p: BackupProgress) => void,
   onMirrorConfirm?: (count: number) => Promise<boolean>,
@@ -123,24 +140,8 @@ export async function sendBackup(
     } 上次清单=${Object.keys(prevManifest).length} 条`,
   );
 
-  // 0. 唤醒对端接收服务：连接问候（非 probe）触发对端 peer-connected → 自动拉起其接收服务器。
-  // 断网重连/对端重启后，对端 53317 常处于未监听状态（配对服务 53318 常驻所以清单查询仍能成功，
-  // 但 prepare-upload 走 53317 会被拒连——「恢复按钮 Failed to connect」的根因）。
-  // 问候可达时再等接收端口就绪：对端拉起需 1-2s，就绪前查清单会拿到空清单 → 误判全量重传。
-  try {
-    await greetDevice({ ip: targetIp, port: targetPort, deviceId: selfDeviceId, name: selfName });
-    for (let i = 0; i < 8; i++) {
-      try {
-        await pingDevice({ ip: targetIp, port: targetPort });
-        break;
-      } catch {
-        await sleep(500);
-      }
-    }
-  } catch {
-    logger.warn('backup', '唤醒问候失败（对端可能离线），继续尝试传输');
-  }
-
+  // P2 硬升级：v2 问候（greetDevice）/ 探测（pingDevice）已删除，无法再触发对端拉起接收服务。
+  // 对端接收服务就绪由 prepare-upload 的 withRetry 重试兜底（连接类失败自动重试 3 次）。
   // 1. 遍历目录（metadata-only，不读文件内容）
   const walked: PlatformFile[] = await walkDirectory(root.uri);
   // 发送根目录名作为 relPath 第一级：接收端在接收目录下重建「发送文件夹名/...」结构，
@@ -162,7 +163,11 @@ export async function sendBackup(
   }
 
   // 3. 三路对比：A当前 vs A上次 vs B当前
-  const plan = planIncremental(allFiles, prevManifest, peer, strategy, knownMissingOnPeer);
+  // BUG FIX: knownMissingOnPeer 可能被意外序列化为非数组，强制转换避免 Set 构造失败
+  const safeKnownMissing: string[] = Array.isArray(knownMissingOnPeer)
+    ? knownMissingOnPeer
+    : (knownMissingOnPeer != null ? Object.values(knownMissingOnPeer as object) : []);
+  const plan = planIncremental(allFiles, prevManifest, peer, strategy, safeKnownMissing);
   const t2 = performance.now();
   logger.info(
     'backup',
@@ -195,10 +200,12 @@ export async function sendBackup(
   // 多块 GCM 流式格式（与 Java streamUpload / Rust decrypt_stream 一致）：
   // LSBK(4)+ver(4)+blockSize(4) 头 + 每块(nonce12+ctLen4+tag16) 开销。
   // 上传长度必须按此精确上报——接收端（localsend 服务端）按声明的 size 硬校验 written == size。
-  const chunkOverhead = (s: number): number => {
+  // P2-PF7：参数明确命名为 fileSize，消除与外层变量的遮蔽歧义。
+  // 空文件也返回 12（LSBK+ver+blockSize 头长度），是真实存在的协议开销，非误判。
+  const chunkOverhead = (fileSize: number): number => {
     const BLOCK = 8 * 1024 * 1024;
-    const blocks = s > 0 ? Math.ceil(s / BLOCK) : 0;
-    return s + 12 + 32 * blocks;
+    const blocks = fileSize > 0 ? Math.ceil(fileSize / BLOCK) : 0;
+    return fileSize + 12 + 32 * blocks;
   };
   let totalBytes = 0;
   // 大文件分片：> 8MB 拆分为 __chunked__/{pct}/{idx}/{total} 条目（与 Rust 发送端一致），
@@ -207,9 +214,9 @@ export async function sendBackup(
   const files: FileMeta[] = [];
   const fileByRel = new Map<string, FileMeta>();
   const chunkMap = new Map<string, { fileId: string; offset: number; size: number }[]>();
-  for (const f of plan.toTransfer) {
+    for (const f of plan.toTransfer) {
     if (f.size > CHUNK_SIZE) {
-      const pct = encodeURIComponent(f.relPath);
+      const pct = rustPctEncode(f.relPath);
       const total = Math.ceil(f.size / CHUNK_SIZE);
       const chunks: { fileId: string; offset: number; size: number }[] = [];
       for (let idx = 0; idx < total; idx++) {
@@ -264,6 +271,8 @@ export async function sendBackup(
 
   // 6. 逐个上传（原生流式加密上传；失败时取消会话，避免接收端残留）
   let sent = 0;
+  // 防御：用已成功去重集合统计 sent，避免重试路径重复计数导致 sent > 计划数（曾出现 191/183）
+  const sentRels = new Set<string>();
   // 累计已传字节（8 路并发下 JS 单线程自增安全）：进度按整体字节显示，而非当前文件
   let completedBytes = 0;
   // 块级进度：原生 streamUpload 每 ~500ms 推送当前文件已传/总字节。
@@ -288,78 +297,51 @@ export async function sendBackup(
     // 接收端因永远收不齐文件而卡在"接收中"（曾误写 i+3 导致 85 个只传 33 个）
     for (let i = 0; i < plan.toTransfer.length; i += 8) {
       const batch = plan.toTransfer.slice(i, i + 8);
+      logger.info('backup', `上传批次 ${i / 8 + 1}: 文件 ${batch.map(f => f.relPath).join(', ')}`);
       let batchSent = 0;
-      await Promise.all(
-        batch.map(async (f, j) => {
-          const idx = i + j;
-          idxByRel.set(f.relPath, idx + 1);
-          // SAF 读取必须用原始相对路径（不带发送根目录名前缀），否则文件不存在
-          const origRel = f.relPath.startsWith(root.name + '/')
-            ? f.relPath.slice(root.name.length + 1)
-            : f.relPath;
-          const chunks = chunkMap.get(f.relPath);
-          if (chunks) {
-            // 大文件分片：查询对端已收分片，跳过，只传缺失部分（断点续传）
-            let received: number[] = [];
-            try {
-              const r = await getChunkStatus({ ip: targetIp, port: targetPort, encodedPath: encodeURIComponent(f.relPath) });
-              received = r.receivedChunks || [];
-            } catch {
-              // 查询失败则全传
-            }
-            for (const c of chunks) {
-              if (received.includes(c.offset / CHUNK_SIZE)) continue;
-              const raw = prepared.files[c.fileId];
-              const token = typeof raw === 'string' ? raw : (raw as { token?: string } | undefined)?.token;
-              if (!token) continue;
-              await streamUploadFile({
-                uri: root.uri,
-                relPath: origRel,
-                targetIp,
-                targetPort,
-                sessionId: prepared.sessionId,
-                fileId: c.fileId,
-                token,
-                targetCode: targetCode || '',
-                offset: c.offset,
-                size: c.size,
-              });
-              completedBytes += c.size;
-            }
-            batchSent++;
-            onProgress?.({
-              current: idx + 1,
-              total: plan.toTransfer.length,
-              fileName: f.relPath,
-              bytesSent: completedBytes,
-              totalBytes,
-            });
-            logger.debug('backup', `大文件分片完成 ${idx + 1}/${plan.toTransfer.length}: ${f.relPath}`);
-          } else {
-            // 普通文件：整文件上传
-            const fileMeta = fileByRel.get(f.relPath)!;
-            // LocalSend v2.2 协议：prepare-upload 响应 files 的值是"纯字符串 token"（非对象）。
-            // 兼容对象/字符串两种形态，避免取 .token 得到 undefined 导致全部文件被跳过。
-            const raw = prepared.files[fileMeta.id];
+
+      // 单文件上传（含分片重试逻辑）
+      async function uploadOneFile(f: typeof plan.toTransfer[0], idx: number): Promise<boolean> {
+        idxByRel.set(f.relPath, idx + 1);
+        const origRel = f.relPath.startsWith(root.name + '/')
+          ? f.relPath.slice(root.name.length + 1)
+          : f.relPath;
+        const chunks = chunkMap.get(f.relPath);
+        if (chunks) {
+          // 大文件分片：查询对端已收分片，跳过已收部分（断点续传）
+          let receivedSet = new Set<number>();
+          try {
+            const r = await getChunkStatus({ ip: targetIp, port: targetPort, encodedPath: rustPctEncode(f.relPath) });
+            receivedSet = new Set((r.receivedChunks || []).map(Number));
+            logger.debug('backup', `分片查询完成 ${f.relPath} 已收=${receivedSet.size} 总=${chunks.length}`);
+          } catch (e) {
+            logger.warn('backup', `分片查询失败（全传）${f.relPath}`, e);
+          }
+          let sentChunks = 0;
+          for (const c of chunks) {
+            if (receivedSet.has(c.offset / CHUNK_SIZE)) continue;
+            const raw = prepared.files[c.fileId];
             const token = typeof raw === 'string' ? raw : (raw as { token?: string } | undefined)?.token;
-            if (!token) {
-              logger.warn('backup', `目标端未接受 ${f.relPath}，跳过`);
-              return;
-            }
-            // 流式上传：原生分块读 + 多块 AES-GCM 加密 + HTTP 流式 POST，大文件内存 O(8MB)
+            if (!token) throw new Error(`prepare-upload 未返回 token：${f.relPath} fileId=${c.fileId}`);
             await streamUploadFile({
               uri: root.uri,
               relPath: origRel,
               targetIp,
               targetPort,
               sessionId: prepared.sessionId,
-              fileId: fileMeta.id,
+              fileId: c.fileId,
               token,
               targetCode: targetCode || '',
+              offset: c.offset,
+              size: c.size,
             });
+            completedBytes += c.size;
+            sentChunks++;
+          }
+          if (sentChunks > 0) {
             batchSent++;
-            completedBytes += fileMeta.size;
-            // 文件完成：补一个最终进度（保证文件级 UI 也即时更新）
+            sentRels.add(f.relPath);
+            sent = sentRels.size;
             onProgress?.({
               current: idx + 1,
               total: plan.toTransfer.length,
@@ -367,10 +349,88 @@ export async function sendBackup(
               bytesSent: completedBytes,
               totalBytes,
             });
-            logger.debug('backup', `文件上传完成 ${idx + 1}/${plan.toTransfer.length}: ${f.relPath}`);
           }
-        }),
+          logger.debug('backup', `大文件分片上传完成 ${f.relPath} 发送=${sentChunks}/${chunks.length} 片`);
+        } else {
+          const fileMeta = fileByRel.get(f.relPath)!;
+          const raw = prepared.files[fileMeta.id];
+          const token = typeof raw === 'string' ? raw : (raw as { token?: string } | undefined)?.token;
+          if (!token) {
+            logger.warn('backup', `目标端未接受 ${f.relPath}，跳过`);
+            return false;
+          }
+          await streamUploadFile({
+            uri: root.uri,
+            relPath: origRel,
+            targetIp,
+            targetPort,
+            sessionId: prepared.sessionId,
+            fileId: fileMeta.id,
+            token,
+            targetCode: targetCode || '',
+          });
+          batchSent++;
+          sentRels.add(f.relPath);
+          sent = sentRels.size;
+          completedBytes += fileMeta.size;
+          onProgress?.({
+            current: idx + 1,
+            total: plan.toTransfer.length,
+            fileName: f.relPath,
+            bytesSent: completedBytes,
+            totalBytes,
+          });
+          logger.debug('backup', `文件上传完成 ${idx + 1}/${plan.toTransfer.length}: ${f.relPath}`);
+        }
+        return true;
+      }
+
+      // 第一轮：全部并发上传
+      const results = await Promise.allSettled(
+        batch.map((f, j) => uploadOneFile(f, i + j)),
       );
+      // 失败文件重试（最多 2 次，指数退避）
+      const failedFiles = results
+        .map((r, k) => ({ r, f: batch[k] }))
+        .filter(({ r }) => r.status === 'rejected')
+        .map(({ f, r }) => ({ f, e: (r as PromiseRejectedResult).reason }));
+
+      for (let retry = 0; retry < 2 && failedFiles.length > 0; retry++) {
+        const delay = 500 * Math.pow(2, retry);
+        logger.warn('backup', `第 ${retry + 1} 轮重试 ${failedFiles.length} 个失败文件，${delay}ms 后重试`);
+        await sleep(delay);
+        // 防御：先快照文件引用再清空数组，避免重试回调里 failedFiles[k] 已为 undefined（原 bug）
+        const toRetry = failedFiles.slice();
+        failedFiles.length = 0;
+        const retryResults = await Promise.allSettled(
+          toRetry.map(({ f }) => uploadOneFile(f, i + batch.indexOf(f))),
+        );
+        retryResults.forEach((r, k) => {
+          const orig = toRetry[k];
+          if (r.status === 'rejected') {
+            logger.error('backup', `重试失败: ${orig?.f?.relPath ?? '?'}`, (r as PromiseRejectedResult).reason);
+            if (orig) failedFiles.push({ f: orig.f, e: (r as PromiseRejectedResult).reason });
+          } else if ((r as PromiseFulfilledResult<boolean>).value) {
+            batchSent++;
+            // 去重：仅当该文件尚未计入成功时才累加 sent
+            if (orig && !sentRels.has(orig.f.relPath)) {
+              sentRels.add(orig.f.relPath);
+              sent = sentRels.size;
+            }
+          }
+        });
+      }
+      if (failedFiles.length > 0) {
+        // 防御：有文件最终失败则整体中止并取消会话，绝不"报成功但数据不全/全毁"（BUG-3）
+        const failedPaths = failedFiles.map(({ f }) => f?.relPath ?? '?').join(', ');
+        logger.error('backup', `${failedFiles.length} 个文件最终失败，中止发送: ${failedPaths}`);
+        try {
+          await cancelSessionNative({ targetIp, targetPort, sessionId: prepared.sessionId });
+        } catch {
+          // 忽略取消失败
+        }
+        throw new Error(`发送失败：${failedFiles.length} 个文件最终上传失败（${failedPaths}），已取消会话`);
+      }
       sent += batchSent;
     }
   } catch (e) {
@@ -396,7 +456,10 @@ export async function sendBackup(
   // 镜像模式：对端多余文件移动到其 delete 文件夹（假删除，保持目录一致）。
   // P0 披露：移动对端文件前必须确认（确认函数由上层注入，展示真实多余文件数）；取消则跳过清理
   if (strategy === 'mirror' && plan.peerExtra.length > 0) {
-    const ok = onMirrorConfirm ? await onMirrorConfirm(plan.peerExtra.length) : true;
+    // 探针：用户报告"增量模式仍弹镜像确认"——记录策略实际值与来源字段，定位覆盖链
+    logger.info('backup', `镜像确认触发: strategy=${strategy} peerExtra=${plan.peerExtra.length} prevManifest=${!!prevManifest}`);
+    // 防御：count 必须是数字（历史上曾出现过 [object Object] 传入确认弹窗）
+    const ok = onMirrorConfirm ? await onMirrorConfirm(Number(plan.peerExtra.length)) : true;
     if (ok) {
       try {
         await moveToDelete({ ip: targetIp, port: targetPort, files: plan.peerExtra });

@@ -1,8 +1,10 @@
 <template>
-  <!-- 液态玻璃四层：canvas 模糊底（按 3/5fps 采样视频帧，壁纸本身不锁帧）/
+  <!-- 液态玻璃四层（照搬示例 index.html 结构）：
+       canvas(视频采样底座) / effect(backdrop-filter+SVG折射，盖在 canvas 之上) /
        tint(半透明着色) / shine(镜面高光) / text(内容) -->
   <div class="liquidGlass-wrapper" :style="{ borderRadius: cornerRadius + 'px', padding }">
     <canvas ref="blurCanvas" class="liquidGlass-blur" aria-hidden="true"></canvas>
+    <div class="liquidGlass-effect" aria-hidden="true"></div>
     <div class="liquidGlass-tint" aria-hidden="true"></div>
     <div class="liquidGlass-shine" aria-hidden="true"></div>
     <div class="liquidGlass-text">
@@ -25,10 +27,12 @@ withDefaults(
 
 const blurCanvas = ref<HTMLCanvasElement | null>(null);
 
-/** 把视频当前帧中本卡背后的区域模糊后画到 canvas（每 333/200ms 由采样器调用） */
+/** 把视频当前帧中本卡背后的区域模糊后画到 canvas（每 333/200ms 由采样器调用）。
+    高画质下 canvas 被 CSS display:none 隐藏（offsetParent 为 null），直接跳过不采样 */
 function drawBlur() {
   const c = blurCanvas.value;
   if (!c) return;
+  if (c.offsetParent === null) return;
   const video = document.querySelector<HTMLVideoElement>('video.wallpaper-video');
   if (!video || video.readyState < 2 || !video.videoWidth) return;
   const wrapper = c.parentElement as HTMLElement;
@@ -44,7 +48,7 @@ function drawBlur() {
   const dispH = vh * scale;
   const ox = (dw - dispW) / 2;
   const oy = (dh - dispH) / 2;
-  const dpr = Math.min(window.devicePixelRatio || 1, 2); // 上限 2x，控制 canvas 内存
+  const dpr = 1; // 性能优化（已确认）：分辨率上限 1x——小卡片模糊背景 1x/2x 肉眼难辨，绘制/内存省~75%
   const cw = Math.max(1, Math.round(r.width * dpr));
   const ch = Math.max(1, Math.round(r.height * dpr));
   if (c.width !== cw || c.height !== ch) {

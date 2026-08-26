@@ -24,15 +24,21 @@ export interface AutoResumeOptions {
 export function useAutoResume(opts: AutoResumeOptions) {
   let timer: ReturnType<typeof setInterval> | null = null;
   let inFlight = false;
+  let isResuming = false;
 
   async function tick() {
-    if (inFlight || opts.isBusy()) return;
+    if (inFlight || opts.isBusy() || isResuming) return;
     const pending = opts.getPending();
     if (!pending) return;
     inFlight = true;
     try {
       const ok = await opts.verifyPeer(pending);
       if (!ok) return;
+      // verifyPeer 成功后二次检查：onResume 会触发新一轮同步，
+      // 在它把 isBusy 置 true 之前不要再次进入（防止 verifyPeer 成功后
+      // 到 onResume 设置扫描标志之间隙被下一轮 tick 钻空子重复触发）
+      if (isResuming || opts.isBusy()) return;
+      isResuming = true;
       opts.onReconnect(pending);
       opts.notify(`已自动重连「${pending.peer}」，正在恢复同步任务`);
       opts.logInfo(`自动重连成功，恢复任务: 对端=${pending.peer}(${pending.peerIp}:${pending.peerPort})`);
@@ -41,6 +47,7 @@ export function useAutoResume(opts: AutoResumeOptions) {
       // 对端仍不可达：下一轮（5s）再试
     } finally {
       inFlight = false;
+      isResuming = false;
     }
   }
 

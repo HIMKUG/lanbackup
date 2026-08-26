@@ -10,10 +10,24 @@
  * - POST /api/localsend/v2/upload         上传文件
  * - POST /api/localsend/v2/cancel         取消
  * - GET  /api/localsend/v2/info           设备信息
+ *
+ * 安全版本字段（#13 协议版本协商）：
+ * - version: 当前协议版本
+ * - minVersion: 最低兼容版本
+ * - kdfVersion: KDF 版本（1=SHA-256, 2=PBKDF2）
+ * - cryptoVersion: 加密版本（1=连接码直接派生, 2=ECDH）
  */
 
 import { logger, maskSecret, summarizeList } from './logger.js';
+import { SpanStatusCode } from '@opentelemetry/api';
 import { jitteredBackoffMs, isChecksumFailureRetryable, formatEtag, parseEtag } from './scheduler.js';
+import {
+  PROTOCOL_VERSION,
+  MIN_PROTOCOL_VERSION,
+  KDF_VERSION,
+  CRYPTO_VERSION,
+  PBKDF2_ITERATIONS,
+} from './identity.js';
 
 /** 加密格式：LSBK(4) || nonce(12) || ciphertext+tag —— 与 Rust/Java 端一致 */
 const MAGIC = new Uint8Array([0x4c, 0x53, 0x42, 0x4b]); // "LSBK"
@@ -21,18 +35,57 @@ const NONCE_LEN = 12;
 /** 加密总开销（魔数 + nonce + GCM tag） */
 export const ENCRYPT_OVERHEAD = 32;
 
-/** 由连接码派生 AES-256-GCM 密钥（SHA-256，与 Rust/Java 端一致） */
-async function deriveAesKey(targetCode: string): Promise<CryptoKey> {
-  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(targetCode));
-  return crypto.subtle.importKey('raw', hash, { name: 'AES-GCM' }, false, ['encrypt']);
+/**
+ * 由连接码派生 AES-256-GCM 密钥（PBKDF2，#9 KDF 加固）。
+ *
+ * Salt 来源：配对时由发起方生成随机 32 字节，编码在 QR Code 中传递。
+ * 两端用相同的 password + salt 派生出相同的密钥。
+ *
+ * 用途（#9 修复后的定位）：
+ * - 用于本地存储加密（SQLite/SharedPreferences 中的配对记录加密）
+ * - 用于 ECDH 共享密钥的二次派生（ECDH_shared → PBKDF2 → session_key）
+ * - 不再用于传输加密（#8 完成后传输加密完全来自 ECDH）
+ *
+ * @param password 密钥派生密码（连接码或 DH 共享密钥）
+ * @param salt 盐值（配对时传递，32 字节 Base64 编码）
+ */
+async function deriveKeyPBKDF2(password: string | Uint8Array, salt: string): Promise<[CryptoKey, Uint8Array]> {
+  const saltBytes = Uint8Array.from(atob(salt), c => c.charCodeAt(0));
+
+  // 导入 password 为 PBKDF2 密钥材料
+  const keyBytes = password instanceof Uint8Array ? password : new TextEncoder().encode(password);
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    keyBytes,
+    'PBKDF2',
+    false,
+    ['deriveKey'],
+  );
+
+  const key = await crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: saltBytes,
+      iterations: PBKDF2_ITERATIONS,
+      hash: 'SHA-256',
+    },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+
+  return [key, saltBytes];
 }
 
 /**
  * AES-256-GCM 加密（Web Crypto），输出 `LSBK || nonce || ciphertext || tag`。
  * 与 desktop/src-tauri/src/crypto.rs、LocalReceiverPlugin.java 的格式完全一致。
+ *
+ * @param plaintext 要加密的明文
+ * @param key AES-256 密钥（从 deriveKeyPBKDF2 派生）
  */
-export async function encryptData(plaintext: ArrayBuffer, targetCode: string): Promise<Blob> {
-  const key = await deriveAesKey(targetCode);
+async function encryptWithKey(plaintext: ArrayBuffer, key: CryptoKey): Promise<Blob> {
   const nonce = crypto.getRandomValues(new Uint8Array(NONCE_LEN));
   const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, key, plaintext);
   const out = new Uint8Array(MAGIC.length + NONCE_LEN + ciphertext.byteLength);
@@ -42,10 +95,55 @@ export async function encryptData(plaintext: ArrayBuffer, targetCode: string): P
   return new Blob([out]);
 }
 
+/**
+ * AES-256-GCM 解密。
+ * @param ciphertext 密文（LSBK 格式）
+ * @param key AES-256 密钥
+ */
+async function decryptWithKey(ciphertext: ArrayBuffer, key: CryptoKey): Promise<ArrayBuffer> {
+  const data = new Uint8Array(ciphertext);
+  if (data.length < MAGIC.length + NONCE_LEN) throw new Error('密文长度不足');
+  const nonce = data.slice(MAGIC.length, MAGIC.length + NONCE_LEN);
+  const ct = data.slice(MAGIC.length + NONCE_LEN);
+  return crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce }, key, ct);
+}
+
+/**
+ * 加密数据（兼容性封装）。
+ * @param plaintext 明文
+ * @param targetCode 连接码（KDF v1 兼容）或 DH 共享密钥（KDF v2）
+ * @param salt PBKDF2 salt（KDF v2），KDF v1 时传空字符串
+ */
+export async function encryptData(plaintext: ArrayBuffer, targetCode: string, salt = ''): Promise<Blob> {
+  if (KDF_VERSION === 2 && salt) {
+    const [key] = await deriveKeyPBKDF2(targetCode, salt);
+    return encryptWithKey(plaintext, key);
+  }
+  // KDF v1 兼容路径（#9 修复前的老设备）
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(targetCode));
+  const key = await crypto.subtle.importKey('raw', hash, { name: 'AES-GCM' }, false, ['encrypt']);
+  return encryptWithKey(plaintext, key);
+}
+
+/**
+ * 解密数据（兼容性封装）。
+ */
+export async function decryptData(ciphertext: ArrayBuffer, targetCode: string, salt = ''): Promise<ArrayBuffer> {
+  if (KDF_VERSION === 2 && salt) {
+    const [key] = await deriveKeyPBKDF2(targetCode, salt);
+    return decryptWithKey(ciphertext, key);
+  }
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(targetCode));
+  const key = await crypto.subtle.importKey('raw', hash, { name: 'AES-GCM' }, false, ['decrypt']);
+  return decryptWithKey(ciphertext, key);
+}
+
 /** 协议类型 */
 export type ProtocolType = 'http' | 'https';
 
-/** 设备信息（register 请求体，字段与 LocalSend core `RegisterDtoV2` 对齐，camelCase） */
+/** 设备信息（register 请求体，字段与 LocalSend core `RegisterDtoV2` 对齐，camelCase）
+ *  #13 协议版本协商：新增 version/minVersion/kdfVersion/cryptoVersion 字段
+ */
 export interface RegisterDto {
   alias: string;
   deviceModel: string;
@@ -56,6 +154,12 @@ export interface RegisterDto {
   port: number;
   download: boolean;
   version: string;
+  /** 最低兼容协议版本 */
+  minVersion?: string;
+  /** KDF 版本：1=SHA-256, 2=PBKDF2 */
+  kdfVersion?: number;
+  /** 加密版本：1=连接码直接派生, 2=ECDH */
+  cryptoVersion?: number;
 }
 
 /** register 响应（字段与 LocalSend core `RegisterResponseDtoV2` 对齐） */
@@ -66,6 +170,10 @@ export interface RegisterResponseDto {
   deviceType?: string;
   fingerprint: string;
   download: boolean;
+  /** 服务端返回的 KDF 版本（用于客户端判断兼容性） */
+  kdfVersion?: number;
+  /** 服务端返回的加密版本 */
+  cryptoVersion?: number;
 }
 
 /** 单个文件元数据 */
@@ -179,23 +287,6 @@ export class TransferClient {
   }
 
   /**
-   * 获取设备信息。
-   */
-  async info(): Promise<RegisterResponseDto> {
-    const url = `${this.baseUrl}/api/localsend/v2/info`;
-    logger.debug('transfer', `info → ${url}`);
-    try {
-      const res = await fetchWithTimeout(url);
-      logger.info('transfer', `info ← ${res.status} (${url})`);
-      if (!res.ok) throw new Error(`info failed: ${await errorDetail(res)}`);
-      return res.json();
-    } catch (e) {
-      logger.error('transfer', `info 失败 (${url})`, e);
-      throw e;
-    }
-  }
-
-  /**
    * 准备上传（协商会话）。
    * @returns sessionId 和每个文件的 token
    */
@@ -241,17 +332,7 @@ export class TransferClient {
     content: Blob,
     onProgress?: ProgressCallback,
   ): Promise<void> {
-    const url = `${this.baseUrl}/api/localsend/v2/upload?sessionId=${encodeURIComponent(
-      sessionId,
-    )}&fileId=${encodeURIComponent(fileId)}&token=${encodeURIComponent(token)}`;
-    logger.debug(
-      'transfer',
-      `upload → ${url} fileId=${fileId} 大小=${content.size}B 加密=${
-        this.targetCode ? '是' : '否'
-      } 会话=${maskSecret(sessionId)}`,
-    );
-
-    // 目标端配置了连接码 → 传输前 AES-256-GCM 加密（接收端用自己连接码解密）
+    // 加密（若需要）先于 span 完成，避免 await 问题
     let body = content;
     if (this.targetCode) {
       try {
@@ -265,39 +346,72 @@ export class TransferClient {
       }
     }
 
-    // 用 XHR 以便获取上传进度
-    await new Promise<void>((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', url);
-      // LocalSend 期望原始二进制流，必须显式声明 Content-Type
-      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-      xhr.timeout = DEFAULT_TIMEOUT;
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable && onProgress) {
-          onProgress(e.loaded, e.total);
-        }
-      };
-      xhr.onload = () => {
-        if (xhr.status === 200) {
-          logger.info('transfer', `upload ← 200 fileId=${fileId} 完成`);
-          resolve();
-        } else {
-          const err = new Error(`upload failed: ${xhr.status}`);
-          logger.error('transfer', `upload ← ${xhr.status} fileId=${fileId}`, err);
+    return logger.startActiveSpan('transfer.upload', (span) => {
+      span.setAttributes({
+        'file.id': fileId,
+        'file.size': content.size,
+        'session.id': maskSecret(sessionId),
+        'upload.encrypted': Boolean(this.targetCode),
+      });
+
+      const url = `${this.baseUrl}/api/localsend/v2/upload?sessionId=${encodeURIComponent(
+        sessionId,
+      )}&fileId=${encodeURIComponent(fileId)}&token=${encodeURIComponent(token)}`;
+      logger.debug(
+        'transfer',
+        `upload → ${url} fileId=${fileId} 大小=${content.size}B 加密=${
+          this.targetCode ? '是' : '否'
+        } 会话=${maskSecret(sessionId)}`,
+      );
+
+      return new Promise<void>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url);
+        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        xhr.timeout = DEFAULT_TIMEOUT;
+        // #26 进度节流：200ms 间隔限制，避免过频回调导致 UI 卡顿
+        let lastProgressMs = 0;
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable && onProgress) {
+            const now = performance.now();
+            if (now - lastProgressMs >= 200) {
+              lastProgressMs = now;
+              onProgress(e.loaded, e.total);
+            }
+          }
+        };
+        xhr.onload = () => {
+          if (xhr.status === 200) {
+            logger.info('transfer', `upload ← 200 fileId=${fileId} 完成`);
+            span.end();
+            resolve();
+          } else {
+            const err = new Error(`upload failed: ${xhr.status}`);
+            logger.error('transfer', `upload ← ${xhr.status} fileId=${fileId}`, err);
+            span.setStatus({ code: SpanStatusCode.ERROR, message: 'HTTP_FAIL' });
+            span.recordException(err);
+            span.end();
+            reject(err);
+          }
+        };
+        xhr.onerror = () => {
+          const err = new Error('upload network error');
+          logger.error('transfer', `upload 网络错误 fileId=${fileId}`, err);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: 'HTTP_FAIL' });
+          span.recordException(err);
+          span.end();
           reject(err);
-        }
-      };
-      xhr.onerror = () => {
-        const err = new Error('upload network error');
-        logger.error('transfer', `upload 网络错误 fileId=${fileId}`, err);
-        reject(err);
-      };
-      xhr.ontimeout = () => {
-        const err = new Error(`upload timeout (${DEFAULT_TIMEOUT}ms)`);
-        logger.error('transfer', `upload 超时 fileId=${fileId}`, err);
-        reject(err);
-      };
-      xhr.send(body);
+        };
+        xhr.ontimeout = () => {
+          const err = new Error(`upload timeout (${DEFAULT_TIMEOUT}ms)`);
+          logger.error('transfer', `upload 超时 fileId=${fileId}`, err);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: 'TIMEOUT' });
+          span.recordException(err);
+          span.end();
+          reject(err);
+        };
+        xhr.send(body);
+      });
     });
   }
 
@@ -471,9 +585,9 @@ export class TransferClient {
     onProgress?: ProgressCallback,
     maxRetries = 5,
   ): Promise<void> {
-    let attempt = 0;
-
-    while (true) {
+    // maxRetries 上限检查，防止 Infinity 或负数
+    const safeMaxRetries = Math.max(0, Math.min(maxRetries, 100));
+    for (let attempt = 0; attempt <= safeMaxRetries; attempt++) {
       try {
         await this.upload(sessionId, fileId, token, content, onProgress);
         return; // 成功
@@ -489,15 +603,14 @@ export class TransferClient {
           throw e;
         }
 
-        if (attempt >= maxRetries) {
+        if (attempt >= safeMaxRetries) {
           logger.error('transfer', `upload 重试耗尽（status=${status}): ${err.message}`);
           throw e;
         }
 
         const delayMs = jitteredBackoffMs(attempt);
-        logger.warn(`transfer`, `upload 422 校验失败，重试 ${attempt + 1}/${maxRetries}（delay=${delayMs}ms）: ${err.message}`);
+        logger.warn('transfer', `upload 422 校验失败，重试 ${attempt + 1}/${safeMaxRetries}（delay=${delayMs}ms）: ${err.message}`);
         await new Promise(resolve => setTimeout(resolve, delayMs));
-        attempt++;
         // 重试时会重新读取文件内容并上传
       }
     }

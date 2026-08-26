@@ -1,0 +1,12 @@
+{
+  "$comment": "P-256 ECDH 交叉协商测试向量：Rust(p256 crate, SEC1 非压缩 65B) 与 Java(KeyAgreement ECDH, getEncoded 非压缩 65B) 各自生成密钥对，交叉协商，shared 必须一致。双端点编码格式一致是 ECDH 协商成功的前提（方案.txt §八.2）。Rust 侧 crypto.rs v3_p256_ecdh_cross_check 与 Java 侧 ECDHP256Test 双端断言一致。",
+  "name": "p256_ecdh_cross_check",
+  "point_encoding": "SEC1 uncompressed (0x04 || X || Y, 65 bytes)",
+  "rust_private_key_hex": "2bb0b0c8c2875f23ad990a5210cb60e2b7c4041564d763825c78b8a406006058",
+  "rust_public_key_hex": "04f6b78ecf719d2de5eda1ca388a9e342316d7f3d0b554bb6bbf79d327c6ca6eb1b42982bba3ea7be77d5097446e327086ff65c3a0bd72bc931763bc42070e4bb4",
+  "java_private_key_hex": "e7674dcdef5530c1328778f1e7f0179486968bb1060c3c150d95bb084aa3b89a",
+  "java_public_key_hex": "044e8cd455266a486fba6af216fabbc942c3ba4a1f505e8cac85d73481ab752af4e2616c3c990c59397587db45e7c2d28ab43ac3cf2cc82d9ca7642bf6e8275857",
+  "expected_shared_rust_java_hex": "db59d954cca702a9c57671c1fd8314507e954f480cc5a5634e380884f094d3e4",
+  "expected_shared_java_rust_hex": "db59d954cca702a9c57671c1fd8314507e954f480cc5a5634e380884f094d3e4",
+  "assert": "两者必须相等"
+}

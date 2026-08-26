@@ -26,6 +26,8 @@ export interface DiscoveredDevice {
   paired: boolean;
   /** 最后发现时间（毫秒） */
   lastSeen: number;
+  /** 是否已建立连接（WebSocket 握手成功） */
+  connected?: boolean;
 }
 
 /** 发现回调 */
@@ -34,6 +36,8 @@ export interface DiscoveryCallbacks {
   onDeviceFound: (device: DiscoveredDevice) => void;
   /** 设备离线 */
   onDeviceLost: (ip: string) => void;
+  /** 设备连接状态变化 */
+  onConnectionStatusChanged?: (ip: string, port: number, connected: boolean) => void;
 }
 
 /**
@@ -78,25 +82,29 @@ export class DiscoveryManager {
       device.connectionCode && isValidConnectionCode(device.connectionCode)
         ? device.connectionCode
         : undefined;
+    // 合并时保留已有的连接状态（避免 UDP 广播覆盖 WebSocket 连接状态）
     const updated: DiscoveredDevice = {
       ...(existing ?? device),
       ...device,
       connectionCode,
       paired: isPaired({ ...device, connectionCode }, this.pairedCodes),
       lastSeen: Date.now(),
+      // 连接状态以已连接为准，未知时保持旧值
+      connected: device.connected ?? existing?.connected ?? false,
     };
     this.devices.set(key, updated);
     const pairedTag = updated.paired ? '已配对' : '未配对';
+    const connTag = updated.connected ? '已连接' : '未连接';
     if (!existing) {
       logger.info(
         'discovery',
         `发现新设备 ${updated.alias} ${updated.ip}:${updated.port} ` +
-          `连接码=${maskSecret(updated.connectionCode ?? '')} ${pairedTag}`,
+          `连接码=${maskSecret(updated.connectionCode ?? '')} ${pairedTag} ${connTag}`,
       );
     } else {
       logger.debug(
         'discovery',
-        `设备上报更新 ${updated.alias} ${updated.ip}:${updated.port} ${pairedTag}`,
+        `设备上报更新 ${updated.alias} ${updated.ip}:${updated.port} ${pairedTag} ${connTag}`,
       );
     }
     this.callbacks.onDeviceFound(updated);
@@ -116,6 +124,27 @@ export class DiscoveryManager {
   }
 
   /**
+   * 更新指定设备的连接状态（由 WebSocket 连接管理器调用）。
+   * @param ip 设备 IP
+   * @param port 设备端口
+   * @param connected 是否已连接
+   */
+  updateConnectionStatus(ip: string, port: number, connected: boolean): void {
+    const key = `${ip}:${port}`;
+    const device = this.devices.get(key);
+    if (!device) return; // 设备不存在则忽略
+    if (device.connected === connected) return; // 状态无变化不重复处理
+    device.connected = connected;
+    device.lastSeen = Date.now();
+    logger.info(
+      'discovery',
+      `连接状态变更 ${device.alias} ${device.ip}:${device.port} → ${connected ? '已连接' : '未连接'}`,
+    );
+    this.callbacks.onDeviceFound(device);
+    this.callbacks.onConnectionStatusChanged?.(ip, port, connected);
+  }
+
+  /**
    * 获取所有已发现的设备。
    */
   allDevices(): DiscoveredDevice[] {
@@ -127,6 +156,13 @@ export class DiscoveryManager {
    */
   pairedDevices(): DiscoveredDevice[] {
     return this.allDevices().filter((d) => d.paired);
+  }
+
+  /**
+   * 获取已配对且已连接的设备。
+   */
+  connectedDevices(): DiscoveredDevice[] {
+    return this.allDevices().filter((d) => d.paired && d.connected);
   }
 
   /**

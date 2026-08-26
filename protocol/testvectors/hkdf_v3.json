@@ -1,0 +1,14 @@
+{
+  "$comment": "双端共享 HKDF 测试向量：直接用 RFC 5869 Appendix A.1 官方 Test Case 1。Rust(crypto.rs v3_hkdf_rfc5869_tc1) 与 Java(HkdfSha256) 各自断言输出一致，防双端派生逻辑漂移。必须进 CI。",
+  "name": "hkdf_sha256_rfc5869_tc1",
+  "hash": "SHA-256",
+  "ikm_hex": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+  "ikm_len": 22,
+  "salt_hex": "000102030405060708090a0b0c",
+  "salt_len": 13,
+  "info_hex": "f0f1f2f3f4f5f6f7f8f9",
+  "info_len": 10,
+  "output_len": 42,
+  "expected_prk_hex": "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5",
+  "expected_okm_hex": "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+}

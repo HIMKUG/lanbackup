@@ -13,8 +13,11 @@ import GlassModal from './GlassModal.vue';
 import GlassScrollbar from './GlassScrollbar.vue';
 import CodeBoxes from './CodeBoxes.vue';
 import IpBoxes from './IpBoxes.vue';
+import SasDisplay from './SasDisplay.vue';
+import AppIcon from './AppIcon.vue';
 
-export { LiquidGlass, GlassFilters, GlassDock, GlassSeg, GlassSwitch, GlassModal, GlassScrollbar, CodeBoxes, IpBoxes };
+export { LiquidGlass, GlassFilters, GlassDock, GlassSeg, GlassSwitch, GlassModal, GlassScrollbar, CodeBoxes, IpBoxes, SasDisplay, AppIcon };
+export { type IconName } from './AppIcon.vue';
 export { installGlowHover, type GsapLike } from './useGlowHover';
 export { setBlurInterval } from './blurSampler';
 export { useLiquidGlass } from './useLiquidGlass';

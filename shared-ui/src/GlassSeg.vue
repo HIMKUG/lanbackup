@@ -10,7 +10,12 @@
       :class="{ active: modelValue === o.id }"
       role="radio"
       :aria-checked="modelValue === o.id"
+      :tabindex="modelValue === o.id ? 0 : -1"
       @click="$emit('update:modelValue', o.id)"
+      @keydown.left.prevent="onKey(-1)"
+      @keydown.right.prevent="onKey(1)"
+      @keydown.up.prevent="onKey(-1)"
+      @keydown.down.prevent="onKey(1)"
     >
       {{ o.label }}
     </button>
@@ -33,7 +38,15 @@ const props = defineProps<{
   label?: string;
 }>();
 
-defineEmits<{ 'update:modelValue': [value: T] }>();
+const emit = defineEmits<{ 'update:modelValue': [value: T] }>();
+
+/** P2-UA7：radiogroup 键盘导航（左右/上下切档，循环），roving tabindex */
+function onKey(dir: number) {
+  const idx = props.options.findIndex((o) => o.id === props.modelValue);
+  if (idx < 0) return;
+  const next = props.options[(idx + dir + props.options.length) % props.options.length];
+  if (next) emit('update:modelValue', next.id);
+}
 
 /** 当前选中项下标 */
 const activeIdx = computed(() => {

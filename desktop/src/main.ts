@@ -1,11 +1,13 @@
 import { createApp } from 'vue';
 import App from './App.vue';
 import './style.css';
-import { logger } from 'shared-core';
+import { logger, initTelemetry } from 'shared-core';
 
 // Debug 调度器：安装全局错误捕获（未捕获异常 / 未处理 Promise 拒绝），
 // 并恢复上次持久化的日志。任何模块漏报的错误都会在这里兜底。
 logger.setDevice('pc');
+
+initTelemetry('pc'); // 初始化 OpenTelemetry（必须在 installGlobalHandlers 之前）
 logger.installGlobalHandlers();
 
 const app = createApp(App);

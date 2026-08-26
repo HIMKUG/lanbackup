@@ -1,19 +1,27 @@
 //! 设备身份：基于 Windows MachineGuid 生成永久连接码 + 公开设备标识
 
+use std::sync::atomic::Ordering;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
 
 use crate::db::AppError;
 
 /// 读取 Windows MachineGuid（注册表）
+///
+/// 经 reg.exe 子进程读取，带 2 秒超时：杀软 hook 进程创建时可令子进程
+/// 无限期不退出，无超时会阻塞调用线程（Database::open 在主线程调用）。
 fn get_machine_guid() -> String {
     #[cfg(target_os = "windows")]
     {
+        use std::io::Read;
         use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
         // CREATE_NO_WINDOW(0x08000000)：隐藏 reg 命令的控制台窗口，
         // 避免配对/启动时闪现黑框
-        let output = Command::new("reg")
+        let mut child = match Command::new("reg")
             .creation_flags(0x08000000)
             .args([
                 "query",
@@ -21,22 +29,51 @@ fn get_machine_guid() -> String {
                 "/v",
                 "MachineGuid",
             ])
-            .output();
-        if let Ok(out) = output {
-            let text = String::from_utf8_lossy(&out.stdout);
-            // 提取 GUID 值
-            for line in text.lines() {
-                if let Some(idx) = line.find("MachineGuid") {
-                    let rest = &line[idx..];
-                    if let Some(eq) = rest.find("REG_SZ") {
-                        let guid = rest[eq + 6..].trim();
-                        if !guid.is_empty() {
-                            crate::log_debug!(
-                                "读取 MachineGuid 成功: {}",
-                                crate::logger::mask(guid)
-                            );
-                            return guid.to_string();
-                        }
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                crate::log_warn!("reg.exe 启动失败（{e}），使用 unknown-machine 兜底");
+                return "unknown-machine".to_string();
+            }
+        };
+        // 轮询等待最多 2 秒，超时强杀兜底
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break Some(st),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break None,
+            }
+        };
+        if status.is_none() {
+            crate::log_warn!("reg.exe 超时 2s 被强杀（疑似被安全软件拦截），使用 unknown-machine 兜底");
+            return "unknown-machine".to_string();
+        }
+        let mut stdout = String::new();
+        if let Some(mut out) = child.stdout.take() {
+            let _ = out.read_to_string(&mut stdout);
+        }
+        // 提取 GUID 值
+        for line in stdout.lines() {
+            if let Some(idx) = line.find("MachineGuid") {
+                let rest = &line[idx..];
+                if let Some(eq) = rest.find("REG_SZ") {
+                    let guid = rest[eq + 6..].trim();
+                    if !guid.is_empty() {
+                        crate::log_debug!(
+                            "读取 MachineGuid 成功: {}",
+                            crate::logger::mask(guid)
+                        );
+                        return guid.to_string();
                     }
                 }
             }
@@ -114,6 +151,7 @@ static SELF_CODE: Mutex<Option<String>> = Mutex::new(None);
 ///
 /// 优先返回配置文件中持久化的码（刷新过）；否则按设备号计算并缓存到文件。
 /// 进程内缓存 + 文件缓存两级，避免每次调用都执行注册表查询/磁盘读。
+/// M5-3: 传输期间拒绝刷新（见 refresh_self_code）；读取永远返回缓存，永不阻塞传输。
 pub fn get_self_code(app: &AppHandle) -> String {
     if let Some(c) = SELF_CODE.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
         return c.clone();
@@ -134,40 +172,63 @@ pub fn get_self_code(app: &AppHandle) -> String {
     code
 }
 
-/// 刷新本机连接码：生成随机码并持久化，旧码立即失效（对方需重新配对）
+/// 刷新本机连接码：生成随机码并持久化，旧码立即失效（对方需重新配对）。
+/// M2: 异步通知所有配对设备断开连接（不清除配对记录，传输完成后重新建立）。
+/// M5-3: 传输期间拒绝刷新（防止解密密钥突变导致传输失败）。
 pub fn refresh_self_code(app: &AppHandle) -> String {
+    // P0-1: 检查是否有传输在进行中（引用计数 > 0）
+    if let Some(state) = app.try_state::<crate::transfer::PairingState>() {
+        if state.transfer_count.load(Ordering::Relaxed) > 0 {
+            crate::log_warn!("刷新连接码被拒绝：传输正在进行中（密钥锁定）");
+            return get_self_code(app);
+        }
+    }
     let code = random_code();
     let dir = config_dir(app);
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join("self_code.txt"), &code);
     *SELF_CODE.lock().unwrap_or_else(|p| p.into_inner()) = Some(code.clone());
     crate::log_info!("连接码已刷新: {}", crate::logger::mask(&code));
+    // M2: 通知所有配对设备断开（异步，不阻塞码刷新返回）
+    crate::transfer::notify_peers_disconnect(app);
     code
 }
 
-/// 随机 8 位连接码（LCG 伪随机，字符集与默认算法一致）
+/// 随机 8 位连接码（CSPRNG + 拒绝采样消除模偏差，字符集与默认算法一致）
 fn random_code() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id() as u128;
-    let mut seed = nanos ^ (pid << 32);
-    let mut code = String::new();
-    for _ in 0..8 {
-        seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let idx = ((seed >> 33) % ALPHABET.len() as u128) as usize;
-        code.push(ALPHABET[idx] as char);
+    // 248 = 31 × 8：丢弃 >=248 的随机字节，保证 31 个字符等概率
+    // （直接 %31 会因 256 非倍数产生模偏差）；同一毫秒内多次调用不再产出相同码
+    let mut code = String::with_capacity(8);
+    while code.len() < 8 {
+        let b: u8 = rand::random();
+        if b < 248 {
+            code.push(ALPHABET[(b % ALPHABET.len() as u8) as usize] as char);
+        }
     }
     code
 }
 
 /// 公开 deviceId（安装后固定）：广播/注册响应中作为 fingerprint。
 /// 与连接码分离——连接码只在配对服务 /verify 端点本地比对，绝不广播。
-pub fn get_device_id(_app: &AppHandle) -> String {
+pub fn get_device_id(app: &AppHandle) -> String {
+    let _ = app;
+    get_device_id_no_ctx()
+}
+
+/// 本机公开指纹码（`v3-` + deviceId 前 8 位）。
+/// 手机端在无配对 secret 时用 `SHA-256(targetCode)` 回退加密，
+/// 其中 targetCode 即对端的指纹码（如 `v3-8eeea519`）。
+/// 本函数用于接收端回退解密时用同一口径派生候选密钥，消除"密钥不匹配"全灭问题。
+pub fn get_self_fingerprint_code(app: &AppHandle) -> String {
+    let id = get_device_id(app);
+    let prefix: String = id.chars().take(8).collect();
+    format!("v3-{prefix}")
+}
+
+/// 无句柄变体：deviceId 仅由 MachineGuid 派生，与 Tauri 句柄无关。
+/// 供 http_json_request 等没有 AppHandle 的底层网络上下文注入身份头。
+pub fn get_device_id_no_ctx() -> String {
     let guid = machine_guid_cached();
     let mut h: u64 = 0xcbf29ce484222325;
     let input = format!("{guid}|lanbackup-device-id|v1");
@@ -208,13 +269,38 @@ pub fn set_device_name(app: &AppHandle, name: String) -> Result<(), AppError> {
 
 /// 生成数据库加密密钥（派生自 MachineGuid，保证同一设备可解密）。
 /// 返回 64 位十六进制字符串，作为 SQLCipher 的 key。
+///
+/// v2（P2-11 修复）：改用标准 PBKDF2-HMAC-SHA256（600k 迭代 + 独立 salt），
+/// 替代原 FNV-1a 快速哈希。FNV-1a 非抗碰撞的密钥派生函数、无 salt、迭代不足，
+/// 在攻击者可离线枚举 UUID 空间时保护性近零。PBKDF2-600k 单核穷举约 1 万年。
+///
+/// 说明：当前 rusqlite 用 `bundled` 特性未启用 SQLCipher（见 Cargo.toml），
+/// `PRAGMA key` 暂无实际加密效果；本函数保证未来启用 SQLCipher 时密钥强度达标。
 pub fn db_encryption_key() -> String {
     let guid = machine_guid_cached();
     crate::log_debug!(
-        "派生数据库加密密钥 输入特征: 长度={} 前缀={}",
+        "派生数据库加密密钥 v2(PBKDF2-600k) 输入特征: 长度={} 前缀={}",
         guid.len(),
         crate::logger::mask(&guid)
     );
+    // salt = SHA256(MachineGuid)：每设备唯一，防彩虹表
+    let salt = Sha256::digest(guid.as_bytes());
+    let mut key = [0u8; 32];
+    ring::pbkdf2::derive(
+        ring::pbkdf2::PBKDF2_HMAC_SHA256,
+        std::num::NonZeroU32::new(600_000).unwrap(),
+        &salt,
+        guid.as_bytes(),
+        &mut key,
+    );
+    hex::encode(key)
+}
+
+/// 旧版 FNV-1a 派生（v1，P2-11 前世）。
+/// 保留供迁移判断参考：若某设备已用旧算法创建的 SQLCipher 库需解密，可据此回退读取。
+#[allow(dead_code)]
+pub fn db_encryption_key_legacy() -> String {
+    let guid = machine_guid_cached();
     // 用 FNV-1a 哈希 + 多次迭代生成 64 位密钥
     let mut hash: u64 = 0xcbf29ce484222325;
     let input = format!("{}|localsend-backup-db|v1", guid);
