@@ -2,11 +2,13 @@ import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
 import { VueMcp } from 'vite-plugin-vue-mcp';
 import { fileURLToPath, URL } from 'node:url';
+import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
-  plugins: [vue(), VueMcp()],
+  plugins: [vue(), VueMcp(), tailwindcss()],
   resolve: {
     alias: {
+      '@': fileURLToPath(new URL('./src', import.meta.url)),
       'shared-core': fileURLToPath(new URL('../shared-core/src/index.ts', import.meta.url)),
     },
   },
