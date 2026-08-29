@@ -132,17 +132,80 @@ impl TransferState {
         }
     }
 
-    /// 是否允许「中止」
+    /// 是否允许「中止」（V4-TRANSFER-MODULE §3.3）
+    ///
+    /// 只有**进行中**的状态可中止。四个「静止」状态都不可：
+    /// `Idle` 没有传输，`Completed`/`Failed`/`Aborted` 都已结束
+    /// —— 对已结束的任务再发中止毫无意义，只会让 UI 出现一个点了没反应的按钮。
     pub fn allows_abort(self) -> bool {
-        !matches!(
+        matches!(
             self,
-            TransferState::Idle | TransferState::Completed | TransferState::Aborted
+            TransferState::Preparing
+                | TransferState::Reconciling
+                | TransferState::Transferring
+                | TransferState::Paused
+                | TransferState::Degrading
+                | TransferState::Verifying
         )
     }
 
-    /// 是否允许「重试」
+    /// 是否允许「重试」（V4-TRANSFER-MODULE §3.3）
+    ///
+    /// `Completed` 排除在外：成功的传输没有「重试」的语义（§3.3 提示「传输已成功」）。
+    /// `Aborted` 包含在内 —— 但注意它**不是**原地复活，见 [`Self::retry_events`]。
     pub fn allows_retry(self) -> bool {
-        matches!(self, TransferState::Paused | TransferState::Failed)
+        matches!(
+            self,
+            TransferState::Paused | TransferState::Failed | TransferState::Aborted
+        )
+    }
+
+    /// 是否允许「开始传输」（V4-TRANSFER-MODULE §3.3）
+    ///
+    /// 除 `Idle` 外，三个终态也允许 —— 否则传完一次就再也开不了第二次。
+    /// 同样不是原地重启，见 [`Self::start_events`]。
+    pub fn allows_start(self) -> bool {
+        matches!(
+            self,
+            TransferState::Idle
+                | TransferState::Completed
+                | TransferState::Failed
+                | TransferState::Aborted
+        )
+    }
+
+    /// 「重试」按钮实际要派发的事件序列（V4-TRANSFER-MODULE §3.2 语义表）。
+    ///
+    /// # 为什么不是单个事件
+    ///
+    /// 文档 §3.3 说 `aborted` 时「重试」可用，而 §2 说「终态单调，Aborted 不可回退」。
+    /// 两者并不矛盾 —— 按钮可用指的是**新建一次会话**，而不是把旧会话拉回来。
+    /// 差别落在事件序列上：`Aborted` 必须先 `ForceReset` 回 `Idle` 再 `Register`。
+    ///
+    /// 把这个映射放在状态机里而不是留给调用方，是因为调用方一旦猜错，
+    /// 就会对 `Aborted` 直接发 `Retry`，拿到一个非法迁移错误 —— 表现为「点了没反应」，
+    /// 正是本次重构要消灭的那类静默失败。
+    pub fn retry_events(self) -> &'static [TransferEvent] {
+        match self {
+            // 重新对账（拉取权威位图）→ 从断点继续
+            TransferState::Paused => &[TransferEvent::Retry],
+            // 开启新尝试（状态机直接支持 Failed → Preparing）
+            TransferState::Failed => &[TransferEvent::Retry],
+            // 终态单调：必须新建会话
+            TransferState::Aborted => &[TransferEvent::ForceReset, TransferEvent::Register],
+            _ => &[],
+        }
+    }
+
+    /// 「开始传输」按钮实际要派发的事件序列（同 [`Self::retry_events`] 的道理）。
+    pub fn start_events(self) -> &'static [TransferEvent] {
+        match self {
+            TransferState::Idle => &[TransferEvent::Register],
+            TransferState::Completed | TransferState::Failed | TransferState::Aborted => {
+                &[TransferEvent::ForceReset, TransferEvent::Register]
+            }
+            _ => &[],
+        }
     }
 
     /// 是否为终态（Completed/Failed/Aborted）
@@ -279,6 +342,103 @@ mod tests {
             s.transition(TransferEvent::Retry).unwrap(),
             TransferState::Preparing
         );
+    }
+
+    /// 事件序列必须**真的能走通**。
+    ///
+    /// 光断言「Aborted 的重试序列是 [ForceReset, Register]」没有意义 ——
+    /// 那只是复述了实现。真正要验的是把序列喂进状态机后能落到 Preparing。
+    #[test]
+    fn retry_event_sequences_are_actually_legal() {
+        for src in [
+            TransferState::Paused,
+            TransferState::Failed,
+            TransferState::Aborted,
+        ] {
+            assert!(src.allows_retry(), "{src:?} 应可重试");
+            let evs = src.retry_events();
+            assert!(!evs.is_empty(), "{src:?} 可重试却没有事件序列");
+
+            let mut s = src;
+            for ev in evs {
+                s = s
+                    .transition(*ev)
+                    .unwrap_or_else(|e| panic!("{src:?} 的重试序列在 {ev:?} 处非法：{e:?}"));
+            }
+            assert_eq!(s, TransferState::Preparing, "{src:?} 重试后应到 Preparing");
+        }
+    }
+
+    #[test]
+    fn start_event_sequences_are_actually_legal() {
+        for src in [
+            TransferState::Idle,
+            TransferState::Completed,
+            TransferState::Failed,
+            TransferState::Aborted,
+        ] {
+            assert!(src.allows_start(), "{src:?} 应可开始新传输");
+            let mut s = src;
+            for ev in src.start_events() {
+                s = s
+                    .transition(*ev)
+                    .unwrap_or_else(|e| panic!("{src:?} 的开始序列在 {ev:?} 处非法：{e:?}"));
+            }
+            assert_eq!(s, TransferState::Preparing, "{src:?} 开始后应到 Preparing");
+        }
+    }
+
+    /// 不可用的状态必须给出**空**序列，避免调用方拿到一个「看似可执行」的序列
+    #[test]
+    fn unavailable_actions_yield_empty_sequences() {
+        for s in [
+            TransferState::Preparing,
+            TransferState::Reconciling,
+            TransferState::Transferring,
+            TransferState::Degrading,
+            TransferState::Verifying,
+        ] {
+            assert!(!s.allows_retry());
+            assert!(s.retry_events().is_empty());
+            assert!(!s.allows_start());
+            assert!(s.start_events().is_empty());
+        }
+        // Completed 可开始新传输，但不可「重试」（已成功）
+        assert!(TransferState::Completed.allows_start());
+        assert!(!TransferState::Completed.allows_retry());
+        assert!(TransferState::Completed.retry_events().is_empty());
+        // Paused 可重试，但不可「开始新传输」（应先重试或中止）
+        assert!(TransferState::Paused.allows_retry());
+        assert!(!TransferState::Paused.allows_start());
+        assert!(TransferState::Paused.start_events().is_empty());
+    }
+
+    /// §3.3：`failed` 不可中止（传输已结束），此前实现误判为可中止
+    #[test]
+    fn abort_excludes_all_settled_states() {
+        for s in [
+            TransferState::Idle,
+            TransferState::Completed,
+            TransferState::Failed,
+            TransferState::Aborted,
+        ] {
+            assert!(!s.allows_abort(), "{s:?} 不应可中止");
+        }
+        for s in [
+            TransferState::Preparing,
+            TransferState::Reconciling,
+            TransferState::Transferring,
+            TransferState::Paused,
+            TransferState::Degrading,
+            TransferState::Verifying,
+        ] {
+            assert!(s.allows_abort(), "{s:?} 应可中止");
+            // 可中止就必须真的能迁移到 Aborted
+            assert_eq!(
+                s.transition(TransferEvent::Abort).unwrap(),
+                TransferState::Aborted
+            );
+        }
     }
 
     #[test]

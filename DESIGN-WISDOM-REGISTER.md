@@ -64,6 +64,8 @@
 | S12 | **UDP 广播不得覆盖 WebSocket 连接状态** —— 两个状态源写同一对象，用 `?? existing ?? false` 三级 fallback | `discovery.ts:85-93` | 设备状态合并 | ✅ 从「靠 fallback 兜」升级为**结构上不可能**：在线性（`presence::PresenceTracker`）与连接态（`state::connection`）是两套独立类型、各自存储，没有共享可变对象可供覆盖。方向依赖单向固定为 `Connected ⇒ Online` |
 | S13 | **严格到齐才合并分片**（缺失或残留多于 total 都等待/失败），防旧版本残留拼接损坏 | `receive.rs:763-764` | 分片合并 | ⬜ |
 | S14 | **空 sessionId 必须显式告警**（后续 upload 全部失败且根因丢失）；**files 字段解析失败不能静默变空 map**（会伪装成"接受了 0 个"照常推进） | `scheduler.rs:769-772,779-780` | 上传准备 | ⬜ |
+| S15 | **禁止把用户困死在终态** —— 任何"只在健康态才放开操作"的裁决都要反问：不健康时用户拿什么自救？① 连接 `Lost`/`Failed` 必须仍可**重连**（否则唯一出路是重启 App）② 传输 `Completed`/`Failed`/`Aborted` 必须仍可**开新传输**（否则第一次传完就报废）③ 恢复类操作（重新启用高级算法）不得依赖连接态，离线也要能改偏好 | V4 自查（阶段 2 `policy.rs` 初版，无旧版对应） | `state/policy.rs` + `state/transfer.rs::allows_start` | ✅ 已修正并用表驱动测试锁死（`user_is_never_stranded_after_connection_loss`、`can_start_new_transfer_after_settled`、`reenable_advanced_works_while_disconnected`） |
+| S16 | **可用性裁决必须回答"点下去真的能走通吗"** —— `can()` 说可用、但状态机没有合法事件序列到达目标态，等于换一种方式静默失败。做法：让裁决暴露 `retry_events()`/`start_events()` 事件序列，并用测试把序列**真的喂进状态机**验证可达 | V4 自查（同上） | `state/transfer.rs::{retry_events,start_events}` | ✅ `retry_event_sequences_are_actually_legal` / `enabled_actions_have_legal_state_machine_paths` |
 
 ---
 
@@ -210,6 +212,7 @@
 | E7 | 未发现分块大小四处不一致 | `transfer.ts:196` 4MB / `transfer.ts:659` 8MB / `scheduler.ts:601` 16MB / 我文档里「小文件 <16MB 跳过 diff」 | ✅ 常量源已统一：`PIECE_SIZE`(4MiB)/`BASIC_CHUNK_SIZE`(16MiB) 单一来源 + 编译期对齐断言（`transfer/chunk.rs`）。另：「小文件跳过 diff」与「tiny tar 聚合」的冲突见 A9，仍待定 |
 | E8 | 未发现两个连接码规范化函数行为不同 | `identity.ts:80` 只去 `[\s\-_]`，`pairing.ts:259` 去所有 `[^A-Z0-9]`。`a.b` 在前者保留为 `A.B`（非法） | V4 统一为一个 |
 | E9 | 未发现 `TINY_BATCH_SIZE = 20` 与注释「50-100 为工程平衡点」矛盾 | `transfer.ts:669` vs `transfer.ts:632,636` | V4 统一 |
+| E10 | 以为阶段 2 落地的 `policy.rs` 已忠实实现 `V4-TRANSFER-MODULE` §3.2/§3.3/§3.4 三张按钮表 | **逐行对表发现 5 处不一致**：① `Lost`/`Failed` 被判为不可连接（用户困死）② `Completed`/`Failed`/`Aborted` 不可开新传输 ③ `Unknown`/`Stale` 一律提示"对方离线"（误导）④ `Failed` 被判为可中止 ⑤ `ReenableAdvanced` 挂在 `degraded_now` + 连接态上，与 §3.4「只看设备级记忆」矛盾 | ✅ 已重写 `policy.rs`，并把三张表转成**表驱动测试**（`doc_table_3_2_*`/`doc_table_3_3_*`/`doc_table_3_4_*`）—— 今后代码一旦偏离文档，测试立即失败。**教训：文档里的表格必须以测试形式存在，否则它只是注释** |
 
 ---
 
