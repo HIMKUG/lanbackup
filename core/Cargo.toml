@@ -34,7 +34,8 @@ rand = "0.10"
 sha2 = "0.11"
 hkdf = "0.12"
 pbkdf2 = "0.13"
-hmac = "0.12"
+# hmac 必须与 sha2 0.11 同属 digest 0.11 世代；0.12 走 digest 0.10，Hmac<Sha256> 无法满足 trait bound
+hmac = "0.13"
 ring = "0.17"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 base64 = "0.23"

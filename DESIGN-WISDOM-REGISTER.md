@@ -22,7 +22,7 @@
 | W2 | **`reg.exe` 子进程可能被杀软 hook 到无限期不退出**，必须 2s 超时 + `kill()` 强杀 + `"unknown-machine"` 兜底（因为 `Database::open` 在主线程调用） | `identity.rs:12-13,42-60` | core 设备标识获取 | ⬜ |
 | W3 | **OTLP/gRPC（tonic）连接会持有 Windows 加载器锁**，挂起即连锁锁死主线程。症状：主线程永久阻塞、窗口无响应，**但进程其余部分与 WebView2 渲染正常**。复用条件：专用线程 + connect timeout + 地址可配置 | `lib.rs:123-127` | 遥测层（若保留） | ⬜ |
 | W4 | **`reg.exe` 必须 `CREATE_NO_WINDOW(0x08000000)`**，否则配对/启动时闪黑框 | `identity.rs:22-23` | — | ⬜ |
-| W5 | **Windows UDP socket 会偶发性失效**，必须检测 `send_to` 失败并重建 socket，不能当网络问题处理 | `bcpd.rs:296-299` | core presence/beacon | ⬜ |
+| W5 | **Windows UDP socket 会偶发性失效**，必须检测 `send_to` 失败并重建 socket，不能当网络问题处理 | `bcpd.rs:296-299` | core presence/beacon | ⚠️ 报文层（`presence::beacon`）与重放防护（`presence::tracker`）已落地且不依赖 socket；**socket 重建策略属传输层，待阶段 4 网络栈**，届时必须落这条 |
 | W6 | **Defender 实时扫描下每次 syscall 都不便宜** → 连接码必须进程内缓存 | `identity.rs:145-148` | core identity | ⬜ |
 | W7 | 路径穿越必须按 `/` 和 `\` **双切分**：Windows 下 `a\..\..\evil` 作为单组件可绕过纯 `/` 切分 | `util.rs:58` | core path 安全 | ⬜ |
 | W8 | 必须过滤含 `:` 的组件 —— 盘符 `C:` 与 NTFS 备用数据流，`Path::join` 遇盘符会**整体替换前缀** | `util.rs:59` | core path 安全 | ⬜ |
@@ -61,7 +61,7 @@
 | S9 | **`mergeRecords` 逐字段合并，新记录缺字段时保留旧值** —— 后台巡检/UDP 探测产生的记录字段不全，覆盖写会**清空 previousKeys**，连接码刷新后历史数据永久无法解密 | `pairing.ts:125-138` | 配对记录合并 | ⬜ |
 | S10 | **`lastManifest` 必须持久化** —— 曾存在 Vue 组件状态里，App 重启后丢失 → **每次重启都退化成全量备份** | `pairing.ts:65-66` | 增量快照存储 | ⬜ |
 | S11 | **上一版本密钥滚动解密**（`previousKeys` 保留 7 天 / 最多 5 个，按 version 降序尝试）—— 连接码刷新后，已在传输中的文件仍能用旧密钥解密 | `pairing.ts:15-22,191-246` | 密钥轮换 | ⬜ |
-| S12 | **UDP 广播不得覆盖 WebSocket 连接状态** —— 两个状态源写同一对象，用 `?? existing ?? false` 三级 fallback | `discovery.ts:85-93` | 设备状态合并 | ⬜ |
+| S12 | **UDP 广播不得覆盖 WebSocket 连接状态** —— 两个状态源写同一对象，用 `?? existing ?? false` 三级 fallback | `discovery.ts:85-93` | 设备状态合并 | ✅ 从「靠 fallback 兜」升级为**结构上不可能**：在线性（`presence::PresenceTracker`）与连接态（`state::connection`）是两套独立类型、各自存储，没有共享可变对象可供覆盖。方向依赖单向固定为 `Connected ⇒ Online` |
 | S13 | **严格到齐才合并分片**（缺失或残留多于 total 都等待/失败），防旧版本残留拼接损坏 | `receive.rs:763-764` | 分片合并 | ⬜ |
 | S14 | **空 sessionId 必须显式告警**（后续 upload 全部失败且根因丢失）；**files 字段解析失败不能静默变空 map**（会伪装成"接受了 0 个"照常推进） | `scheduler.rs:769-772,779-780` | 上传准备 | ⬜ |
 
@@ -128,12 +128,12 @@
 | M19 | **SAF tree URI 必须 `takePersistableUriPermission`**，否则重启后目录不可用 | `L1494-1503` | Android 平台层 | ⬜ |
 | M20 | **SAF 无跨目录 rename** → 移动用"复制 + 删除"实现假删除 | `L1642-1693` | Android 平台层 | ⬜ |
 | M21 | **用 `DocumentFile` 遍历，不手工拼 documentId** —— 规避部分 ROM（国产）上 URI 解析失败 | `L1508-1510,L1617-1631` | Android 平台层 | ⬜ |
-| M22 | **组播收发都要持 `WifiManager.MulticastLock`（`setReferenceCounted(false)`）** —— 部分 ROM 会过滤 outgoing 组播包。**Java 的广播路径就漏了这把锁** | `L1272-1278`; 对比 `L1092-1138` | Android beacon | ⬜ |
+| M22 | **组播收发都要持 `WifiManager.MulticastLock`（`setReferenceCounted(false)`）** —— 部分 ROM 会过滤 outgoing 组播包。**Java 的广播路径就漏了这把锁** | `L1272-1278`; 对比 `L1092-1138` | Android beacon | ⬜ 待阶段 4 传输层 + 阶段 6 Android 绑定。**收与发两条路径都要持锁**（旧 Java 只在收的路径持了） |
 | M23 | **前台服务 + 通知渠道 + `FOREGROUND_SERVICE` / `POST_NOTIFICATIONS` 权限** —— 当前 manifest 完全缺失，Java 无任何 Service。手机切后台后 ServerSocket 随时被系统回收 | manifest 全缺 | Android 平台层（**新增**） | ⬜ |
 | M24 | **`WAKE_LOCK` + 电池优化豁免** —— Doze 下 socket 被断，长传中断 | 缺失 | Android 平台层（**新增**） | ⬜ |
 | M25 | **补齐 `ANDROID_PERMISSIONS.md` 要求的存储权限**（`READ_EXTERNAL_STORAGE maxSdk=32` + `READ_MEDIA_*`）—— 文档要求"手动编辑 manifest"，**这一步从未执行** | `ANDROID_PERMISSIONS.md:44-54` vs manifest | Android 平台层（**新增**） | ⬜ |
 | M26 | **切后台降频省电**：状态侦测 500ms（前台）→ 5000ms（后台），回前台恢复 | `App.vue:1655-1663` | core presence | ⬜ |
-| M27 | **已配对设备再次被发现 → 只记忆新 IP，不置在线** —— 在线状态必须由 verify 探测确认，扫描到 ≠ 建立通信（否则隐藏设备会被误标在线） | `App.vue:1494-1495` | 在线性状态机 | ⬜ |
+| M27 | **已配对设备再次被发现 → 只记忆新 IP，不置在线** —— 在线状态必须由 verify 探测确认，扫描到 ≠ 建立通信（否则隐藏设备会被误标在线） | `App.vue:1494-1495` | 在线性状态机 | ✅ `PresenceTracker::on_packet` 是**唯一**能把状态置为 `Online` 的入口，且必须同时通过 HMAC 认证 + `(ts,seq)` 严格递增 + 时钟窗口三道校验。发现/扫描不经过此入口，因此结构上无法置在线 |
 | M28 | **探针不完全可达设备降频**（每 10 轮 ≈5s 一次），成功即恢复 500ms | `App.vue:1629-1630` | core presence | ⬜ |
 | M29 | **误删防抖已移除**：配对记录只在显式解除/收到对端解除时删除，**绝不因轮询失败自动删除** | `App.vue:1627` | 配对对账 | ⬜ |
 | M30 | **冷启动日志回放**：WebView 就绪前原生侧产生的日志前端收不到，需环形缓冲 + 注册监听后回放 | `receiver.ts:753-779`; `App.vue:1429` | core 日志桥 | ⬜ |

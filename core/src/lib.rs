@@ -23,6 +23,7 @@
 pub mod crypto;
 pub mod dto;
 pub mod error;
+pub mod presence;
 pub mod server;
 pub mod state;
 pub mod transfer;
@@ -30,12 +31,22 @@ pub mod version;
 
 pub use error::{Error, ErrorCode, ErrorEnvelope, Result};
 pub use version::{Capabilities, API_PREFIX, PROTOCOL_VERSION};
-// TODO(阶段 2): pub mod server;   —— 单一 hyper 路由表（吸收 localsend 的 HTTP 管道）
-// TODO(阶段 2.5): 主算法数据面（块差异/弱校验/Merkle 校验/并发续传的 IO 编排）
-// TODO(阶段 3): pub mod schedule; —— 并发控制（tokio Semaphore）
-// TODO(阶段 5): pub mod pairing;  —— 配对、解配对、吊销、双向对账
-// TODO(阶段 4): pub mod presence; —— UDP beacon 与在线性维护（状态机在 state::presence）
-// TODO(阶段 4): pub mod sync;     —— 三路增量、manifest、archive/mirror 策略
-// TODO(阶段 5): pub mod discovery; —— 组播与子网探测
-// TODO(阶段 5): pub mod identity; —— 设备身份与连接码派生
-// TODO(阶段 6): uniffi 绑定导出
+
+// ── 已落地 ─────────────────────────────────────────────────────────────
+// 阶段 1   dto / error / version   —— 契约先行：DTO 生成 schema + golden 指纹
+// 阶段 2   state / transfer::chunk —— 三张状态机 + can() 裁决 + 分块降级引擎
+//          crypto::merkle          —— Merkle root
+// 阶段 2.4 server                  —— hyper 路由 /api/v4/*、内存会话、状态机门控
+// 阶段 2.5 crypto::merkle          —— proof/verify_piece（接收端独立验证任意 piece）
+//          transfer::chunk         —— 弱/强双校验 + ChunkDiff 三分类
+//          transfer::schedule      —— 全局信号量 12 + 重试独立配额 4 + 全抖动退避
+// 阶段 4.3 presence::beacon        —— 32B UDP beacon 报文与 HMAC 认证（纯计算部分）
+//
+// ── 待落地 ─────────────────────────────────────────────────────────────
+// TODO(阶段 2.6): 主算法 IO 编排（把 chunk/schedule/merkle 串成实际收发流水线）
+// TODO(阶段 4):   presence 传输层 —— UDP 收发、Android MulticastLock（W5/M22）
+// TODO(阶段 4):   pub mod sync;      —— 三路增量、manifest、archive/mirror 策略
+// TODO(阶段 5):   pub mod pairing;   —— 配对、解配对、吊销、双向对账
+// TODO(阶段 5):   pub mod discovery; —— 组播与子网探测
+// TODO(阶段 5):   pub mod identity;  —— 设备身份与连接码派生
+// TODO(阶段 6):   uniffi 绑定导出
