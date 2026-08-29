@@ -11,8 +11,9 @@
     "clippy": "cargo clippy --all-targets -- -D warnings",
     "fmt": "cargo fmt --all",
     "fmt:check": "cargo fmt --all -- --check",
-    "schema": "cargo build --features gen-schema",
-    "schema:check": "cargo run --bin gen-schema -- --check"
+    "schema": "cargo run --bin gen_schema",
+    "schema:check": "cargo run --bin gen_schema -- --check",
+    "schema:golden": "cargo run --bin gen_schema -- --golden"
   },
   "keywords": ["lanbackup", "rust", "core"],
   "license": "MIT"

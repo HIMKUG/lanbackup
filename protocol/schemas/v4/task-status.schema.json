@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/task-status.schema.json",
+  "title": "V4 task-status",
+  "description": "单个文件的任务终态。\n\n**终态由接收端判定** —— 数据在谁的磁盘上谁知道。 发送端心跳超时时**不允许自行判定失败**，必须先查询对端终态 （这正是\"一方认为在传输可重试、另一方认为已完成\"的直接原因）。",
+  "type": "string",
+  "enum": [
+    "queued",
+    "transferring",
+    "completed",
+    "failed",
+    "cancelled"
+  ]
+}

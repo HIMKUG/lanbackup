@@ -1,0 +1,120 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/sync-status.schema.json",
+  "title": "V4 sync-status",
+  "description": "信任对账响应。\n\n**问的不是\"你在吗\"，而是\"你还认我吗\"**。\n\n三代版本的问题：一方解除配对后，另一方弹出提示，**自己却仍然是配对的** —— 因为配对状态是本机单方面记录，没有反向确认。\n\nV4 规则：本机有效信任 = 本机记录 ∩ 对端确认。",
+  "type": "object",
+  "required": [
+    "deviceId",
+    "myTrustVersion",
+    "presence",
+    "status",
+    "youArePairedWithMe"
+  ],
+  "properties": {
+    "deviceId": {
+      "type": "string"
+    },
+    "myTrustVersion": {
+      "description": "本端信任版本号，每次配对状态变更 +1。 对端可据此判断自己的记录是否过期。",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "presence": {
+      "description": "本端的在线状态",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Presence"
+        }
+      ]
+    },
+    "status": {
+      "description": "本端视角下对端的配对状态",
+      "allOf": [
+        {
+          "$ref": "#/definitions/PairingState"
+        }
+      ]
+    },
+    "youArePairedWithMe": {
+      "description": "对端视角：我是否仍被对方视为已配对",
+      "type": "boolean"
+    }
+  },
+  "definitions": {
+    "PairingState": {
+      "description": "配对状态。\n\n`Active` 不是一次确认永久有效 —— 需要周期性**双向对账**维持 （`GET /api/v4/sync-status`）。任一方说\"不认\"，本机即进入 `Revoking`。",
+      "oneOf": [
+        {
+          "description": "未配对",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        },
+        {
+          "description": "已发起，等对端确认",
+          "type": "string",
+          "enum": [
+            "pending"
+          ]
+        },
+        {
+          "description": "已配对且双向确认有效",
+          "type": "string",
+          "enum": [
+            "active"
+          ]
+        },
+        {
+          "description": "任一方发起解除，等待对端 ack",
+          "type": "string",
+          "enum": [
+            "revoking"
+          ]
+        },
+        {
+          "description": "已解除（终态）",
+          "type": "string",
+          "enum": [
+            "revoked"
+          ]
+        }
+      ]
+    },
+    "Presence": {
+      "description": "在线性。\n\n由 UDP beacon 维护（周期 500ms，1.5s 未收到转 `Stale`，3s 转 `Offline`）。 **注意**：在线性是独立维度，与\"是否已配对\"分开 —— 三代并存的 bug 之一 就是把两者混为一谈，导致\"对方离线却可以连接\"。",
+      "oneOf": [
+        {
+          "description": "尚未探测",
+          "type": "string",
+          "enum": [
+            "unknown"
+          ]
+        },
+        {
+          "description": "在线",
+          "type": "string",
+          "enum": [
+            "online"
+          ]
+        },
+        {
+          "description": "信号不稳定（1~2 个 beacon 周期未收到）",
+          "type": "string",
+          "enum": [
+            "stale"
+          ]
+        },
+        {
+          "description": "离线",
+          "type": "string",
+          "enum": [
+            "offline"
+          ]
+        }
+      ]
+    }
+  }
+}

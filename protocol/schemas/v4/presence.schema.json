@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/presence.schema.json",
+  "title": "V4 presence",
+  "description": "在线性。\n\n由 UDP beacon 维护（周期 500ms，1.5s 未收到转 `Stale`，3s 转 `Offline`）。 **注意**：在线性是独立维度，与\"是否已配对\"分开 —— 三代并存的 bug 之一 就是把两者混为一谈，导致\"对方离线却可以连接\"。",
+  "oneOf": [
+    {
+      "description": "尚未探测",
+      "type": "string",
+      "enum": [
+        "unknown"
+      ]
+    },
+    {
+      "description": "在线",
+      "type": "string",
+      "enum": [
+        "online"
+      ]
+    },
+    {
+      "description": "信号不稳定（1~2 个 beacon 周期未收到）",
+      "type": "string",
+      "enum": [
+        "stale"
+      ]
+    },
+    {
+      "description": "离线",
+      "type": "string",
+      "enum": [
+        "offline"
+      ]
+    }
+  ]
+}

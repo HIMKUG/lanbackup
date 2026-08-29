@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/handshake.verify.schema.json",
+  "title": "V4 handshake.verify",
+  "type": "object",
+  "required": [
+    "clientEphPub",
+    "clientNonce",
+    "deviceId",
+    "requestId",
+    "serverNonce"
+  ],
+  "properties": {
+    "challengeToken": {
+      "description": "路径 B：`challenge` 阶段签发的 JWT",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "clientEphPub": {
+      "type": "string"
+    },
+    "clientNonce": {
+      "type": "string"
+    },
+    "deviceId": {
+      "type": "string"
+    },
+    "hmac": {
+      "description": "路径 A：HMAC 标签（用连接码派生的 secret 签名，连接码本身绝不上线）",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "requestId": {
+      "type": "string"
+    },
+    "serverNonce": {
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,86 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/session.prepare.schema.json",
+  "title": "V4 session.prepare",
+  "type": "object",
+  "required": [
+    "deviceId",
+    "files",
+    "sessionId"
+  ],
+  "properties": {
+    "deviceId": {
+      "type": "string"
+    },
+    "files": {
+      "description": "以 `fileId` 为 key 的字典（**不是数组**，v2.2 协议要求）",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/FileMeta"
+      }
+    },
+    "sessionId": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "FileMeta": {
+      "description": "待传输文件的元数据。\n\n**文件名只在此阶段携带** —— upload 阶段不带 fileName， 接收端自行从会话中查（LocalSend v2 数据面最容易实现错的一点）。",
+      "type": "object",
+      "required": [
+        "fileId",
+        "fileName",
+        "mtime",
+        "relPath",
+        "size"
+      ],
+      "properties": {
+        "fileId": {
+          "description": "文件唯一 ID",
+          "type": "string"
+        },
+        "fileName": {
+          "type": "string"
+        },
+        "merkleRoot": {
+          "description": "Merkle 根（主算法扩展字段，大文件才有）",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mtime": {
+          "description": "修改时间（毫秒）。\n\n**接收端必须保留此值** —— 一旦被重置为写入时间， 发送端三路对比会永久误判为变更，每次全量重传 （原 `transfer.ts:187`）。",
+          "type": "integer",
+          "format": "int64"
+        },
+        "pieceHashes": {
+          "description": "每个 piece 的 SHA-256（piece = 4MB）",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "relPath": {
+          "description": "相对路径（统一 `/` 分隔，已去掉 `./` 前缀与结尾 `/`）",
+          "type": "string"
+        },
+        "sha256": {
+          "description": "整个文件的 SHA-256（hex），可选",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    }
+  }
+}

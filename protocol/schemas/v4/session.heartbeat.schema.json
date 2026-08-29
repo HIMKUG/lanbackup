@@ -1,0 +1,107 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/session.heartbeat.schema.json",
+  "title": "V4 session.heartbeat",
+  "type": "object",
+  "required": [
+    "bitmapVersion",
+    "phase",
+    "sessionId"
+  ],
+  "properties": {
+    "bitmapVersion": {
+      "description": "本端权威块位图版本号",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "phase": {
+      "description": "本端当前阶段（用于对账）",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TransferPhase"
+        }
+      ]
+    },
+    "sessionId": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "TransferPhase": {
+      "description": "传输会话阶段。\n\n**这是双方共识，不是本地字段** —— 阶段变更需对端 ack （`V4-TRANSFER-MODULE.md` §2.3）。",
+      "oneOf": [
+        {
+          "description": "无会话",
+          "type": "string",
+          "enum": [
+            "idle"
+          ]
+        },
+        {
+          "description": "建立会话、能力协商、选择算法",
+          "type": "string",
+          "enum": [
+            "preparing"
+          ]
+        },
+        {
+          "description": "拉取对端权威块位图（仅主算法）",
+          "type": "string",
+          "enum": [
+            "reconciling"
+          ]
+        },
+        {
+          "description": "传块中",
+          "type": "string",
+          "enum": [
+            "transferring"
+          ]
+        },
+        {
+          "description": "心跳超时/网络中断，等待重试或对账",
+          "type": "string",
+          "enum": [
+            "paused"
+          ]
+        },
+        {
+          "description": "正在从主算法切换到基础算法",
+          "type": "string",
+          "enum": [
+            "degrading"
+          ]
+        },
+        {
+          "description": "整体校验",
+          "type": "string",
+          "enum": [
+            "verifying"
+          ]
+        },
+        {
+          "description": "已完成（终态）",
+          "type": "string",
+          "enum": [
+            "completed"
+          ]
+        },
+        {
+          "description": "失败（终态）",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        },
+        {
+          "description": "已中止（终态）",
+          "type": "string",
+          "enum": [
+            "aborted"
+          ]
+        }
+      ]
+    }
+  }
+}

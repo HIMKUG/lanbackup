@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/handshake.challenge.schema.json",
+  "title": "V4 handshake.challenge",
+  "type": "object",
+  "required": [
+    "clientNonce",
+    "deviceId",
+    "requestId"
+  ],
+  "properties": {
+    "clientNonce": {
+      "description": "客户端一次性随机数（32 字节 hex）",
+      "type": "string"
+    },
+    "deviceId": {
+      "type": "string"
+    },
+    "requestId": {
+      "description": "幂等键。重试必须复用同一 `requestId`，服务端据此去重 （解决\"握手发出去就失联，不知道成没成\"）。",
+      "type": "string"
+    }
+  }
+}

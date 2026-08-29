@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/unpair-request.schema.json",
+  "title": "V4 unpair-request",
+  "type": "object",
+  "required": [
+    "deviceId",
+    "requestId",
+    "signature"
+  ],
+  "properties": {
+    "deviceId": {
+      "type": "string"
+    },
+    "requestId": {
+      "type": "string"
+    },
+    "signature": {
+      "description": "ECDSA P-256 签名（ASN.1 DER base64url），用配对时交换的公钥验签",
+      "type": "string"
+    }
+  }
+}

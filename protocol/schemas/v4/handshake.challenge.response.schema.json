@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/handshake.challenge.response.schema.json",
+  "title": "V4 handshake.challenge.response",
+  "type": "object",
+  "required": [
+    "challengeToken",
+    "requestId",
+    "serverEphPub",
+    "serverNonce"
+  ],
+  "properties": {
+    "challengeToken": {
+      "description": "JWT challenge token，`exp = iat + 300`\n\n**注意**：`exp` 仅作卫生约束（日志/时钟漂移发现）， 绝不用于拒绝请求 —— 原 `protocol/README.md:24` 明确放弃了 `X-Timestamp ±容差` 校验，因为双端时钟差会导致握手失败。",
+      "type": "string"
+    },
+    "requestId": {
+      "type": "string"
+    },
+    "serverEphPub": {
+      "description": "服务端临时 ECDH 公钥（base64url）",
+      "type": "string"
+    },
+    "serverNonce": {
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/move-to-delete.schema.json",
+  "title": "V4 move-to-delete",
+  "description": "假删除请求。\n\n不真删，移到 `delete/` 目录 —— 误删不可逆，镜像模式的删除必须是假的。\n\n**Android 实现注意**：SAF 没有跨目录 rename，必须用\"复制 + 删除\"实现 （原 `LocalReceiverPlugin.java:1642-1693`）。",
+  "type": "object",
+  "required": [
+    "deviceId",
+    "relPaths"
+  ],
+  "properties": {
+    "deviceId": {
+      "type": "string"
+    },
+    "relPaths": {
+      "description": "相对路径列表",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

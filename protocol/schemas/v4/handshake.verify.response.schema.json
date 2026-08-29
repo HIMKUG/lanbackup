@@ -1,0 +1,85 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/handshake.verify.response.schema.json",
+  "title": "V4 handshake.verify.response",
+  "type": "object",
+  "required": [
+    "capabilities",
+    "deviceId",
+    "requestId",
+    "status"
+  ],
+  "properties": {
+    "alias": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "capabilities": {
+      "description": "协商后的能力（两端能力按位与）",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Capabilities"
+        }
+      ]
+    },
+    "deviceId": {
+      "type": "string"
+    },
+    "requestId": {
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/definitions/PairingState"
+    }
+  },
+  "definitions": {
+    "Capabilities": {
+      "description": "能力位图",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "PairingState": {
+      "description": "配对状态。\n\n`Active` 不是一次确认永久有效 —— 需要周期性**双向对账**维持 （`GET /api/v4/sync-status`）。任一方说\"不认\"，本机即进入 `Revoking`。",
+      "oneOf": [
+        {
+          "description": "未配对",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        },
+        {
+          "description": "已发起，等对端确认",
+          "type": "string",
+          "enum": [
+            "pending"
+          ]
+        },
+        {
+          "description": "已配对且双向确认有效",
+          "type": "string",
+          "enum": [
+            "active"
+          ]
+        },
+        {
+          "description": "任一方发起解除，等待对端 ack",
+          "type": "string",
+          "enum": [
+            "revoking"
+          ]
+        },
+        {
+          "description": "已解除（终态）",
+          "type": "string",
+          "enum": [
+            "revoked"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/diff-mismatch.schema.json",
+  "title": "V4 diff-mismatch",
+  "description": "diff 端点的 HTTP 状态码语义（**非显而易见，必须照此实现**）：\n\n| 状态码 | 含义 | |---|---| | 206 | 块存在且 ETag 匹配 | | 412 | 块存在但 SHA-256 不匹配（NACK），响应带 `expected` / `actual` | | 416 | Range 越界，响应带 `Content-Range: bytes * /{total}` | | 200 | ETag 不匹配，文件已变，需全量重传 |\n\n把\"存在性\"和\"正确性\"用两个不同状态码分开表达， 发送端才能区分\"没传过\"和\"传过但坏了\"。",
+  "type": "object",
+  "required": [
+    "actual",
+    "expected"
+  ],
+  "properties": {
+    "actual": {
+      "description": "实际的 SHA-256",
+      "type": "string"
+    },
+    "expected": {
+      "description": "期望的 SHA-256",
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/error-code.schema.json",
+  "title": "V4 error-code",
+  "description": "错误码。取值沿用协议契约已有的错误码集合。",
+  "oneOf": [
+    {
+      "type": "string",
+      "enum": [
+        "INVALID_REQUEST",
+        "INVALID_CODE",
+        "HMAC_MISMATCH",
+        "UNTRUSTED",
+        "RATE_LIMIT_EXCEEDED",
+        "NOT_FOUND",
+        "VERSION_UNSUPPORTED",
+        "UNKNOWN_DEVICE",
+        "TOKEN_EXPIRED"
+      ]
+    },
+    {
+      "description": "对端不具备请求的能力",
+      "type": "string",
+      "enum": [
+        "CAPABILITY_UNSUPPORTED"
+      ]
+    },
+    {
+      "description": "传输已中止（用户中止或连接断开）",
+      "type": "string",
+      "enum": [
+        "ABORTED"
+      ]
+    },
+    {
+      "description": "会话无进展超时",
+      "type": "string",
+      "enum": [
+        "STALLED"
+      ]
+    },
+    {
+      "description": "内部错误",
+      "type": "string",
+      "enum": [
+        "INTERNAL"
+      ]
+    }
+  ]
+}

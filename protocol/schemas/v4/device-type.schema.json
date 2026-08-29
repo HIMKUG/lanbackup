@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/device-type.schema.json",
+  "title": "V4 device-type",
+  "description": "设备类型。取值沿用 LocalSend 生态的既有语义，便于与上游互通。",
+  "type": "string",
+  "enum": [
+    "mobile",
+    "desktop",
+    "web",
+    "headless",
+    "server"
+  ]
+}

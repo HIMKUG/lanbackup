@@ -1,0 +1,24 @@
+{
+  "algorithm": "SHA-256",
+  "description": "V4 契约指纹：全部 protocol/schemas/v4/*.schema.json（按文件名排序、canonical JSON）拼接后的 SHA-256。任一 DTO 变更导致 schema 变化，指纹必变，CI 比对即报警。由 `gen_schema --golden` 生成。",
+  "endpoints": [
+    "GET /api/v4/probe",
+    "POST /api/v4/handshake/challenge",
+    "POST /api/v4/handshake/verify",
+    "GET /api/v4/handshake/status",
+    "POST /api/v4/pair/unpair",
+    "POST /api/v4/pair/revoke",
+    "POST /api/v4/session/register",
+    "POST /api/v4/session/prepare",
+    "POST /api/v4/session/chunk-diff",
+    "GET /api/v4/session/{id}/phase",
+    "POST /api/v4/session/heartbeat",
+    "POST /api/v4/session/abort",
+    "GET /api/v4/sync/status",
+    "POST /api/v4/sync/dir",
+    "POST /api/v4/sync/move-to-delete",
+    "POST /api/v4/sync/disconnect"
+  ],
+  "schemaCount": 45,
+  "schemaHash": "501a73d7b9b65f2450ddeeb858da636bf974009a5a58704bf6ecf210c450f1c7"
+}

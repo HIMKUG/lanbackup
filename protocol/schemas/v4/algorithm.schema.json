@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/algorithm.schema.json",
+  "title": "V4 algorithm",
+  "description": "当前生效的算法",
+  "oneOf": [
+    {
+      "description": "主算法：块级差异 + Merkle + 断点续传 + 并发",
+      "type": "string",
+      "enum": [
+        "advanced"
+      ]
+    },
+    {
+      "description": "基础算法：16MB 分块顺序传输 + 简单续传",
+      "type": "string",
+      "enum": [
+        "basic"
+      ]
+    }
+  ]
+}

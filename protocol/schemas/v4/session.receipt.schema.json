@@ -1,0 +1,84 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/session.receipt.schema.json",
+  "title": "V4 session.receipt",
+  "type": "object",
+  "required": [
+    "sessionId",
+    "tasks"
+  ],
+  "properties": {
+    "sessionId": {
+      "type": "string"
+    },
+    "tasks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TaskReceipt"
+      }
+    }
+  },
+  "definitions": {
+    "TaskReceipt": {
+      "type": "object",
+      "required": [
+        "fileId",
+        "relPath",
+        "status"
+      ],
+      "properties": {
+        "fileId": {
+          "type": "string"
+        },
+        "finalName": {
+          "description": "因冲突重命名后的最终文件名",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mtime": {
+          "description": "接收端保留的 mtime（必须等于发送端的 mtime）",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "reason": {
+          "description": "失败原因",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "relPath": {
+          "type": "string"
+        },
+        "size": {
+          "description": "接收端实际落盘的大小",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "status": {
+          "$ref": "#/definitions/TaskStatus"
+        }
+      }
+    },
+    "TaskStatus": {
+      "description": "单个文件的任务终态。\n\n**终态由接收端判定** —— 数据在谁的磁盘上谁知道。 发送端心跳超时时**不允许自行判定失败**，必须先查询对端终态 （这正是\"一方认为在传输可重试、另一方认为已完成\"的直接原因）。",
+      "type": "string",
+      "enum": [
+        "queued",
+        "transferring",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    }
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/chunk-diff.schema.json",
+  "title": "V4 chunk-diff",
+  "description": "块差异分析结果。\n\n四类语义（原 `scheduler.ts:21-29`）： - `missing`：接收端完全没有 - `matched`：**弱校验与强校验都匹配** - `mismatched`：**弱校验命中但 SHA-256 不匹配** —— 该块写坏了， 只需重传这一块而不是整个文件",
+  "type": "object",
+  "required": [
+    "fileComplete",
+    "fileId",
+    "sessionId"
+  ],
+  "properties": {
+    "fileComplete": {
+      "description": "所有块都已到齐且校验通过",
+      "type": "boolean"
+    },
+    "fileId": {
+      "type": "string"
+    },
+    "matchedChunks": {
+      "description": "弱校验 + 强校验都匹配的块",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0.0
+      }
+    },
+    "mismatchedChunks": {
+      "description": "弱校验命中但 SHA-256 不匹配的块",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0.0
+      }
+    },
+    "missingChunks": {
+      "description": "接收端完全没有的块",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0.0
+      }
+    },
+    "sessionId": {
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/unpair.schema.json",
+  "title": "V4 unpair",
+  "type": "object",
+  "required": [
+    "deviceId",
+    "requestId",
+    "signature"
+  ],
+  "properties": {
+    "deviceId": {
+      "type": "string"
+    },
+    "requestId": {
+      "type": "string"
+    },
+    "revokeToken": {
+      "description": "吊销令牌，30 天有效期。对端离线时用它兜底解除",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "signature": {
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/sync-strategy.schema.json",
+  "title": "V4 sync-strategy",
+  "description": "同步策略。\n\n**archive（默认）只增不删**：对端已删除的文件不自动补回 —— 删除视为用户的有意行为，只告警不复活。 备份工具若复活用户手动删掉的文件，用户就永远删不掉东西了。\n\n**mirror 完整镜像**：补传全部对端缺失，并清理对端多余文件。 删除语义有风险，**必须由用户显式开启**。",
+  "oneOf": [
+    {
+      "description": "只增不删（默认）",
+      "type": "string",
+      "enum": [
+        "archive"
+      ]
+    },
+    {
+      "description": "完整镜像，含删除语义",
+      "type": "string",
+      "enum": [
+        "mirror"
+      ]
+    }
+  ]
+}

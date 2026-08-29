@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/degrade-reason.schema.json",
+  "title": "V4 degrade-reason",
+  "description": "降级原因码。UI 必须显示\"当前算法 + 降级原因 + 已传进度处置\"。",
+  "oneOf": [
+    {
+      "description": "对端不具备主算法能力。稳定原因，**不**记入设备级降级记忆 （对端升级后自然恢复）。",
+      "type": "string",
+      "enum": [
+        "PEER_NO_CAPABILITY"
+      ]
+    },
+    {
+      "description": "主算法初始化失败（Merkle 构建 / 密钥派生 / 端点异常）",
+      "type": "string",
+      "enum": [
+        "INIT_FAILED"
+      ]
+    },
+    {
+      "description": "对账连续失败",
+      "type": "string",
+      "enum": [
+        "RECONCILE_FAILED"
+      ]
+    },
+    {
+      "description": "心跳超时后对账重试耗尽",
+      "type": "string",
+      "enum": [
+        "RETRY_EXHAUSTED"
+      ]
+    },
+    {
+      "description": "连续块失败达到阈值",
+      "type": "string",
+      "enum": [
+        "CHUNK_RETRY_EXHAUSTED"
+      ]
+    },
+    {
+      "description": "整体校验反复失败",
+      "type": "string",
+      "enum": [
+        "VERIFY_FAILED"
+      ]
+    }
+  ]
+}

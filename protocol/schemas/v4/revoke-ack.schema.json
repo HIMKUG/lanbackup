@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/revoke-ack.schema.json",
+  "title": "V4 revoke-ack",
+  "type": "object",
+  "required": [
+    "deviceId",
+    "pairingRevoked",
+    "requestId",
+    "revokeToken"
+  ],
+  "properties": {
+    "deviceId": {
+      "type": "string"
+    },
+    "pairingRevoked": {
+      "description": "对端是否已确认解除",
+      "type": "boolean"
+    },
+    "requestId": {
+      "type": "string"
+    },
+    "revokeToken": {
+      "type": "string"
+    }
+  }
+}

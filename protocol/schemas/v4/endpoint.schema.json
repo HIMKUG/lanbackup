@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/endpoint.schema.json",
+  "title": "V4 endpoint",
+  "description": "设备上线的网络地址信息。\n\n**多通道容错**（原 `pairing.ts:32-33`）：同一设备可能同时有多个 IP （2.4G/5G 双频、有线+无线、路由器 DHCP 重分配），只记一个必然连不上。",
+  "type": "object",
+  "required": [
+    "ip",
+    "port"
+  ],
+  "properties": {
+    "ip": {
+      "description": "最近一次可达的 IP",
+      "type": "string"
+    },
+    "ips": {
+      "description": "历史可达 IP，最近在前，最多 5 个",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "port": {
+      "description": "服务端口",
+      "type": "integer",
+      "format": "uint16",
+      "minimum": 0.0
+    }
+  }
+}

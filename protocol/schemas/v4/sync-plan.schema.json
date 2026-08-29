@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/sync-plan.schema.json",
+  "title": "V4 sync-plan",
+  "description": "三路对比（A 当前 / A 上次快照 / B 当前）的传输集合。\n\n三类语义不同，处置策略也不同： - `added`   —— A 新增 - `changed` —— A 修改过 - `residual`—— **B 端存在但 size 不一致** = 残留/损坏/部分传输\n\n`residual` 单独拎出来当\"变更\"处理是关键：只按\"存在与否\"判断， 上次传输中断留下的半截文件永远不会被修复（原 `sync.ts:97-100`）。",
+  "type": "object",
+  "required": [
+    "absentOnPeer",
+    "added",
+    "changed",
+    "healMissing",
+    "peerExtra",
+    "residual"
+  ],
+  "properties": {
+    "absentOnPeer": {
+      "description": "B 端已删除但 A 端仍在（archive 下仅告警，mirror 下补回）",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "added": {
+      "description": "A 端新增",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "changed": {
+      "description": "A 端变更",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "healMissing": {
+      "description": "archive 策略下的自愈补全： **只补上次快照里存在过**的对端缺失文件 —— 之前备份过、 对端误删的重新推送；从未备份过的仍不补，尊重\"只增不删\"。",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "peerExtra": {
+      "description": "mirror 策略下 B 端多余、需清理的文件。\n\n**注意**：生成时必须排除 `delete/` 与 `delete\\` 前缀 —— moveToDelete 后文件仍留在 delete 文件夹，若仍算\"对端多余\" 会导致镜像模式**无限弹确认框**（原 `sync.ts:131-137`，实测问题5）。",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "residual": {
+      "description": "B 端有但 size 不一致（残留/损坏）",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

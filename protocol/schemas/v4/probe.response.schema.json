@@ -1,0 +1,162 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/probe.response.schema.json",
+  "title": "V4 probe.response",
+  "description": "probe 响应。\n\n三代版本的响应里 `staticPub` 与 `publicKey` 两个字段并存且大小写不同， V4 合并为单一的 `staticPub`。",
+  "type": "object",
+  "required": [
+    "alias",
+    "capabilities",
+    "deviceId",
+    "deviceType",
+    "port",
+    "protocolVersion",
+    "serverNonce",
+    "staticPub"
+  ],
+  "properties": {
+    "alias": {
+      "description": "设备显示名",
+      "type": "string"
+    },
+    "capabilities": {
+      "description": "能力位图（u32 位掩码）。取值见 `version::CAP_*` 常量。",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Capabilities"
+        }
+      ]
+    },
+    "deviceId": {
+      "description": "设备公开标识（**不是连接码**）。\n\n安全约束：连接码 = 加密密钥材料，绝不上线。广播与 info/probe 响应 一律只带公开 deviceId（原 `pairing.ts:1-11`、`backup.ts:187-188`）。",
+      "type": "string"
+    },
+    "deviceType": {
+      "$ref": "#/definitions/DeviceType"
+    },
+    "endpoint": {
+      "description": "网络地址",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Endpoint"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "port": {
+      "description": "服务端口",
+      "type": "integer",
+      "format": "uint16",
+      "minimum": 0.0
+    },
+    "presence": {
+      "description": "本端视角下**调用方**的在线状态",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Presence"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "protocolVersion": {
+      "description": "协议版本，固定为 `PROTOCOL_VERSION`",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "serverNonce": {
+      "description": "服务端一次性随机数（32 字节 hex）。路径 A 配对的密钥材料之一。",
+      "type": "string"
+    },
+    "staticPub": {
+      "description": "设备长期静态公钥（P-256，SEC1 未压缩，base64url）。\n\n编码必须与 Java `Key.getEncoded()` / Rust `p256` crate 一致 （原 `protocol/README.md:113`）。",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "Capabilities": {
+      "description": "能力位图",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "DeviceType": {
+      "description": "设备类型。取值沿用 LocalSend 生态的既有语义，便于与上游互通。",
+      "type": "string",
+      "enum": [
+        "mobile",
+        "desktop",
+        "web",
+        "headless",
+        "server"
+      ]
+    },
+    "Endpoint": {
+      "description": "设备上线的网络地址信息。\n\n**多通道容错**（原 `pairing.ts:32-33`）：同一设备可能同时有多个 IP （2.4G/5G 双频、有线+无线、路由器 DHCP 重分配），只记一个必然连不上。",
+      "type": "object",
+      "required": [
+        "ip",
+        "port"
+      ],
+      "properties": {
+        "ip": {
+          "description": "最近一次可达的 IP",
+          "type": "string"
+        },
+        "ips": {
+          "description": "历史可达 IP，最近在前，最多 5 个",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "port": {
+          "description": "服务端口",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Presence": {
+      "description": "在线性。\n\n由 UDP beacon 维护（周期 500ms，1.5s 未收到转 `Stale`，3s 转 `Offline`）。 **注意**：在线性是独立维度，与\"是否已配对\"分开 —— 三代并存的 bug 之一 就是把两者混为一谈，导致\"对方离线却可以连接\"。",
+      "oneOf": [
+        {
+          "description": "尚未探测",
+          "type": "string",
+          "enum": [
+            "unknown"
+          ]
+        },
+        {
+          "description": "在线",
+          "type": "string",
+          "enum": [
+            "online"
+          ]
+        },
+        {
+          "description": "信号不稳定（1~2 个 beacon 周期未收到）",
+          "type": "string",
+          "enum": [
+            "stale"
+          ]
+        },
+        {
+          "description": "离线",
+          "type": "string",
+          "enum": [
+            "offline"
+          ]
+        }
+      ]
+    }
+  }
+}

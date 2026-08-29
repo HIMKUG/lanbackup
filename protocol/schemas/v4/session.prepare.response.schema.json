@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/session.prepare.response.schema.json",
+  "title": "V4 session.prepare.response",
+  "type": "object",
+  "required": [
+    "capabilities",
+    "files",
+    "sessionId"
+  ],
+  "properties": {
+    "capabilities": {
+      "description": "协商后的能力。对端无 `CAP_ADVANCED` 时调用方必须直接用基础算法。",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Capabilities"
+        }
+      ]
+    },
+    "files": {
+      "description": "`fileId` → 上传 token（**值是纯字符串，不是对象**）",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "sessionId": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "Capabilities": {
+      "description": "能力位图",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  }
+}

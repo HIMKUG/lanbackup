@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/manifest-entry.schema.json",
+  "title": "V4 manifest-entry",
+  "description": "清单中的单个文件条目。\n\n**判据是 mtime + size，不是内容哈希** —— 这是刻意的取舍： 手机端 CPU 弱，相册几万文件算内容哈希会把扫描从秒级拖到分钟级 （原 `sync.ts:5`）。\n\n已知限制：同 path 同 size 但内容损坏的文件无法用 size 检出。",
+  "type": "object",
+  "required": [
+    "mtime",
+    "size"
+  ],
+  "properties": {
+    "mtime": {
+      "description": "修改时间（**毫秒**，与 shared-core 一致）",
+      "type": "integer",
+      "format": "int64"
+    },
+    "size": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    }
+  }
+}

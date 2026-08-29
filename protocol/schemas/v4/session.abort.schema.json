@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/session.abort.schema.json",
+  "title": "V4 session.abort",
+  "type": "object",
+  "required": [
+    "sessionId"
+  ],
+  "properties": {
+    "reason": {
+      "description": "中止原因，用于 UI 提示",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sessionId": {
+      "type": "string"
+    }
+  }
+}

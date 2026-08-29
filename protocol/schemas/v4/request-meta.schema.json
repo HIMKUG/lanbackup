@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/request-meta.schema.json",
+  "title": "V4 request-meta",
+  "description": "所有响应的公共信封字段。\n\n说明：`requestId` 用于全链路追踪（对齐 `protocol/README.md` 的 `X-Request-Id` 约定），错误响应由 `error::ErrorEnvelope` 单独定义。",
+  "type": "object",
+  "properties": {
+    "requestId": {
+      "description": "全链路追踪 ID，由调用方生成，服务端原样回显",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/chunk-status.response.schema.json",
+  "title": "V4 chunk-status.response",
+  "type": "object",
+  "required": [
+    "fileComplete",
+    "nextChunk",
+    "receivedChunks"
+  ],
+  "properties": {
+    "fileComplete": {
+      "description": "文件是否已完整。\n\nJava 侧此字段恒为 false，从不告诉对端\"文件已完整\"。",
+      "type": "boolean"
+    },
+    "nextChunk": {
+      "description": "**第一个缺失块的索引**（不是已收块数）。\n\n三代实现的 Java 侧返回 `chunks.length()`，与 golden 语义 （第一个缺失片）漂移，会导致发送端跳片。",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "receivedChunks": {
+      "description": "已收到的块索引",
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0.0
+      }
+    }
+  }
+}

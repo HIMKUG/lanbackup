@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://lanbackup/schemas/v4/session.verify.response.schema.json",
+  "title": "V4 session.verify.response",
+  "type": "object",
+  "required": [
+    "fileId"
+  ],
+  "properties": {
+    "fileId": {
+      "type": "string"
+    },
+    "reason": {
+      "description": "校验失败时返回原因",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sha256": {
+      "description": "校验通过时返回实际 SHA-256",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

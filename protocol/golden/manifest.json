@@ -1,8 +1,9 @@
 {
-  "schemaHash": "PENDING_FIRST_CAPTURE",
-  "description": "契约指纹：协议 Schema 序列化后的 SHA-256。契约一旦变更，旧 Golden File 全部失效，CI 立即报警。首次抓取真实响应后回填。",
-  "capturedAt": null,
-  "endpoints": [
+  "supersededBy": "protocol/schemas/v4/golden-manifest.json",
+  "note": "本目录为 V3 / localsend v2 时代的 golden file，已被 V4「契约即代码」取代。V4 的契约指纹见 protocol/schemas/v4/golden-manifest.json（由 core/src/bin/gen_schema.rs 的 --golden 生成，schemaHash 为真实 SHA-256，不再为 PENDING_FIRST_CAPTURE）。本目录下的 v2 文件将在 V4 阶段 2 删除。",
+  "oldSchemaHash": "PENDING_FIRST_CAPTURE",
+  "oldDescription": "契约指纹：协议 Schema 序列化后的 SHA-256。契约一旦变更，旧 Golden File 全部失效，CI 立即报警。首次抓取真实响应后回填。",
+  "oldEndpoints": [
     "GET /api/v3/probe",
     "POST /api/v3/pair/initiate",
     "GET /api/v3/pair/status",
