@@ -347,15 +347,10 @@ fn algo_name(a: Algorithm) -> &'static str {
     }
 }
 
+/// 原因码取自 [`DegradeReason::code`] —— **不在此另写一份 match**，
+/// 否则 HTTP 层与 UI/日志层会各说一套（登记表 E10）。
 fn degrade_name(d: DegradeReason) -> &'static str {
-    match d {
-        DegradeReason::PeerNoCapability => "PEER_NO_CAPABILITY",
-        DegradeReason::InitFailed => "INIT_FAILED",
-        DegradeReason::ReconcileFailed => "RECONCILE_FAILED",
-        DegradeReason::RetryExhausted => "RETRY_EXHAUSTED",
-        DegradeReason::ChunkRetryExhausted => "CHUNK_RETRY_EXHAUSTED",
-        DegradeReason::VerifyFailed => "VERIFY_FAILED",
-    }
+    d.code()
 }
 
 /// 将 `Error` 转换为 HTTP 响应（留给上层 service 包装）

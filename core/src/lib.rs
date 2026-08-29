@@ -40,7 +40,10 @@ pub use version::{Capabilities, API_PREFIX, PROTOCOL_VERSION};
 // 阶段 2.5 crypto::merkle          —— proof/verify_piece（接收端独立验证任意 piece）
 //          transfer::chunk         —— 弱/强双校验 + ChunkDiff 三分类
 //          transfer::schedule      —— 全局信号量 12 + 重试独立配额 4 + 全抖动退避
+// 阶段 3   state::policy           —— 按钮可用性与文档 §3 三张表逐行对齐（表驱动测试）
+// 阶段 4.1 transfer::degrade       —— D1-D6 降级判定 + 设备级记忆 + UI 可见性快照
 // 阶段 4.3 presence::beacon        —— 32B UDP beacon 报文与 HMAC 认证（纯计算部分）
+//          presence::tracker       —— (ts,seq) 单调水位重放防护 + 在线性衰减
 //
 // ── 待落地 ─────────────────────────────────────────────────────────────
 // TODO(阶段 2.6): 主算法 IO 编排（把 chunk/schedule/merkle 串成实际收发流水线）

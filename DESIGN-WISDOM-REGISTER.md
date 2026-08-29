@@ -66,6 +66,9 @@
 | S14 | **空 sessionId 必须显式告警**（后续 upload 全部失败且根因丢失）；**files 字段解析失败不能静默变空 map**（会伪装成"接受了 0 个"照常推进） | `scheduler.rs:769-772,779-780` | 上传准备 | ⬜ |
 | S15 | **禁止把用户困死在终态** —— 任何"只在健康态才放开操作"的裁决都要反问：不健康时用户拿什么自救？① 连接 `Lost`/`Failed` 必须仍可**重连**（否则唯一出路是重启 App）② 传输 `Completed`/`Failed`/`Aborted` 必须仍可**开新传输**（否则第一次传完就报废）③ 恢复类操作（重新启用高级算法）不得依赖连接态，离线也要能改偏好 | V4 自查（阶段 2 `policy.rs` 初版，无旧版对应） | `state/policy.rs` + `state/transfer.rs::allows_start` | ✅ 已修正并用表驱动测试锁死（`user_is_never_stranded_after_connection_loss`、`can_start_new_transfer_after_settled`、`reenable_advanced_works_while_disconnected`） |
 | S16 | **可用性裁决必须回答"点下去真的能走通吗"** —— `can()` 说可用、但状态机没有合法事件序列到达目标态，等于换一种方式静默失败。做法：让裁决暴露 `retry_events()`/`start_events()` 事件序列，并用测试把序列**真的喂进状态机**验证可达 | V4 自查（同上） | `state/transfer.rs::{retry_events,start_events}` | ✅ `retry_event_sequences_are_actually_legal` / `enabled_actions_have_legal_state_machine_paths` |
+| S17 | **不得因用户的正常操作而惩罚用户** —— 设备级降级记忆只统计「主算法有能力但跑不通」。用户主动中止、对端断开、App 退出都必须记为 `Inconclusive`：**既不计数也不清零**。若把它们算作失败，用户连点三次取消就永久失去主算法，且毫无提示，这类 bug 几乎不可能被投诉定位 | V4 自查（§4.3 记忆机制） | `transfer/degrade.rs::SessionOutcome` | ✅ `user_abort_and_peer_loss_must_not_disable_advanced` |
+| S18 | **迟到信号不得污染已定局会话** —— 阈值型判定（连续 N 次失败）必须**先做状态准入、再动计数器**。反序写法下，会话 Aborted 后到达的失败信号会把"离降级还差 2 次"的痕迹留在计数器里 | V4 自查（本次由测试抓到） | `transfer/degrade.rs::can_degrade_from` 前置门 | ✅ `ignored_signals_do_not_pollute_the_streak_counters` |
+| S19 | **人工恢复必须连计数一起清** —— 只清 `preferBasic` 而保留连续失败计数，下一次失败立刻又达阈值，「重新启用主算法」按钮形同虚设。同理，记忆生效后的 basic 会话**不得继续计数**，否则记忆自我强化成永久状态 | V4 自查（§4.3 人工恢复） | `transfer/degrade.rs::DegradeMemory::clear` | ✅ `manual_clear_also_zeroes_streak` / `skipped_advanced_sessions_do_not_reinforce_memory` |
 
 ---
 
@@ -93,7 +96,7 @@
 | A18 | **冲突处理：绝不覆盖、绝不弹窗**，由接收端按 `原名_MMDDhhmmss.扩展名` 重命名。局域网备份常在无人值守时跑，弹窗会挂死流程。宁可多一份副本，不可静默丢数据 | `conflict.ts:1-7` | core 冲突处理 | ⬜ |
 | A19 | **冲突的幂等跳过**：同名且 size/mtime 完全一致 → 视为已存在不冲突（否则上次中断重试会产生 `_0815234500` 副本） | `conflict.ts:35-42` | core 冲突处理 | ⬜ |
 | A20 | **心跳失败不阻断传输**（catch 只 log 不 rethrow）—— 心跳是尽力而为，心跳失败 ≠ 传输失败，否则弱网抖动会误杀大传输 | `transfer.ts:533-554` | core 心跳 | ⬜ |
-| A21 | **能力协商用显式响应头而非版本号猜测**，且要求**完全匹配**才启用 —— 宁可降级也不让半兼容的实现跑出静默数据损坏 | `scheduler.ts:539-560` | V4 能力位图 | ⬜ |
+| A21 | **能力协商用显式响应头而非版本号猜测**，且要求**完全匹配**才启用 —— 宁可降级也不让半兼容的实现跑出静默数据损坏 | `scheduler.ts:539-560` | V4 能力位图（`Capabilities::negotiate` 按位与）+ D1 判定：协商结果无 `CAP_ADVANCED` 即刻降级，绝不"先试试看"（`transfer/degrade.rs`） | ✅ |
 | A22 | **header key 必须 lowercase 后取** —— Node 全小写 / 浏览器保留原样 | `scheduler.ts:562-567` | core HTTP | ⬜ |
 | A23 | **形态与角色完全解耦**：任意设备可担任任意角色，支持 A→B / B→A / A→A / B→B。**不能假设"电脑=发送端、手机=接收端"** | `config.ts:1-9` | V4 架构前提 | ⬜ |
 | A24 | **Windows 路径归一化**：统一 `/` 分隔，去掉开头 `./` 和结尾 `/`（平台层可能返回 `.\sub\file.txt`） | `manifest.ts:43-51` | core manifest | ⬜ |

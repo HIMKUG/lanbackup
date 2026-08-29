@@ -104,6 +104,49 @@ pub enum DegradeReason {
     VerifyFailed,
 }
 
+impl DegradeReason {
+    /// 线上原因码（`V4-TRANSFER-MODULE.md` §4.1 的「降级原因码」列）。
+    ///
+    /// **这是唯一真源** —— HTTP 层、日志、UI 都必须调用这里，
+    /// 不允许各自再写一份 match（两份映射必然漂移，见登记表 E10）。
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::PeerNoCapability => "PEER_NO_CAPABILITY",
+            Self::InitFailed => "INIT_FAILED",
+            Self::ReconcileFailed => "RECONCILE_FAILED",
+            Self::RetryExhausted => "RETRY_EXHAUSTED",
+            Self::ChunkRetryExhausted => "CHUNK_RETRY_EXHAUSTED",
+            Self::VerifyFailed => "VERIFY_FAILED",
+        }
+    }
+
+    /// 给用户看的中文文案（§4.4 要求 UI 明示降级原因）。
+    ///
+    /// 与 [`Self::code`] 分离：原因码是给机器/日志对账的，
+    /// 这句是给人读的 —— 二者都不能省。
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::PeerNoCapability => "对方版本较旧，不支持高级传输",
+            Self::InitFailed => "高级传输初始化失败",
+            Self::ReconcileFailed => "块对账连续失败",
+            Self::RetryExhausted => "断线后重试已用尽",
+            Self::ChunkRetryExhausted => "数据块连续失败",
+            Self::VerifyFailed => "整体校验反复失败",
+        }
+    }
+
+    /// 是否计入**设备级降级记忆**（§4.3）。
+    ///
+    /// 区分两种降级原因是这套记忆机制的关键：
+    /// - `PeerNoCapability` 是**稳定**原因 —— 对端就是老版本，
+    ///   记进记忆毫无意义（对端升级后自然恢复），因此返回 `false`。
+    /// - 其余都是「有能力但跑不通」的**环境性**原因 —— 值得记住，
+    ///   避免每次会话都白试一遍主算法。
+    pub fn counts_toward_memory(self) -> bool {
+        !matches!(self, Self::PeerNoCapability)
+    }
+}
+
 // ============================================================
 // POST /api/v4/session/register
 // ============================================================
