@@ -59,7 +59,12 @@ pub enum TransferEvent {
     BeginVerify,
     /// 校验通过（Verifying → Completed）
     VerifyOk,
-    /// 校验失败（Verifying → Degrading，仍有基础算法可兜底）
+    /// 校验失败但**仍有重试额度**（Verifying → Transferring，重传不一致块）。
+    ///
+    /// 文档 T17。先回传输态重传坏块，而不是立刻降级 ——
+    /// 单块写坏用主算法重传一块就能修好，直接降级会把整个文件按 16MB 重传。
+    VerifyRetry,
+    /// 校验失败且重试耗尽（Verifying → Degrading，交给基础算法兜底）。文档 T18
     VerifyFailed,
     /// 用户/系统中止（多数态 → Aborted）
     Abort,
@@ -67,8 +72,20 @@ pub enum TransferEvent {
     PeerLost,
     /// 重试（Paused/Failed → Preparing，开启新尝试）
     Retry,
-    /// 暂停后重试耗尽（Paused → Failed）
+    /// 会话建立阶段重试耗尽（Preparing → Failed）。文档 T6，原因 `PREPARE_FAILED`。
+    ///
+    /// **注意不含 Paused** —— 文档 T12 明确写「paused + 对账失败 > 3 → degrading」，
+    /// 而不是 failed：还有基础算法能把活干完，此时放弃等于白扔已传进度。
     RetryExhausted,
+    /// 不可恢复错误（任意进行中的状态 → Failed）。
+    ///
+    /// 覆盖文档 T20（基础算法初始化失败）、T23（不可恢复错误）、
+    /// T24（无进展超过 30 分钟）。
+    ///
+    /// **这条边是基础算法的唯一失败出口** —— 没有它，降级后的失败会在
+    /// `Transferring → Degrading → Transferring` 之间无限打转
+    /// （`Degrading` 只有 `DegradeComplete` 一条出路），会话永远不结束。
+    Fail,
     /// 应用重置（任意 → Idle）
     ForceReset,
 }
@@ -81,12 +98,16 @@ impl TransferState {
             (Preparing, TransferEvent::NegotiateAdvanced) => Reconciling,
             (Preparing, TransferEvent::NegotiateBasic) => Transferring,
             (Preparing, TransferEvent::Degrade) => Degrading,
+            // T6：prepare 重试耗尽 → failed（原因 PREPARE_FAILED）
+            (Preparing, TransferEvent::RetryExhausted) => Failed,
+            (Preparing, TransferEvent::Fail) => Failed,
             (Preparing, TransferEvent::Abort) => Aborted,
             (Preparing, TransferEvent::PeerLost) => Aborted,
             (Preparing, TransferEvent::ForceReset) => Idle,
             (Reconciling, TransferEvent::Reconciled) => Transferring,
             (Reconciling, TransferEvent::ReconcileFailed) => Degrading,
             (Reconciling, TransferEvent::Degrade) => Degrading,
+            (Reconciling, TransferEvent::Fail) => Failed,
             (Reconciling, TransferEvent::Abort) => Aborted,
             (Reconciling, TransferEvent::PeerLost) => Aborted,
             (Reconciling, TransferEvent::ForceReset) => Idle,
@@ -95,21 +116,31 @@ impl TransferState {
             (Transferring, TransferEvent::ChunkRetryExhausted) => Degrading,
             (Transferring, TransferEvent::BeginVerify) => Verifying,
             (Transferring, TransferEvent::Degrade) => Degrading,
+            // T24：无进展超 30 分钟 / 基础算法块重试耗尽（已无可降级余地）
+            (Transferring, TransferEvent::Fail) => Failed,
             (Transferring, TransferEvent::Abort) => Aborted,
             (Transferring, TransferEvent::PeerLost) => Aborted,
             (Transferring, TransferEvent::ForceReset) => Idle,
             (Paused, TransferEvent::Retry) => Preparing,
-            (Paused, TransferEvent::RetryExhausted) => Failed,
+            // T12：paused 的对账重试耗尽走 **degrading**（不是 failed）——
+            // 基础算法还能把活干完，此处放弃等于白扔已确认进度。
             (Paused, TransferEvent::Degrade) => Degrading,
+            (Paused, TransferEvent::Fail) => Failed,
             (Paused, TransferEvent::Abort) => Aborted,
             (Paused, TransferEvent::PeerLost) => Aborted,
             (Paused, TransferEvent::ForceReset) => Idle,
             (Degrading, TransferEvent::DegradeComplete) => Transferring,
+            // T20：基础算法初始化失败 —— 兜底的兜底没有了，只能失败
+            (Degrading, TransferEvent::Fail) => Failed,
             (Degrading, TransferEvent::Abort) => Aborted,
             (Degrading, TransferEvent::PeerLost) => Aborted,
             (Degrading, TransferEvent::ForceReset) => Idle,
             (Verifying, TransferEvent::VerifyOk) => Completed,
+            // T17：仍有重试额度 → 回传输态重传不一致块
+            (Verifying, TransferEvent::VerifyRetry) => Transferring,
+            // T18：重试耗尽 → 降级
             (Verifying, TransferEvent::VerifyFailed) => Degrading,
+            (Verifying, TransferEvent::Fail) => Failed,
             (Verifying, TransferEvent::Abort) => Aborted,
             (Verifying, TransferEvent::PeerLost) => Aborted,
             (Verifying, TransferEvent::ForceReset) => Idle,
@@ -232,11 +263,13 @@ impl TransferEvent {
             TransferEvent::DegradeComplete => "DegradeComplete",
             TransferEvent::BeginVerify => "BeginVerify",
             TransferEvent::VerifyOk => "VerifyOk",
+            TransferEvent::VerifyRetry => "VerifyRetry",
             TransferEvent::VerifyFailed => "VerifyFailed",
             TransferEvent::Abort => "Abort",
             TransferEvent::PeerLost => "PeerLost",
             TransferEvent::Retry => "Retry",
             TransferEvent::RetryExhausted => "RetryExhausted",
+            TransferEvent::Fail => "Fail",
             TransferEvent::ForceReset => "ForceReset",
         }
     }
@@ -282,10 +315,70 @@ mod tests {
     }
 
     #[test]
-    fn paused_retry_exhausted_to_failed() {
-        let s = TransferState::Paused;
+    fn prepare_retry_exhausted_to_failed() {
+        // 文档 T6
+        let s = TransferState::Preparing;
         let s = s.transition(TransferEvent::RetryExhausted).unwrap();
         assert_eq!(s, TransferState::Failed);
+    }
+
+    #[test]
+    fn paused_retry_exhausted_degrades_rather_than_fails() {
+        // 文档 T12：paused + 对账失败 > 3 → degrading，**不是** failed。
+        // 基础算法还能把活干完，此处放弃等于白扔已确认进度。
+        let s = TransferState::Paused;
+        assert!(
+            s.transition(TransferEvent::RetryExhausted).is_err(),
+            "Paused 不该有通往 Failed 的重试耗尽边（与文档 T12 冲突）"
+        );
+        let s = s.transition(TransferEvent::Degrade).unwrap();
+        assert_eq!(s, TransferState::Degrading);
+        let s = s.transition(TransferEvent::DegradeComplete).unwrap();
+        assert_eq!(s, TransferState::Transferring);
+    }
+
+    #[test]
+    fn verify_retry_returns_to_transferring_before_degrading() {
+        // 文档 T17：仍有重试额度时回传输态重传坏块，而不是立刻降级 ——
+        // 单块写坏用主算法补一块就行，降级要按 16MB 重来。
+        let s = TransferState::Verifying;
+        let s2 = s.transition(TransferEvent::VerifyRetry).unwrap();
+        assert_eq!(s2, TransferState::Transferring);
+        // T18：额度用尽才降级
+        let s3 = s.transition(TransferEvent::VerifyFailed).unwrap();
+        assert_eq!(s3, TransferState::Degrading);
+    }
+
+    #[test]
+    fn basic_algorithm_has_a_failure_exit() {
+        // 若没有 Fail 边，降级后的失败会在 Transferring ⇄ Degrading 之间
+        // 无限打转（Degrading 只有 DegradeComplete 一条出路），会话永不结束。
+        for s in [
+            TransferState::Preparing,
+            TransferState::Reconciling,
+            TransferState::Transferring,
+            TransferState::Paused,
+            TransferState::Degrading,
+            TransferState::Verifying,
+        ] {
+            assert_eq!(
+                s.transition(TransferEvent::Fail),
+                Ok(TransferState::Failed),
+                "{s:?} 缺少失败出口"
+            );
+        }
+        // Idle 没有会话可失败；终态已定局
+        for s in [
+            TransferState::Idle,
+            TransferState::Completed,
+            TransferState::Failed,
+            TransferState::Aborted,
+        ] {
+            assert!(
+                s.transition(TransferEvent::Fail).is_err(),
+                "{s:?} 不应可失败"
+            );
+        }
     }
 
     #[test]

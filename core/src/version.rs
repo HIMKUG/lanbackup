@@ -175,6 +175,34 @@ pub mod retry {
     pub const BACKOFF_MAX_MS: u64 = 64_000;
     /// 退避指数上限（2^5 * 1000 = 32s）
     pub const BACKOFF_MAX_EXPONENT: u32 = 5;
+
+    // 块重试退避与握手退避**不共用参数**（文档 V4-TRANSFER-MODULE §2.4 T13）。
+    //
+    // 教训：旧实现只有一套 backoff（base 1s / max 64s），块重试也走它。
+    // 结果传大文件时一个偶发坏块会让该分片睡上几十秒，而并发窗口里
+    // 这个 slot 一直被占着 —— 表现为"传输卡住但没报错"。
+    // 块重试发生在热路径，必须快重试；握手重试关系到"对端到底在不在"，
+    // 必须慢一点，否则网络刚抖一下就把 3 次重试在 1 秒内烧完直接判死。
+
+    /// 单块重试退避基数（T13：200ms）
+    pub const CHUNK_BACKOFF_BASE_MS: u64 = 200;
+    /// 单块重试退避上限（T13：5s）
+    pub const CHUNK_BACKOFF_MAX_MS: u64 = 5_000;
+
+    // 编译期护栏：把"两套退避参数不许被统一"钉死在类型系统这一层。
+    // 用 const assert 而不是 #[test] —— 后者要跑起来才报错，前者连编译都不给过。
+    const _: () = assert!(
+        CHUNK_BACKOFF_BASE_MS < BACKOFF_BASE_MS,
+        "块重试基数必须小于握手基数：块重试在传输热路径上，慢退避会让偶发坏块长时间占着并发 slot"
+    );
+    const _: () = assert!(
+        CHUNK_BACKOFF_MAX_MS < BACKOFF_MAX_MS,
+        "块重试退避上限必须小于握手退避上限"
+    );
+    const _: () = assert!(
+        CHUNK_BACKOFF_BASE_MS > 0 && BACKOFF_BASE_MS > 0,
+        "退避基数为 0 会让随机区间退化为空"
+    );
 }
 
 #[cfg(test)]

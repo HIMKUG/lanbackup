@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 
+use crate::version::retry;
+
 /// 对端标识（IP:port 或设备 id），用于每 peer 并发配额
 pub type PeerId = String;
 
@@ -123,14 +125,38 @@ pub struct RetryPermit {
     _retry: OwnedSemaphorePermit,
 }
 
-/// 全抖动退避（A14，AWS 标准 full jitter）。
+/// 全抖动退避（A14，AWS 标准 full jitter），**握手 / 对账**用的参数。
 ///
 /// 第 `attempt` 次重试的等待毫秒数：`min(64000, 1000 * 2^attempt)` 区间内的均匀随机值。
 /// `attempt` 从 0 起，指数上限 5（`1000 * 2^5 = 32000`，并整体封顶 64000ms），防惊群也防无限增长。
 ///
 /// 调用方在等待后应 `acquire_retry()` 拿独立配额再发，**不要**用普通块许可发重试（A13）。
 pub fn full_jitter_backoff_ms(attempt: u32) -> u64 {
-    let exp = (1000u64 << attempt.min(5)).min(64_000);
+    full_jitter_backoff_with(attempt, retry::BACKOFF_BASE_MS, retry::BACKOFF_MAX_MS)
+}
+
+/// 单块重试的退避（文档 T13：base 200ms / max 5s）。
+///
+/// **与握手退避不是一套参数** —— 块重试发生在传输热路径上，
+/// 用握手那套（base 1s、上限 64s）会让一个偶发坏块把整条流水线堵一分钟；
+/// 而握手用块那套（200ms 起）又太急，网络刚断就把 3 次重试在 1 秒内烧完。
+pub fn chunk_backoff_ms(attempt: u32) -> u64 {
+    full_jitter_backoff_with(
+        attempt,
+        retry::CHUNK_BACKOFF_BASE_MS,
+        retry::CHUNK_BACKOFF_MAX_MS,
+    )
+}
+
+/// 全抖动退避的通用实现：`random(0, min(max_ms, base_ms * 2^attempt))`
+pub fn full_jitter_backoff_with(attempt: u32, base_ms: u64, max_ms: u64) -> u64 {
+    // `checked_shl` 而非直接 `<<`：attempt 虽已被 BACKOFF_MAX_EXPONENT 夹住，
+    // 但常量是可配的，溢出兜底为 u64::MAX 再交给 min(max_ms) 收敛。
+    let exp = base_ms
+        .checked_shl(attempt.min(retry::BACKOFF_MAX_EXPONENT))
+        .unwrap_or(u64::MAX)
+        .min(max_ms)
+        .max(1);
     // 均匀随机 [0, exp)（rand 0.10 的 free function）
     rand::random_range(0..exp)
 }
@@ -223,6 +249,39 @@ mod tests {
         for attempt in [10u32, 20, 100] {
             let b = full_jitter_backoff_ms(attempt);
             assert!(b < 64_000, "attempt{attempt} 应 < 64000，实际 {b}");
+        }
+    }
+
+    // 注：「块退避参数必须比握手更激进」已在 `version::retry` 里做成 const assert，
+    // 编译期就会拦住，无需在此重复运行期断言。
+
+    #[test]
+    fn chunk_backoff_is_within_bounds_and_capped() {
+        // attempt 0 → exp=200 → [0,200)
+        for _ in 0..50 {
+            let b = chunk_backoff_ms(0);
+            assert!(b < 200, "attempt0 应 < 200，实际 {b}");
+        }
+        // attempt 5 → 200*2^5 = 6400 > 5000 → 封顶 5000
+        for _ in 0..50 {
+            let b = chunk_backoff_ms(5);
+            assert!(b < 5_000, "attempt5 应被 5000 封顶，实际 {b}");
+        }
+        // 超大 attempt 不溢出、仍封顶
+        for attempt in [10u32, 40, 100] {
+            let b = chunk_backoff_ms(attempt);
+            assert!(b < 5_000, "attempt{attempt} 应 < 5000，实际 {b}");
+        }
+    }
+
+    #[test]
+    fn backoff_never_returns_from_empty_range() {
+        // full_jitter_backoff_with 内部用 `random_range(0..exp)`，exp==0 会 panic。
+        // `.max(1)` 就是为此存在 —— 即使有人把 base 或 max 配成 0 也不许崩。
+        for _ in 0..20 {
+            let _ = full_jitter_backoff_with(0, 0, 0);
+            let _ = full_jitter_backoff_with(9, 0, 100);
+            let _ = full_jitter_backoff_with(9, 100, 0);
         }
     }
 
