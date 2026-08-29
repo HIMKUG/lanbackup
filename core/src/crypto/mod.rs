@@ -5,6 +5,4 @@
 
 pub mod merkle;
 
-pub use merkle::{
-    merkle_root, sha256_of, verify_piece, MerkleProof, MerkleRoot, MerkleTree,
-};
+pub use merkle::{merkle_root, sha256_of, verify_piece, MerkleProof, MerkleRoot, MerkleTree};

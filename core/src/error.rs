@@ -134,7 +134,10 @@ pub enum Error {
     Crypto(String),
 
     #[error("非法状态迁移: {from} -> {to}")]
-    InvalidTransition { from: &'static str, to: &'static str },
+    InvalidTransition {
+        from: &'static str,
+        to: &'static str,
+    },
 
     #[error("{0}")]
     Other(String),

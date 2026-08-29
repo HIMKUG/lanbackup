@@ -134,7 +134,10 @@ impl TransferState {
 
     /// 是否允许「中止」
     pub fn allows_abort(self) -> bool {
-        !matches!(self, TransferState::Idle | TransferState::Completed | TransferState::Aborted)
+        !matches!(
+            self,
+            TransferState::Idle | TransferState::Completed | TransferState::Aborted
+        )
     }
 
     /// 是否允许「重试」
@@ -144,7 +147,10 @@ impl TransferState {
 
     /// 是否为终态（Completed/Failed/Aborted）
     pub fn is_terminal(self) -> bool {
-        matches!(self, TransferState::Completed | TransferState::Failed | TransferState::Aborted)
+        matches!(
+            self,
+            TransferState::Completed | TransferState::Failed | TransferState::Aborted
+        )
     }
 }
 
@@ -245,7 +251,10 @@ mod tests {
             TransferState::Degrading,
             TransferState::Verifying,
         ] {
-            assert_eq!(s.transition(TransferEvent::PeerLost).unwrap(), TransferState::Aborted);
+            assert_eq!(
+                s.transition(TransferEvent::PeerLost).unwrap(),
+                TransferState::Aborted
+            );
         }
     }
 
@@ -256,23 +265,35 @@ mod tests {
         assert!(s.transition(TransferEvent::Retry).is_err());
         assert!(s.transition(TransferEvent::Abort).is_err());
         // 只有 ForceReset 能离开终态
-        assert_eq!(s.transition(TransferEvent::ForceReset).unwrap(), TransferState::Idle);
+        assert_eq!(
+            s.transition(TransferEvent::ForceReset).unwrap(),
+            TransferState::Idle
+        );
     }
 
     #[test]
     fn failed_allows_explicit_retry() {
         let s = TransferState::Failed;
         assert!(s.allows_retry());
-        assert_eq!(s.transition(TransferEvent::Retry).unwrap(), TransferState::Preparing);
+        assert_eq!(
+            s.transition(TransferEvent::Retry).unwrap(),
+            TransferState::Preparing
+        );
     }
 
     #[test]
     fn illegal_transitions_rejected() {
         // Idle 直接传块？非法
-        assert!(TransferState::Idle.transition(TransferEvent::BeginVerify).is_err());
+        assert!(TransferState::Idle
+            .transition(TransferEvent::BeginVerify)
+            .is_err());
         // Transferring 直接 Completed？非法（必须经 Verifying）
-        assert!(TransferState::Transferring.transition(TransferEvent::VerifyOk).is_err());
+        assert!(TransferState::Transferring
+            .transition(TransferEvent::VerifyOk)
+            .is_err());
         // Aborted 不可重试
-        assert!(TransferState::Aborted.transition(TransferEvent::Retry).is_err());
+        assert!(TransferState::Aborted
+            .transition(TransferEvent::Retry)
+            .is_err());
     }
 }

@@ -47,10 +47,16 @@ pub struct Verdict {
 
 impl Verdict {
     fn allow(reason: &'static str) -> Self {
-        Verdict { enabled: true, reason }
+        Verdict {
+            enabled: true,
+            reason,
+        }
     }
     fn deny(reason: &'static str) -> Self {
-        Verdict { enabled: false, reason }
+        Verdict {
+            enabled: false,
+            reason,
+        }
     }
 }
 
@@ -148,106 +154,160 @@ mod tests {
     #[test]
     fn connect_only_when_online_and_disconnected() {
         // 离线：禁用
-        assert!(!can(
-            UiAction::Connect,
-            &ctx(Presence::Offline, C::Disconnected, T::Idle, false, false)
-        )
-        .enabled);
+        assert!(
+            !can(
+                UiAction::Connect,
+                &ctx(Presence::Offline, C::Disconnected, T::Idle, false, false)
+            )
+            .enabled
+        );
         // 在线 + 未连接：启用
-        assert!(can(
-            UiAction::Connect,
-            &ctx(Presence::Online, C::Disconnected, T::Idle, false, false)
-        )
-        .enabled);
+        assert!(
+            can(
+                UiAction::Connect,
+                &ctx(Presence::Online, C::Disconnected, T::Idle, false, false)
+            )
+            .enabled
+        );
         // 在线 + 已连接：禁用（已连接）
-        assert!(!can(
-            UiAction::Connect,
-            &ctx(Presence::Online, C::Connected, T::Idle, false, false)
-        )
-        .enabled);
+        assert!(
+            !can(
+                UiAction::Connect,
+                &ctx(Presence::Online, C::Connected, T::Idle, false, false)
+            )
+            .enabled
+        );
         // 在线 + 连接中：禁用（正在连接）
-        assert!(!can(
-            UiAction::Connect,
-            &ctx(Presence::Online, C::Connecting, T::Idle, false, false)
-        )
-        .enabled);
+        assert!(
+            !can(
+                UiAction::Connect,
+                &ctx(Presence::Online, C::Connecting, T::Idle, false, false)
+            )
+            .enabled
+        );
     }
 
     #[test]
     fn start_transfer_requires_connected() {
-        assert!(can(
-            UiAction::StartTransfer,
-            &ctx(Presence::Online, C::Connected, T::Idle, false, false)
-        )
-        .enabled);
+        assert!(
+            can(
+                UiAction::StartTransfer,
+                &ctx(Presence::Online, C::Connected, T::Idle, false, false)
+            )
+            .enabled
+        );
         // 未连接：禁用
-        assert!(!can(
-            UiAction::StartTransfer,
-            &ctx(Presence::Online, C::Disconnected, T::Idle, false, false)
-        )
-        .enabled);
+        assert!(
+            !can(
+                UiAction::StartTransfer,
+                &ctx(Presence::Online, C::Disconnected, T::Idle, false, false)
+            )
+            .enabled
+        );
         // 传输进行中：禁用
-        assert!(!can(
-            UiAction::StartTransfer,
-            &ctx(Presence::Online, C::Connected, T::Transferring, false, false)
-        )
-        .enabled);
+        assert!(
+            !can(
+                UiAction::StartTransfer,
+                &ctx(
+                    Presence::Online,
+                    C::Connected,
+                    T::Transferring,
+                    false,
+                    false
+                )
+            )
+            .enabled
+        );
     }
 
     #[test]
     fn abort_retry_gates() {
         // 传输中可中止
-        assert!(can(
-            UiAction::Abort,
-            &ctx(Presence::Online, C::Connected, T::Transferring, false, false)
-        )
-        .enabled);
+        assert!(
+            can(
+                UiAction::Abort,
+                &ctx(
+                    Presence::Online,
+                    C::Connected,
+                    T::Transferring,
+                    false,
+                    false
+                )
+            )
+            .enabled
+        );
         // 空闲不可中止
-        assert!(!can(
-            UiAction::Abort,
-            &ctx(Presence::Online, C::Connected, T::Idle, false, false)
-        )
-        .enabled);
+        assert!(
+            !can(
+                UiAction::Abort,
+                &ctx(Presence::Online, C::Connected, T::Idle, false, false)
+            )
+            .enabled
+        );
         // Paused 可重试
-        assert!(can(
-            UiAction::Retry,
-            &ctx(Presence::Online, C::Connected, T::Paused, false, false)
-        )
-        .enabled);
+        assert!(
+            can(
+                UiAction::Retry,
+                &ctx(Presence::Online, C::Connected, T::Paused, false, false)
+            )
+            .enabled
+        );
         // Idle 不可重试
-        assert!(!can(
-            UiAction::Retry,
-            &ctx(Presence::Online, C::Connected, T::Idle, false, false)
-        )
-        .enabled);
+        assert!(
+            !can(
+                UiAction::Retry,
+                &ctx(Presence::Online, C::Connected, T::Idle, false, false)
+            )
+            .enabled
+        );
     }
 
     #[test]
     fn reenable_advanced_gated_by_degrade_cause() {
         // 环境性降级（对端有能力）：可重新启用
-        assert!(can(
-            UiAction::ReenableAdvanced,
-            &ctx(Presence::Online, C::Connected, T::Transferring, true, false)
-        )
-        .enabled);
+        assert!(
+            can(
+                UiAction::ReenableAdvanced,
+                &ctx(Presence::Online, C::Connected, T::Transferring, true, false)
+            )
+            .enabled
+        );
         // 对端无能力降级：不可重新启用
-        assert!(!can(
-            UiAction::ReenableAdvanced,
-            &ctx(Presence::Online, C::Connected, T::Transferring, true, true)
-        )
-        .enabled);
+        assert!(
+            !can(
+                UiAction::ReenableAdvanced,
+                &ctx(Presence::Online, C::Connected, T::Transferring, true, true)
+            )
+            .enabled
+        );
         // 未降级：禁用
-        assert!(!can(
-            UiAction::ReenableAdvanced,
-            &ctx(Presence::Online, C::Connected, T::Transferring, false, false)
-        )
-        .enabled);
+        assert!(
+            !can(
+                UiAction::ReenableAdvanced,
+                &ctx(
+                    Presence::Online,
+                    C::Connected,
+                    T::Transferring,
+                    false,
+                    false
+                )
+            )
+            .enabled
+        );
         // 降级但连接断开：禁用
-        assert!(!can(
-            UiAction::ReenableAdvanced,
-            &ctx(Presence::Online, C::Disconnected, T::Transferring, true, false)
-        )
-        .enabled);
+        assert!(
+            !can(
+                UiAction::ReenableAdvanced,
+                &ctx(
+                    Presence::Online,
+                    C::Disconnected,
+                    T::Transferring,
+                    true,
+                    false
+                )
+            )
+            .enabled
+        );
     }
 
     #[test]

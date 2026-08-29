@@ -95,16 +95,15 @@ const DRAFT07_META: &str = r##"{
 
 /// 定位 `protocol/schemas/v4/` 目录（相对 crate 根）
 fn schema_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../protocol/schemas/v4")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../protocol/schemas/v4")
 }
 
 #[test]
 fn every_generated_schema_is_valid_draft07() {
     let meta: serde_json::Value =
         serde_json::from_str(DRAFT07_META).expect("内嵌的 draft-07 meta-schema 必须是合法 JSON");
-    let validator = jsonschema::JSONSchema::compile(&meta)
-        .expect("draft-07 meta-schema 必须能编译为校验器");
+    let validator =
+        jsonschema::JSONSchema::compile(&meta).expect("draft-07 meta-schema 必须能编译为校验器");
 
     let dir = schema_dir();
     assert!(dir.exists(), "schema 目录不存在: {}", dir.display());
@@ -126,27 +125,26 @@ fn every_generated_schema_is_valid_draft07() {
         .collect();
     files.sort();
 
-    assert!(!files.is_empty(), "没有找到任何 *.schema.json，生成步骤可能未执行");
+    assert!(
+        !files.is_empty(),
+        "没有找到任何 *.schema.json，生成步骤可能未执行"
+    );
 
     let mut failures: Vec<String> = Vec::new();
 
     for path in &files {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let content = fs::read_to_string(path).expect("读取 schema 文件失败");
-        let schema: serde_json::Value =
-            match serde_json::from_str(&content) {
-                Ok(v) => v,
-                Err(e) => {
-                    failures.push(format!("  - {name}: JSON 解析失败: {e}"));
-                    continue;
-                }
-            };
+        let schema: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                failures.push(format!("  - {name}: JSON 解析失败: {e}"));
+                continue;
+            }
+        };
 
         // 必须声明 draft-07，与生成器一致
-        let declared = schema
-            .get("$schema")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let declared = schema.get("$schema").and_then(|v| v.as_str()).unwrap_or("");
         if declared != "http://json-schema.org/draft-07/schema#" {
             failures.push(format!(
                 "  - {name}: $schema 应为 draft-07，实际为 {declared:?}"
@@ -174,5 +172,8 @@ fn every_generated_schema_is_valid_draft07() {
         failures.join("\n")
     );
 
-    eprintln!("conformance 通过：{} 份 schema 均为合法 Draft-07", files.len());
+    eprintln!(
+        "conformance 通过：{} 份 schema 均为合法 Draft-07",
+        files.len()
+    );
 }

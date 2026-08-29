@@ -95,7 +95,11 @@ impl MerkleTree {
             let mut i = 0;
             while i < cur.len() {
                 let left = cur[i];
-                let right = if i + 1 < cur.len() { cur[i + 1] } else { cur[i] };
+                let right = if i + 1 < cur.len() {
+                    cur[i + 1]
+                } else {
+                    cur[i]
+                };
                 next.push(hash_pair(left, right));
                 i += 2;
             }
@@ -247,10 +251,7 @@ mod tests {
         let root = tree.root();
         for (i, leaf) in leaves.iter().enumerate() {
             let proof = tree.proof(i);
-            assert!(
-                verify_piece(i, leaf, &proof, &root),
-                "index {i} 应校验通过"
-            );
+            assert!(verify_piece(i, leaf, &proof, &root), "index {i} 应校验通过");
         }
     }
 

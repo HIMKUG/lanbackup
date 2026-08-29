@@ -274,7 +274,10 @@ async fn handle_chunk(store: &Arc<SessionStore>, body: &[u8]) -> Response<Full<b
         return err_response(ErrorCode::NotFound, "文件未登记");
     }
     // 首次分块：Preparing/Reconciling → Transferring（NegotiateBasic 路径的 MVP）
-    if matches!(rec.phase, TransferState::Preparing | TransferState::Reconciling) {
+    if matches!(
+        rec.phase,
+        TransferState::Preparing | TransferState::Reconciling
+    ) {
         let ev = if rec.algorithm == Algorithm::Advanced {
             TransferEvent::NegotiateAdvanced
         } else {
@@ -423,49 +426,91 @@ mod tests {
     async fn full_flow_register_prepare_chunk_phase_abort() {
         let store = SessionStore::new();
         // register
-        route(&store, Method::POST, "/api/v4/session/register",
-            &body(serde_json::json!({"deviceId":"d","alias":"a","sessionId":"s1"}))).await;
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/register",
+            &body(serde_json::json!({"deviceId":"d","alias":"a","sessionId":"s1"})),
+        )
+        .await;
         // prepare
-        let r = route(&store, Method::POST, "/api/v4/session/prepare",
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/prepare",
             &body(serde_json::json!({
                 "sessionId":"s1","deviceId":"d",
                 "files":{"f1":{"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}}
-            }))).await;
+            })),
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::OK);
 
         // chunk #0 → 应推进到 Transferring
-        let r = route(&store, Method::POST, "/api/v4/session/chunk",
-            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0}))).await;
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/chunk",
+            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0})),
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::OK);
         let g = store.inner.lock().await;
         assert_eq!(g.get("s1").unwrap().phase, TransferState::Transferring);
-        assert!(g.get("s1").unwrap().confirmed.get("f1").unwrap().contains(&0));
+        assert!(g
+            .get("s1")
+            .unwrap()
+            .confirmed
+            .get("f1")
+            .unwrap()
+            .contains(&0));
         drop(g);
 
         // phase 查询应反映 transferring
-        let r = route(&store, Method::GET, "/api/v4/session/phase?sessionId=s1", &[]).await;
+        let r = route(
+            &store,
+            Method::GET,
+            "/api/v4/session/phase?sessionId=s1",
+            &[],
+        )
+        .await;
         let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
         assert_eq!(v["phase"].as_str(), Some("transferring"));
 
         // abort → Aborted
-        let r = route(&store, Method::POST, "/api/v4/session/abort",
-            &body(serde_json::json!({"sessionId":"s1"}))).await;
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/abort",
+            &body(serde_json::json!({"sessionId":"s1"})),
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::OK);
         let g = store.inner.lock().await;
         assert_eq!(g.get("s1").unwrap().phase, TransferState::Aborted);
         drop(g);
 
         // 终态再 abort → 非法迁移，返回 409
-        let r = route(&store, Method::POST, "/api/v4/session/abort",
-            &body(serde_json::json!({"sessionId":"s1"}))).await;
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/abort",
+            &body(serde_json::json!({"sessionId":"s1"})),
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
     async fn abort_unknown_session_is_404() {
         let store = SessionStore::new();
-        let r = route(&store, Method::POST, "/api/v4/session/abort",
-            &body(serde_json::json!({"sessionId":"nope"}))).await;
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/abort",
+            &body(serde_json::json!({"sessionId":"nope"})),
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
 

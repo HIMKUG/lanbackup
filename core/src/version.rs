@@ -199,7 +199,10 @@ mod tests {
         let agreed = local.negotiate(peer);
         assert!(agreed.contains(CAP_PAIRING_V4));
         assert!(agreed.contains(CAP_ENCRYPT));
-        assert!(!agreed.contains(CAP_ADVANCED), "对端不支持主算法 → 必须降级");
+        assert!(
+            !agreed.contains(CAP_ADVANCED),
+            "对端不支持主算法 → 必须降级"
+        );
     }
 
     #[test]

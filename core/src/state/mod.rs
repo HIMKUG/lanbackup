@@ -13,7 +13,7 @@ pub mod policy;
 pub mod presence;
 pub mod transfer;
 
-pub use connection::{ConnectionState, ConnEvent, IllegalTransition as ConnIllegal};
+pub use connection::{ConnEvent, ConnectionState, IllegalTransition as ConnIllegal};
 pub use policy::{can, UiAction, UiContext, Verdict};
 pub use presence::{on_beacon, reset, tick};
 pub use transfer::{IllegalTransition as TransferIllegal, TransferEvent, TransferState};

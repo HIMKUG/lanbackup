@@ -174,7 +174,10 @@ mod tests {
             ConnectionState::Lost,
             ConnectionState::Failed,
         ] {
-            assert_eq!(s.transition(ConnEvent::ForceAbort).unwrap(), ConnectionState::Disconnected);
+            assert_eq!(
+                s.transition(ConnEvent::ForceAbort).unwrap(),
+                ConnectionState::Disconnected
+            );
         }
     }
 }

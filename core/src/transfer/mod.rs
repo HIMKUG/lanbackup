@@ -12,8 +12,8 @@ pub mod schedule;
 
 pub use chunk::{
     block_count, blocks_to_pieces, compute_chunk_diff, degrade_from_pieces, piece_count,
-    weak_checksum, weak_screen, DiffResult, PieceHash, ChunkPlan, DegradePlan, BASIC_CHUNK_SIZE,
-    PIECE_SIZE, PIECES_PER_BLOCK,
+    weak_checksum, weak_screen, ChunkPlan, DegradePlan, DiffResult, PieceHash, BASIC_CHUNK_SIZE,
+    PIECES_PER_BLOCK, PIECE_SIZE,
 };
 
 pub use schedule::{full_jitter_backoff_ms, ChunkPermit, RetryPermit, TransferScheduler};

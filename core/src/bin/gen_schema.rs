@@ -76,17 +76,32 @@ fn all_schemas() -> Vec<(String, String)> {
             "handshake.status",
             schemars::schema_for!(handshake::HandshakeStatusResponse),
         ),
-        emit("pairing-state", schemars::schema_for!(handshake::PairingState)),
-        emit("unpair-request", schemars::schema_for!(handshake::UnpairRequest)),
-        emit("unpair", schemars::schema_for!(handshake::UnpairNotification)),
-        emit("revoke-notify", schemars::schema_for!(handshake::RevokeNotify)),
+        emit(
+            "pairing-state",
+            schemars::schema_for!(handshake::PairingState),
+        ),
+        emit(
+            "unpair-request",
+            schemars::schema_for!(handshake::UnpairRequest),
+        ),
+        emit(
+            "unpair",
+            schemars::schema_for!(handshake::UnpairNotification),
+        ),
+        emit(
+            "revoke-notify",
+            schemars::schema_for!(handshake::RevokeNotify),
+        ),
         emit("revoke-ack", schemars::schema_for!(handshake::RevokeAck)),
         emit(
             "sync-status",
             schemars::schema_for!(handshake::SyncStatusResponse),
         ),
         // 传输会话
-        emit("transfer-phase", schemars::schema_for!(session::TransferPhase)),
+        emit(
+            "transfer-phase",
+            schemars::schema_for!(session::TransferPhase),
+        ),
         emit("algorithm", schemars::schema_for!(session::Algorithm)),
         emit(
             "degrade-reason",
@@ -101,7 +116,10 @@ fn all_schemas() -> Vec<(String, String)> {
             "session.register.response",
             schemars::schema_for!(session::SessionRegisterResponse),
         ),
-        emit("session.prepare", schemars::schema_for!(session::PrepareRequest)),
+        emit(
+            "session.prepare",
+            schemars::schema_for!(session::PrepareRequest),
+        ),
         emit(
             "session.prepare.response",
             schemars::schema_for!(session::PrepareResponse),
@@ -115,7 +133,10 @@ fn all_schemas() -> Vec<(String, String)> {
             "session.verify.response",
             schemars::schema_for!(session::VerifyFileResponse),
         ),
-        emit("session.phase", schemars::schema_for!(session::PhaseResponse)),
+        emit(
+            "session.phase",
+            schemars::schema_for!(session::PhaseResponse),
+        ),
         emit(
             "session.heartbeat",
             schemars::schema_for!(session::HeartbeatRequest),
@@ -126,9 +147,18 @@ fn all_schemas() -> Vec<(String, String)> {
         ),
         emit("task-status", schemars::schema_for!(session::TaskStatus)),
         emit("task-receipt", schemars::schema_for!(session::TaskReceipt)),
-        emit("session.receipt", schemars::schema_for!(session::ReceiptRequest)),
-        emit("session.tasks", schemars::schema_for!(session::TaskListResponse)),
-        emit("session.abort", schemars::schema_for!(session::AbortRequest)),
+        emit(
+            "session.receipt",
+            schemars::schema_for!(session::ReceiptRequest),
+        ),
+        emit(
+            "session.tasks",
+            schemars::schema_for!(session::TaskListResponse),
+        ),
+        emit(
+            "session.abort",
+            schemars::schema_for!(session::AbortRequest),
+        ),
         // 清单与同步
         emit("sync-strategy", schemars::schema_for!(sync::SyncStrategy)),
         emit("manifest-entry", schemars::schema_for!(sync::ManifestEntry)),
@@ -145,8 +175,14 @@ fn all_schemas() -> Vec<(String, String)> {
         ),
         emit("disconnect", schemars::schema_for!(sync::DisconnectRequest)),
         // 错误
-        emit("error", schemars::schema_for!(lanbackup_core::ErrorEnvelope)),
-        emit("error-code", schemars::schema_for!(lanbackup_core::ErrorCode)),
+        emit(
+            "error",
+            schemars::schema_for!(lanbackup_core::ErrorEnvelope),
+        ),
+        emit(
+            "error-code",
+            schemars::schema_for!(lanbackup_core::ErrorCode),
+        ),
     ]
 }
 
@@ -228,8 +264,7 @@ fn emit_golden(out: &Path) {
     for p in &paths {
         let text = std::fs::read_to_string(p).expect("读取 schema 失败");
         // canonical：解析再序列化，消除空白/键序差异
-        let v: serde_json::Value =
-            serde_json::from_str(&text).expect("schema 不是合法 JSON");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("schema 不是合法 JSON");
         let canonical = serde_json::to_string(&v).expect("schema 规范化失败");
         hasher.update(canonical.as_bytes());
     }
@@ -261,8 +296,11 @@ fn emit_golden(out: &Path) {
     });
 
     let path = Path::new(out).join("golden-manifest.json");
-    std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&manifest).unwrap()))
-        .expect("写入 golden-manifest 失败");
+    std::fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&manifest).unwrap()),
+    )
+    .expect("写入 golden-manifest 失败");
     println!(
         "已生成 golden-manifest.json：{} 份 schema，SHA-256 = {}",
         paths.len(),
