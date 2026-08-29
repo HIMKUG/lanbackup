@@ -41,7 +41,7 @@
 | D6 | **接收超时只 finalize 统计、绝不 break 出循环** —— break 会造成"端口通但事件无人消费"的失聪态，而 watchdog 只探 TCP 连通性，**永远不会触发自愈**。空闲等待是接收端的正常稳态 | `receive.rs:112-116` | core 接收循环 | ⬜ |
 | D7 | **认证前必须限制分配长度** —— 流式密文的 `clen` 取自密文流且在 GCM 认证之前分配，不设上限则任意对端可让本端尝试分配 ~4GiB，**无需知道密钥** | `crypto.rs:413-419` | core 加解密 | ⬜ |
 | D8 | **固定长度头必须循环读满** —— 单次 `read` 不保证填满缓冲（TcpStream 分段 / BufReader 边界），否则合法密文被**间歇性**误杀 | `crypto.rs:389-391` | core 流读取 | ⬜ |
-| D9 | **跨 await 不持锁**；guard 在表达式结束即释放；`drop()` 释放锁后再 spawn | `receive.rs:690`; `mod.rs:569`; `pairing/v3.rs:315` | core 并发规范 | ⬜ |
+| D9 | **跨 await 不持锁**；guard 在表达式结束即释放；`drop()` 释放锁后再 spawn | `transfer/schedule.rs`（peer_chunk 取 Arc 即释锁，许可 RAII 归还） | core 并发规范 | ✅ |
 | D10 | **`tokio::sync::RwLock` 而非 `std::sync::Mutex`**（在 tokio 上下文访问的状态），否则阻塞调度器 | `mod.rs:237-239` | core 状态容器 | ⬜ |
 | D11 | **release 配置 `panic=abort`** → 越界 panic 直接杀死进程。日志解析等字符串操作全程用 `strip_prefix`/`find`，绝不做裸切片 | `logger.rs:562-563` | core 编码规范 | ⬜ |
 | D12 | **setup 闭包必须立即返回**，所有耗时/阻塞初始化异步化，否则 OS 将窗口标记为"未响应" | `lib.rs:134-137` | 桌面端启动 | ⬜ |
@@ -80,14 +80,14 @@
 | A7 | **增量判据用 mtime + size，不用内容哈希** —— 手机端 CPU 弱，相册几万文件算哈希会把扫描从秒级拖到分钟级。已知限制：同 path 同 size 但内容损坏的文件检测不出来 | `sync.ts:5,101-102` | core sync | ⬜ |
 | A8 | **接收端必须保留发送端 mtime（RFC3339）** —— 一旦被重置为写入时间，A 端三路对比会**永久误判为变更，每次全量重传**。这是整条增量链路的命脉 | `transfer.ts:187`; `receive.rs:535-536` | core 接收 | ⬜ |
 | A9 | **tiny 文件 ustar tar 聚合**：<10KB 文件按批打包为单一 tar 流，一次 prepare-upload + 一次 upload。**万次握手 → 1 次连接**。batchSize 50-100 为工程平衡点 | `transfer.ts:626-650` | core 批量传输 | ⬜ |
-| A10 | **局域网专用工程参数**：CHUNK 8MB（协议头开销 vs 单分片失败重传成本的最优平衡，针对 100MB/s+ / RTT 1-3ms）、并发 8、TINY 10KB、LARGE 100MB。**公网/跨城场景下全部不适用** | `transfer.ts:656-672` | core 传输参数 | ⬜ |
+| A10 | **局域网专用工程参数**：CHUNK 8MB（协议头开销 vs 单分片失败重传成本的最优平衡，针对 100MB/s+ / RTT 1-3ms）、并发 8、TINY 10KB、LARGE 100MB。**公网/跨城场景下全部不适用** | `transfer.ts:656-672`（V4 采用 4MB piece + 16MB basic，属既定设计取舍，待实测调参） | core 传输参数 | ⚠️ |
 | A11 | **GET /diff 四态状态码**：206=存在且 ETag 匹配 / 412=存在但 SHA-256 不匹配（NACK）/ 416=Range 越界（带 `Content-Range: bytes */{total}`）/ 200=ETag 不匹配文件已变需全量重传。**把"存在性"和"正确性"用两个状态码分开表达** | `transfer.ts:438-445` | V4 路由契约 | ⬜ |
 | A12 | **ETag 必须带双引号且不加 `W/` 前缀** —— `W/` 是弱校验器（内容等价但字节可不同），这里要字节级强校验，加 `W/` 会让 `If-Range` 语义变化导致误判 | `scheduler.rs:209-228` | V4 路由契约 | ⬜ |
-| A13 | **全局信号量 12（=3 接收端 × 4 块）+ 重试独立配额 4** —— 全局而非每 peer 独立（防多接收端总并发爆炸）；**重试必须单独配额**，否则失败重试吃光许可，正常分片全部饿死 | `scheduler.rs:234-250,405-418` | core 并发控制 | ⬜ |
-| A14 | **全抖动退避（AWS 标准）**：`random(0, min(64000, 1000 * 2^n))`，n 上限 5。防惊群 | `scheduler.rs:375-388` | core 重试 | ⬜ |
+| A13 | **全局信号量 12（=3 接收端 × 4 块）+ 重试独立配额 4** —— 全局而非每 peer 独立（防多接收端总并发爆炸）；**重试必须单独配额**，否则失败重试吃光许可，正常分片全部饿死 | `transfer/schedule.rs` | core 并发控制 | ✅ |
+| A14 | **全抖动退避（AWS 标准）**：`random(0, min(64000, 1000 * 2^n))`，n 上限 5。防惊群 | `transfer/schedule.rs::full_jitter_backoff_ms` | core 重试 | ✅ |
 | A15 | **422 刻意视为可重试** —— 违背 HTTP 惯例，因为本协议里 422 = 块 SHA-256 校验失败，重传大概率成功 | `scheduler.rs:204-207` | core 重试判定 | ⬜ |
-| A16 | **Merkle 奇数节点复制自身而非补零**（BEP-0052 规定）。填错规则会与标准实现根哈希不一致 | `scheduler.ts:112-118` | core merkle | ⬜ |
-| A17 | **Merkle 三层结构**：Leaf 16KiB / Piece 4MB / Root。容易在实现时混为两层 | `scheduler.ts:66-77` | core merkle | ⬜ |
+| A16 | **Merkle 奇数节点复制自身而非补零**（BEP-0052 规定）。填错规则会与标准实现根哈希不一致 | `crypto/merkle.rs`（含 proof/verify 补完） | core merkle | ✅ |
+| A17 | **Merkle 三层结构**：Leaf 16KiB / Piece 4MB / Root。容易在实现时混为两层 | `crypto/merkle.rs`（piece 级叶子，16KiB 子层校验待补） | core merkle | ⚠️ |
 | A18 | **冲突处理：绝不覆盖、绝不弹窗**，由接收端按 `原名_MMDDhhmmss.扩展名` 重命名。局域网备份常在无人值守时跑，弹窗会挂死流程。宁可多一份副本，不可静默丢数据 | `conflict.ts:1-7` | core 冲突处理 | ⬜ |
 | A19 | **冲突的幂等跳过**：同名且 size/mtime 完全一致 → 视为已存在不冲突（否则上次中断重试会产生 `_0815234500` 副本） | `conflict.ts:35-42` | core 冲突处理 | ⬜ |
 | A20 | **心跳失败不阻断传输**（catch 只 log 不 rethrow）—— 心跳是尽力而为，心跳失败 ≠ 传输失败，否则弱网抖动会误杀大传输 | `transfer.ts:533-554` | core 心跳 | ⬜ |
@@ -206,8 +206,8 @@
 | E3 | 认为 golden file 校验在生效 | `golden/manifest.json` 的 `schemaHash` 是 `PENDING_FIRST_CAPTURE`，`capturedAt` 为 null —— **从未回填，校验事实上未生效** | 契约即代码（schemars）必须同时回填 schemaHash |
 | E4 | 未发现协议目录自相矛盾 | README 说 3.0，golden 写 3.1；README 说"无 pair/initiate 端点"，manifest.json 的 endpoints 又列了它们 | V4 路由表定稿时一次性清理 |
 | E5 | 未发现扫描自过滤失效 | 广播 fingerprint 是 UUID，自过滤却拿它跟 8 位连接码比，永不相等 → 手机把自己扫进设备列表 | 列入 M34 修复 |
-| E6 | 未发现弱校验实现与注释不符 | `scheduler.ts` 注释写 xxHash64，但常量 `PRIME64_4 = 9650019240527522597` 与标准 xxHash64（`9650029242287828579`）不同，轮函数也非标准 —— **不是标准 xxHash64** | 若 Rust/Java 用标准 xxHash64，弱校验将永不命中。降级为强校验（不产生错误，但性能损失）。V4 必须统一 |
-| E7 | 未发现分块大小四处不一致 | `transfer.ts:196` 4MB / `transfer.ts:659` 8MB / `scheduler.ts:601` 16MB / 我文档里「小文件 <16MB 跳过 diff」 | V4 必须统一为**单一常量源**。且我的"小文件跳过 diff"与"tiny 文件 tar 聚合"是**冲突策略** |
+| E6 | 未发现弱校验实现与注释不符 | `scheduler.ts` 注释写 xxHash64，但常量 `PRIME64_4 = 9650019240527522597` 与标准 xxHash64（`9650029242287828579`）不同，轮函数也非标准 —— **不是标准 xxHash64** | ✅ 已统一：V4 弃用含糊的 xxHash64，改用无歧义的 **Adler-32** 作为弱校验（`transfer/chunk.rs::weak_checksum`），根除「常量对不上 → 弱校验永不命中」风险；强校验仍由 SHA-256 担责 |
+| E7 | 未发现分块大小四处不一致 | `transfer.ts:196` 4MB / `transfer.ts:659` 8MB / `scheduler.ts:601` 16MB / 我文档里「小文件 <16MB 跳过 diff」 | ✅ 常量源已统一：`PIECE_SIZE`(4MiB)/`BASIC_CHUNK_SIZE`(16MiB) 单一来源 + 编译期对齐断言（`transfer/chunk.rs`）。另：「小文件跳过 diff」与「tiny tar 聚合」的冲突见 A9，仍待定 |
 | E8 | 未发现两个连接码规范化函数行为不同 | `identity.ts:80` 只去 `[\s\-_]`，`pairing.ts:259` 去所有 `[^A-Z0-9]`。`a.b` 在前者保留为 `A.B`（非法） | V4 统一为一个 |
 | E9 | 未发现 `TINY_BATCH_SIZE = 20` 与注释「50-100 为工程平衡点」矛盾 | `transfer.ts:669` vs `transfer.ts:632,636` | V4 统一 |
 

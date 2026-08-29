@@ -8,8 +8,12 @@
 //! 自动降级到基础算法（见 [`chunk::degrade_from_pieces`]），界面明示当前算法与降级原因。
 
 pub mod chunk;
+pub mod schedule;
 
 pub use chunk::{
-    block_count, blocks_to_pieces, degrade_from_pieces, piece_count, ChunkPlan, DegradePlan,
-    BASIC_CHUNK_SIZE, PIECE_SIZE, PIECES_PER_BLOCK,
+    block_count, blocks_to_pieces, compute_chunk_diff, degrade_from_pieces, piece_count,
+    weak_checksum, weak_screen, DiffResult, PieceHash, ChunkPlan, DegradePlan, BASIC_CHUNK_SIZE,
+    PIECE_SIZE, PIECES_PER_BLOCK,
 };
+
+pub use schedule::{full_jitter_backoff_ms, ChunkPermit, RetryPermit, TransferScheduler};

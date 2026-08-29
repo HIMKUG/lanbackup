@@ -170,6 +170,103 @@ pub fn blocks_to_pieces(completed_blocks: &[u64], plan: &ChunkPlan) -> Vec<u64> 
     pieces
 }
 
+// ===== 弱/强双校验 + ChunkDiff（接通 scheduler.ts 死代码，见 V4-ARCHITECTURE §3.4 问题2 / §7.1） =====
+//
+// 设计约束（来自 DESIGN-WISDOM-REGISTER）：
+// - E6：旧 weakChecksum 注释写 xxHash64，但常量与标准实现不符 —— 若 Rust 用标准 xxHash64
+//   弱校验将永不命中。V4 改用**无歧义的 Adler-32**（rsync 标准弱校验），从根上消除「常量对不上」风险。
+// - 弱校验只做「快筛」（廉价、可错），强校验（SHA-256）才是正确性依据；两者配合实现
+//   rsync 式 missing / matched / mismatched 三分类（与 `dto::session::ChunkDiff` 语义对齐）。
+
+use std::collections::{HashMap, HashSet};
+
+/// 强校验：piece 内容的 SHA-256（单一事实源，复用 `crypto::merkle::sha256_of`）
+pub use crate::crypto::merkle::sha256_of as strong_checksum;
+
+/// 弱校验（Adler-32，rsync 标准）。
+///
+/// 选用 Adler-32 而非 xxHash64 的考量（见 E6）：xxHash64 在旧实现里常量写错、非标准，
+/// 且 V4 要「统一」弱校验算法。Adler-32 定义明确、无魔数歧义，作为快筛足够。
+/// 注意：弱校验**不是**完整性依据，仅用于 cheap 地判断「对端可能有这块」，
+/// 最终是否一致以 `strong_checksum`（SHA-256）为准。
+pub fn weak_checksum(data: &[u8]) -> u32 {
+    const MOD: u32 = 65521; // 65521 = 最大素数 < 65536
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+    for &byte in data {
+        a = (a + byte as u32) % MOD;
+        b = (b + a) % MOD;
+    }
+    (b << 16) | a
+}
+
+/// 单个 piece 的双校验摘要
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PieceHash {
+    pub index: u64,
+    /// 弱校验（Adler-32），用于快筛
+    pub weak: u32,
+    /// 强校验（SHA-256），作为正确性依据
+    pub strong: [u8; 32],
+}
+
+impl PieceHash {
+    /// 由 piece 字节一次性算出弱/强双校验
+    pub fn from_piece(index: u64, data: &[u8]) -> Self {
+        Self {
+            index,
+            weak: weak_checksum(data),
+            strong: strong_checksum(data),
+        }
+    }
+}
+
+/// 块差异结果（与 `dto::session::ChunkDiff` 的三分类语义一致）
+///
+/// - `missing`：对端完全没有（必须传输）
+/// - `matched`：对端有且强校验一致（可跳过）
+/// - `mismatched`：对端有但强校验不一致（内容已变，需重传）
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiffResult {
+    pub missing: Vec<u64>,
+    pub matched: Vec<u64>,
+    pub mismatched: Vec<u64>,
+}
+
+/// 发送端用：把本地 piece 双校验集合与对端已确认的强校验集合比对，产出差异。
+///
+/// `peer_strong` 来自接收端的权威块位图（`GET /api/v4/session/diff`），**不能用发送端本地推测**。
+/// 分类规则：
+/// - 对端无该 piece（不在 `peer_strong`）→ `missing`
+/// - 对端有且该 piece 强校验一致 → `matched`
+/// - 对端有但强校验不一致 → `mismatched`
+pub fn compute_chunk_diff(
+    source: &[PieceHash],
+    peer_strong: &HashMap<u64, [u8; 32]>,
+) -> DiffResult {
+    let mut diff = DiffResult::default();
+    for ph in source {
+        match peer_strong.get(&ph.index) {
+            None => diff.missing.push(ph.index),
+            Some(s) if s == &ph.strong => diff.matched.push(ph.index),
+            Some(_) => diff.mismatched.push(ph.index),
+        }
+    }
+    // 排序保证结果确定性（便于对账与测试）
+    diff.missing.sort_unstable();
+    diff.matched.sort_unstable();
+    diff.mismatched.sort_unstable();
+    diff
+}
+
+/// 弱校验快筛：对端是否可能存在该块的弱校验命中。
+///
+/// 命中**不代表**内容一致（需强校验确认），但不命中一定可跳过强校验计算，
+/// 用于在带宽受限场景先发弱校验、只对候选块取强校验。
+pub fn weak_screen(weak: u32, peer_weak: &HashSet<u32>) -> bool {
+    peer_weak.contains(&weak)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +355,88 @@ mod tests {
         assert_eq!(plan.piece_to_block(4), 1);
         assert_eq!(plan.piece_to_block(7), 1);
         assert_eq!(plan.piece_to_block(8), 2);
+    }
+
+    // ===== 弱/强双校验 + ChunkDiff 测试 =====
+
+    #[test]
+    fn weak_checksum_empty_is_adler_one() {
+        // Adler-32 规范：空输入 = 1
+        assert_eq!(weak_checksum(&[]), 1);
+    }
+
+    #[test]
+    fn weak_checksum_single_byte_known() {
+        // "a"：a = 1+97 = 98, b = 0+98 = 98 → (98<<16)|98
+        assert_eq!(weak_checksum(b"a"), (98u32 << 16) | 98);
+    }
+
+    #[test]
+    fn weak_checksum_is_deterministic_and_changes() {
+        assert_eq!(weak_checksum(b"hello"), weak_checksum(b"hello"));
+        // 单字节差异应改变弱校验（足够做快筛）
+        assert_ne!(weak_checksum(b"ab"), weak_checksum(b"ac"));
+    }
+
+    #[test]
+    fn piece_hash_from_piece_computes_both() {
+        let ph = PieceHash::from_piece(3, b"payload");
+        assert_eq!(ph.index, 3);
+        assert_eq!(ph.weak, weak_checksum(b"payload"));
+        assert_eq!(ph.strong, strong_checksum(b"payload"));
+    }
+
+    #[test]
+    fn diff_classifies_missing_matched_mismatched() {
+        // 3 个 piece 的源端哈希
+        let p0 = PieceHash::from_piece(0, b"alpha");
+        let p1 = PieceHash::from_piece(1, b"bravo");
+        let p2 = PieceHash::from_piece(2, b"charlie");
+        let source = vec![p0.clone(), p1.clone(), p2.clone()];
+
+        // 对端只持有 p0（一致）和 p1（但内容变了 → 强校验不符）
+        let mut peer: HashMap<u64, [u8; 32]> = HashMap::new();
+        peer.insert(0, p0.strong); // 一致 → matched
+        peer.insert(1, strong_checksum(b"BRAVO-CHANGED")); // 不一致 → mismatched
+
+        let diff = compute_chunk_diff(&source, &peer);
+        assert_eq!(diff.matched, vec![0]);
+        assert_eq!(diff.mismatched, vec![1]);
+        assert_eq!(diff.missing, vec![2]);
+    }
+
+    #[test]
+    fn diff_all_missing_when_peer_empty() {
+        let source = vec![
+            PieceHash::from_piece(0, b"x"),
+            PieceHash::from_piece(1, b"y"),
+        ];
+        let peer: HashMap<u64, [u8; 32]> = HashMap::new();
+        let diff = compute_chunk_diff(&source, &peer);
+        assert_eq!(diff.missing, vec![0, 1]);
+        assert!(diff.matched.is_empty());
+        assert!(diff.mismatched.is_empty());
+    }
+
+    #[test]
+    fn diff_all_matched_when_peer_fully_in_sync() {
+        let s0 = PieceHash::from_piece(0, b"x");
+        let s1 = PieceHash::from_piece(1, b"y");
+        let source = vec![s0.clone(), s1.clone()];
+        let mut peer: HashMap<u64, [u8; 32]> = HashMap::new();
+        peer.insert(0, s0.strong);
+        peer.insert(1, s1.strong);
+        let diff = compute_chunk_diff(&source, &peer);
+        assert_eq!(diff.matched, vec![0, 1]);
+        assert!(diff.missing.is_empty());
+        assert!(diff.mismatched.is_empty());
+    }
+
+    #[test]
+    fn weak_screen_filters_by_weak_checksum() {
+        let mut peer = HashSet::new();
+        peer.insert(weak_checksum(b"hit"));
+        assert!(weak_screen(weak_checksum(b"hit"), &peer));
+        assert!(!weak_screen(weak_checksum(b"miss"), &peer));
     }
 }
