@@ -3,11 +3,13 @@
 # 工作区根目录：D:/code/tools/6a7f5d5699c44b33268ede69/
 #
 # 包说明：
-#   - shared-core/     纯 TS，两端复用（pairing/crypto/transfer/scheduler...）
+#   - core/            ★ Rust crate（V4 第五个包）：协议与算法的唯一实现，两端共用
+#   - shared-core/     纯 TS，两端复用（V4 后瘦身为日志/配置/UI 编排，协议实现全归 core）
 #   - shared-ui/       纯 TS/Vue，液态玻璃组件库（桌面端和移动端共用）
 #   - desktop/         Tauri + Vue，桌面端应用
 #   - mobile/          Capacitor + Vue，手机端应用（包含 local-receiver/ 子模块）
 packages:
+  - 'core'
   - 'shared-core'
   - 'shared-ui'
   - 'desktop'

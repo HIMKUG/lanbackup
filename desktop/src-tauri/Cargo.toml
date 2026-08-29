@@ -29,7 +29,12 @@ serde_json = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 # LocalSend 核心：HTTP 传输（v2 协议客户端 + 服务端）+ 设备发现
 # http feature 自动包含 crypto（mTLS 证书等），这里用纯 HTTP 时 tls_config 传 None 即可
-localsend = { path = "../../../docs/localsend-main/packages/core", features = ["http", "multicast"] }
+#
+# 2026-08-29：改为指向仓库内的 vendored 副本，详见 third_party/localsend/VENDOR.md。
+# 原路径 ../../../docs/localsend-main/packages/core 位于仓库之外，导致
+#   ① 换机器 clone 后 cargo build 直接失败 ② 上游无版本控制，本地修改不可追溯
+# V4 阶段 2 将吸收其 HTTP 管道并删除 V2 协议层，届时本依赖项可能整体移除。
+localsend = { path = "../../third_party/localsend", features = ["http", "multicast"] }
 tokio = { version = "1", features = ["full"] }
 # 大文件流式上传（ReaderStream）
 tokio-util = { version = "0.7", features = ["io"] }
@@ -90,8 +95,10 @@ strip = true
 opt-level = 3
 [profile.release.package.localsend]
 opt-level = 3
-[profile.release.package.localsend-core]
-opt-level = 3
+# 2026-08-29：删除 `[profile.release.package.localsend-core]` —— 该包不存在
+# （上游 crate 名是 `localsend`），cargo 每次构建都告警
+# "profile package spec did not match any packages"。
+# V4 阶段 2 接入 lanbackup-core 后，在此为其补 opt-level = 3。
 
 [profile.release.package.tauri]
 opt-level = "s"

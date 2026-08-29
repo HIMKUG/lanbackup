@@ -1,0 +1,61 @@
+[package]
+name = "lanbackup-core"
+version = "0.1.0"
+description = "局域网备份工具核心（V4 单一实现，桌面端与手机端共用）"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "lanbackup_core"
+# cdylib 供 Android JNI/uniFFI 使用；rlib 供桌面端 Tauri 直接依赖
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+# ---------- 异步与 HTTP ----------
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+http-body-util = "0.1"
+http = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider"] }
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+
+# ---------- 序列化 ----------
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 契约即代码：从 Rust 类型生成 JSON Schema（见 V4-ARCHITECTURE.md §八）
+schemars = "0.8"
+
+# ---------- 密码学 ----------
+# 版本与 localsend 上游对齐，避免 Cargo 多版本共存（rand 0.8+0.10、sha2 0.10+0.11 等）
+rand = "0.10"
+sha2 = "0.11"
+hkdf = "0.12"
+pbkdf2 = "0.13"
+hmac = "0.12"
+ring = "0.17"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+base64 = "0.23"
+hex = "0.4"
+
+# ---------- 网络 ----------
+if-addrs = "0.15"
+socket2 = "0.6"
+
+# ---------- 存储 ----------
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# ---------- 工具 ----------
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+log = "0.4"
+
+[dev-dependencies]
+# 协议 conformance：校验生成的 schema 与 golden file
+jsonschema = "0.18"
+
+# 发布优化：core 是性能热点，保持 opt-level 3
+[profile.release.package.lanbackup-core]
+opt-level = 3

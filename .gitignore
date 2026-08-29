@@ -9,10 +9,17 @@ mobile/android/.gradle/
 mobile/android/.idea/
 mobile/android/local.properties
 mobile/android/.kotlin/
+# Capacitor 插件自身的构建产物（上面的 mobile/android/** 规则匹配不到）
+mobile/local-receiver/android/build/
+mobile/local-receiver/android/.gradle/
+mobile/local-receiver/android/.idea/
 
 # Rust
-**/Cargo.lock
-src-tauri/target/
+# 2026-08-29：二进制 crate 必须提交 lockfile 才能保证可复现构建。
+# 此前 `**/Cargo.lock` 把 desktop/src-tauri/Cargo.lock 排除了，
+# 导致换机器构建时依赖版本可能漂移。改为显式放行，第三方库的 lock 仍不跟踪。
+**/target/
+third_party/localsend/target/
 
 # 编辑器
 .vscode/
