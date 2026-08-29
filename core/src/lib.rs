@@ -20,20 +20,20 @@
 //! - `V4-TRANSFER-MODULE.md` —— 传输状态机、按钮可用性、降级策略
 //! - `DESIGN-WISDOM-REGISTER.md` —— **既有代码的实测智慧清单，重构不得遗漏**
 
+pub mod crypto;
+pub mod dto;
 pub mod error;
+pub mod state;
+pub mod transfer;
 pub mod version;
 
 pub use error::{Error, ErrorCode, ErrorEnvelope, Result};
 pub use version::{Capabilities, API_PREFIX, PROTOCOL_VERSION};
-
-// TODO(阶段 1): pub mod dto;      —— V4 全部 DTO，schemars 生成 JSON Schema
 // TODO(阶段 2): pub mod server;   —— 单一 hyper 路由表（吸收 localsend 的 HTTP 管道）
-// TODO(阶段 2.5): pub mod transfer; —— 主算法 + 基础算法
+// TODO(阶段 2.5): 主算法数据面（块差异/弱校验/Merkle 校验/并发续传的 IO 编排）
 // TODO(阶段 3): pub mod schedule; —— 并发控制（tokio Semaphore）
-// TODO(阶段 3): pub mod state;    —— 会话/连接/在线性状态机
-// TODO(阶段 4.5): pub mod crypto; —— 握手层 ECDSA 签名 + 统一 AEAD 传输加密
 // TODO(阶段 5): pub mod pairing;  —— 配对、解配对、吊销、双向对账
-// TODO(阶段 4): pub mod presence; —— UDP beacon 与在线性维护
+// TODO(阶段 4): pub mod presence; —— UDP beacon 与在线性维护（状态机在 state::presence）
 // TODO(阶段 4): pub mod sync;     —— 三路增量、manifest、archive/mirror 策略
 // TODO(阶段 5): pub mod discovery; —— 组播与子网探测
 // TODO(阶段 5): pub mod identity; —— 设备身份与连接码派生
