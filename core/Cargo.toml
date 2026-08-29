@@ -17,6 +17,7 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "tokio"] }
 http-body-util = "0.1"
 http = "1"
+bytes = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider"] }
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }

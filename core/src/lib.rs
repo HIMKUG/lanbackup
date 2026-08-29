@@ -23,6 +23,7 @@
 pub mod crypto;
 pub mod dto;
 pub mod error;
+pub mod server;
 pub mod state;
 pub mod transfer;
 pub mod version;

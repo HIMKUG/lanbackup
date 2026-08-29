@@ -26,6 +26,20 @@
       ]
     },
     {
+      "description": "请求体格式/字段非法",
+      "type": "string",
+      "enum": [
+        "BAD_REQUEST"
+      ]
+    },
+    {
+      "description": "当前状态不允许该操作（状态机拒绝迁移）",
+      "type": "string",
+      "enum": [
+        "ILLEGAL_STATE"
+      ]
+    },
+    {
       "description": "传输已中止（用户中止或连接断开）",
       "type": "string",
       "enum": [

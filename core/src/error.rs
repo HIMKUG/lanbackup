@@ -23,6 +23,10 @@ pub enum ErrorCode {
     TokenExpired,
     /// 对端不具备请求的能力
     CapabilityUnsupported,
+    /// 请求体格式/字段非法
+    BadRequest,
+    /// 当前状态不允许该操作（状态机拒绝迁移）
+    IllegalState,
     /// 传输已中止（用户中止或连接断开）
     Aborted,
     /// 会话无进展超时
@@ -44,6 +48,8 @@ impl ErrorCode {
             Self::UnknownDevice => "UNKNOWN_DEVICE",
             Self::TokenExpired => "TOKEN_EXPIRED",
             Self::CapabilityUnsupported => "CAPABILITY_UNSUPPORTED",
+            Self::BadRequest => "BAD_REQUEST",
+            Self::IllegalState => "ILLEGAL_STATE",
             Self::Aborted => "ABORTED",
             Self::Stalled => "STALLED",
             Self::Internal => "INTERNAL",
@@ -56,6 +62,8 @@ impl ErrorCode {
             Self::InvalidRequest | Self::InvalidCode => 400,
             Self::Untrusted | Self::HmacMismatch | Self::TokenExpired => 401,
             Self::CapabilityUnsupported => 409,
+            Self::BadRequest => 400,
+            Self::IllegalState => 409,
             Self::RateLimitExceeded => 429,
             Self::NotFound | Self::UnknownDevice => 404,
             Self::VersionUnsupported => 426,
