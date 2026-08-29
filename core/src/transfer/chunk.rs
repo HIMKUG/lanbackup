@@ -24,21 +24,34 @@
 
 use crate::dto::session::Algorithm;
 
+// 分块常量**只在 `crate::version` 定义一处**，此处仅重导出。
+//
+// 这不是洁癖。本模块开头引的 C10 就是「四处并存 4MB/8MB/16MB」那次事故，
+// 而此前 chunk.rs 自己又写了一遍 `PIECE_SIZE = 4MiB` / `BASIC_CHUNK_SIZE = 16MiB`，
+// 与 version.rs 的定义**数值上恰好相等**——纯属运气。
+// 只要有人调 version.rs 里的 BASIC_CHUNK_SIZE（那里写成 `4 * PIECE_SIZE`，
+// 看起来就是"可以调的"），对齐不变式在 chunk.rs 这边毫无察觉，
+// 编译期断言也拦不住——因为它守的是 chunk.rs 那份副本。
+
 /// 主算法分块单位（piece）。所有续传 / 差异 / 并发以 piece 为最小粒度。
-pub const PIECE_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB
+pub use crate::version::PIECE_SIZE;
 
 /// 基础算法块大小。见模块文档的不变式说明。
-pub const BASIC_CHUNK_SIZE: u64 = 16 * 1024 * 1024; // 16 MiB
+pub use crate::version::BASIC_CHUNK_SIZE;
 
 /// 一个基础块涵盖多少个主算法 piece。由对齐不变式保证为整数。
-pub const PIECES_PER_BLOCK: u64 = BASIC_CHUNK_SIZE / PIECE_SIZE;
+///
+/// `version::BASIC_CHUNK_PIECES` 的别名，保留本模块的命名习惯。
+pub use crate::version::BASIC_CHUNK_PIECES as PIECES_PER_BLOCK;
 
-// 编译期断言：对齐不变式不能被破坏（破坏则降级会丢失进度）
+// 编译期断言：对齐不变式不能被破坏（破坏则降级会丢失进度）。
+// 现在守的是**唯一那份**定义。
 const _: () = assert!(
     BASIC_CHUNK_SIZE.is_multiple_of(PIECE_SIZE),
     "BASIC_CHUNK_SIZE 必须是 PIECE_SIZE 的整数倍，否则降级会丢弃进度"
 );
 const _: () = assert!(PIECE_SIZE > 0 && BASIC_CHUNK_SIZE > 0);
+const _: () = assert!(PIECES_PER_BLOCK > 0);
 
 /// 计算文件被切成多少个 piece（空文件为 0）
 pub fn piece_count(file_size: u64) -> u64 {

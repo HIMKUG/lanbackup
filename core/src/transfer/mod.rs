@@ -14,10 +14,18 @@
 //! | [`chunk`] | 分块几何、弱/强校验、差异计算、piece→block 换算 | 纯函数，不含策略 |
 //! | [`schedule`] | 并发许可、重试退避 | 不判断"该不该降级" |
 //! | [`degrade`] | **何时降级、记多久、给用户看什么** | 不自己转状态机 |
+//! | [`session`] | **编排**：把上面三者接成一条真实链路，驱动状态机 | 不做 IO |
+//! | [`cleanup`] | 断开/中止的有序清理清单 | 不执行真实 IO |
+//!
+//! 分层的收益在 [`session`] 上体现得最明显：它不碰 socket，
+//! 于是"连续 3 个块重试耗尽必须降级"这类只在故障时才走到的路径
+//! 变成了纯同步断言 —— 否则这部分永远不会有测试。
 
 pub mod chunk;
+pub mod cleanup;
 pub mod degrade;
 pub mod schedule;
+pub mod session;
 
 pub use chunk::{
     block_count, blocks_to_pieces, compute_chunk_diff, degrade_from_pieces, piece_count,
@@ -31,4 +39,10 @@ pub use degrade::{
     SessionOutcome,
 };
 
-pub use schedule::{full_jitter_backoff_ms, ChunkPermit, RetryPermit, TransferScheduler};
+pub use schedule::{
+    chunk_backoff_ms, full_jitter_backoff_ms, ChunkPermit, RetryPermit, TransferScheduler,
+};
+
+pub use cleanup::{CleanupAction, CleanupPlan, CleanupTrigger};
+
+pub use session::{Applied, Outcome, SessionDriver, SessionError, Step};

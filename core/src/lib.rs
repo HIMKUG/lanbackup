@@ -39,14 +39,16 @@ pub use version::{Capabilities, API_PREFIX, PROTOCOL_VERSION};
 // 阶段 2.4 server                  —— hyper 路由 /api/v4/*、内存会话、状态机门控
 // 阶段 2.5 crypto::merkle          —— proof/verify_piece（接收端独立验证任意 piece）
 //          transfer::chunk         —— 弱/强双校验 + ChunkDiff 三分类
-//          transfer::schedule      —— 全局信号量 12 + 重试独立配额 4 + 全抖动退避
+//          transfer::schedule      —— 全局信号量 12 + 重试独立配额 4 + 全抖动退避（握手/块两套）
+// 阶段 2.6 transfer::session       —— 编排器：决策与 IO 分离，驱动状态机串起 prepare/对账/收发/校验
+//          transfer::cleanup       —— §六 断开/中止有序清理清单（先停请求→释放许可→清内存→删文件）
+//          transfer::degrade       —— DegradeController 接入编排循环（observe 真实信号、执行 events、算进度、出可见性）
 // 阶段 3   state::policy           —— 按钮可用性与文档 §3 三张表逐行对齐（表驱动测试）
 // 阶段 4.1 transfer::degrade       —— D1-D6 降级判定 + 设备级记忆 + UI 可见性快照
 // 阶段 4.3 presence::beacon        —— 32B UDP beacon 报文与 HMAC 认证（纯计算部分）
 //          presence::tracker       —— (ts,seq) 单调水位重放防护 + 在线性衰减
 //
 // ── 待落地 ─────────────────────────────────────────────────────────────
-// TODO(阶段 2.6): 主算法 IO 编排（把 chunk/schedule/merkle 串成实际收发流水线）
 // TODO(阶段 4):   presence 传输层 —— UDP 收发、Android MulticastLock（W5/M22）
 // TODO(阶段 4):   pub mod sync;      —— 三路增量、manifest、archive/mirror 策略
 // TODO(阶段 5):   pub mod pairing;   —— 配对、解配对、吊销、双向对账
