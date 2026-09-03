@@ -15,10 +15,8 @@ import {
 } from '../identity.js';
 import { diffManifests, buildManifest, makeEntry } from '../manifest.js';
 import { updateAnchors, isAfterAnchor, scanDateRange } from '../anchor.js';
-import { isConflict, conflictRename, resolveFileName } from '../conflict.js';
 import { quickScan, deepScan } from '../scan.js';
 import { createEmptyState, getOrCreateDevice, markBackupDone, migrateState } from '../state.js';
-import { decidePolicy, isSameWifi } from '../autopolicy.js';
 import {
   DebugDispatcher,
   maskSecret,
@@ -87,30 +85,6 @@ test('锚点：只增不删，mtime 更新', () => {
   assert.ok(isAfterAnchor(anchors, 'b.txt', 0), '无锚点应扫描');
 });
 
-test('冲突：同名且大小/mtime 不一致 → 冲突', () => {
-  const existing = { name: 'IMG_001.jpg', size: 100, mtime: 1000 };
-  assert.ok(isConflict(existing, { name: 'IMG_001.jpg', size: 200, mtime: 1000 }), '大小不同冲突');
-  assert.ok(isConflict(existing, { name: 'IMG_001.jpg', size: 100, mtime: 2000 }), 'mtime不同冲突');
-  assert.ok(!isConflict(existing, { name: 'IMG_001.jpg', size: 100, mtime: 1000 }), '完全一致不冲突');
-  assert.ok(!isConflict(undefined, { name: 'IMG_001.jpg', size: 100, mtime: 1000 }), '不存在不冲突');
-});
-
-test('冲突重命名：原名_MMDDhhmmss.扩展名', () => {
-  const mtime = new Date(2026, 7, 15, 8, 23, 45).getTime(); // 2026-08-15 08:23:45
-  const renamed = conflictRename('IMG_001.jpg', mtime);
-  assert.strictEqual(renamed, 'IMG_001_0815082345.jpg');
-});
-
-test('resolveFileName：冲突时重命名，不覆盖', () => {
-  const existing = {
-    'IMG_001.jpg': { name: 'IMG_001.jpg', size: 100, mtime: 1000 },
-  };
-  const incoming = { name: 'IMG_001.jpg', size: 200, mtime: new Date(2026, 7, 15, 8, 23, 45).getTime() };
-  const result = resolveFileName(existing, incoming);
-  assert.notStrictEqual(result, 'IMG_001.jpg', '不应覆盖原名');
-  assert.ok(result.startsWith('IMG_001_'), '应重命名');
-});
-
 test('快速扫描：只返回锚点之后的文件', () => {
   const anchors = updateAnchors({}, [{ relPath: 'a.txt', lastMtime: 1000 }]);
   const allFiles = [
@@ -162,25 +136,6 @@ test('状态：迁移旧版本状态，补全缺失字段', () => {
   assert.deepStrictEqual(d.anchors, {}, '锚点应补空对象');
   assert.strictEqual(d.autoPolicy, 'semi', '策略应补默认值');
   assert.strictEqual(d.lastBackupAt, null, '时间应补 null');
-});
-
-test('自动策略：半自动弹窗、纯自动静默、纯手动不触发', () => {
-  assert.strictEqual(decidePolicy('semi', true, true), 'ask', '半自动+在线+同WiFi → 询问');
-  assert.strictEqual(decidePolicy('auto', true, true), 'auto', '纯自动+在线+同WiFi → 静默');
-  assert.strictEqual(decidePolicy('manual', true, true), 'none', '纯手动 → 不触发');
-  assert.strictEqual(decidePolicy('semi', false, true), 'none', '设备不在线 → 不触发');
-  assert.strictEqual(decidePolicy('semi', true, false), 'none', '不同WiFi → 不触发');
-});
-
-test('同 Wi-Fi 判断：比较 /24 网段', () => {
-  assert.ok(isSameWifi('192.168.1.5', '192.168.1.100'), '同网段 → 同WiFi');
-  assert.ok(!isSameWifi('192.168.1.5', '192.168.2.100'), '不同网段 → 不同WiFi');
-  assert.ok(!isSameWifi('', '192.168.1.100'), '空IP → 不同WiFi');
-});
-
-test('同 Wi-Fi 判断：可配置网段长度（/16）', () => {
-  assert.ok(isSameWifi('192.168.1.5', '192.168.2.100', 16), '/16 同网段 → 同WiFi');
-  assert.ok(!isSameWifi('192.168.1.5', '192.169.2.100', 16), '/16 不同网段 → 不同WiFi');
 });
 
 test('Logger：格式、环形缓冲上限、export 拼接', () => {

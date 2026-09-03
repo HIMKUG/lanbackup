@@ -285,6 +285,18 @@ impl PresenceSocket {
         group: Ipv4Addr,
         guard: Box<dyn MulticastGuard>,
     ) -> io::Result<Self> {
+        Self::bind_with_guard_impl(port, group, guard, true)
+    }
+
+    /// 内部绑定实现。`acquire` 为 `true` 时在绑定时获取组播锁；为 `false` 时假定锁已由
+    /// 调用方持有（如 [`Self::rebuild`] 重建时），不再重复获取——否则同一把锁会被
+    /// acquire 两次，M22 语义被破坏（锁在 `Drop` 时仍只 release 一次，但计数错乱）。
+    fn bind_with_guard_impl(
+        port: u16,
+        group: Ipv4Addr,
+        guard: Box<dyn MulticastGuard>,
+        acquire: bool,
+    ) -> io::Result<Self> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_reuse_address(true)?;
         #[cfg(unix)]
@@ -316,11 +328,13 @@ impl PresenceSocket {
             joined = 1;
         }
 
-        // M22：绑定成功即获取组播锁，失败仅告警不致命。
-        if let Err(e) = guard.acquire() {
-            log::warn!(
-                "MulticastGuard acquire failed (beacon may be dropped by Wi-Fi chip in power-save): {e}"
-            );
+        // M22：绑定时获取组播锁（仅当尚未持有时），失败仅告警不致命。
+        if acquire {
+            if let Err(e) = guard.acquire() {
+                log::warn!(
+                    "MulticastGuard acquire failed (beacon may be dropped by Wi-Fi chip in power-save): {e}"
+                );
+            }
         }
 
         let std_socket: std::net::UdpSocket = socket.into();
@@ -391,7 +405,8 @@ impl PresenceSocket {
         // 否则锁随套接字一起丢，等于没持锁。
         let guard = self.guard.take();
         let fresh = match guard {
-            Some(g) => Self::bind_with_guard(self.port, self.group, g)?,
+            // 锁已由调用方持有，重建时**不再重新 acquire**（否则同一把锁被 acquire 两次）。
+            Some(g) => Self::bind_with_guard_impl(self.port, self.group, g, false)?,
             None => Self::bind(self.port, self.group)?,
         };
         *self = fresh;
@@ -613,5 +628,115 @@ mod tests {
         let g = NoopMulticastGuard;
         assert!(g.acquire().is_ok());
         g.release();
+    }
+
+    /// M22 端到端验证：组播锁必须在 `bind_with_guard` 时 acquire，
+    /// 并在 `PresenceSocket` 被 drop 时 release。这条测试锁死了「收发两条路径
+    /// 全生命周期持锁」的契约，避免日后重构把锁的获取/释放时机改错。
+    #[test]
+    fn multicast_guard_acquired_on_bind_and_released_on_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Clone, Debug)]
+        struct RecordingGuard {
+            acquired: Arc<AtomicUsize>,
+            released: Arc<AtomicUsize>,
+        }
+        impl MulticastGuard for RecordingGuard {
+            fn acquire(&self) -> Result<(), String> {
+                self.acquired.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn release(&self) {
+                self.released.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let acquired = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicUsize::new(0));
+        let guard = RecordingGuard {
+            acquired: acquired.clone(),
+            released: released.clone(),
+        };
+
+        // `bind_with_guard` 内部经 `UdpSocket::from_std` 注册到 tokio reactor，
+        // 必须在运行时上下文里调用；测试用 `current_thread` 运行时包住它。
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sock = rt
+            .block_on(async {
+                PresenceSocket::bind_with_guard(49152, MULTICAST_GROUP, Box::new(guard))
+            })
+            .expect("绑定应成功");
+        assert_eq!(
+            acquired.load(Ordering::SeqCst),
+            1,
+            "bind_with_guard 必须立即 acquire 组播锁"
+        );
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            0,
+            "add 发布前不应释放"
+        );
+
+        drop(sock);
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            1,
+            "PresenceSocket 销毁时必须 release 组播锁"
+        );
+    }
+
+    /// M22 + Drop 重建：套接字重建（`rebuild`）必须保留原有的组播锁，
+    /// 不能因借不到 guard 而丢锁。验证重建后总 acquire 次数仍为 1（未重复获取）、release 仍为 0。
+    #[test]
+    fn rebuild_preserves_multicast_guard() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Clone, Debug)]
+        struct RecordingGuard {
+            acquired: Arc<AtomicUsize>,
+            released: Arc<AtomicUsize>,
+        }
+        impl MulticastGuard for RecordingGuard {
+            fn acquire(&self) -> Result<(), String> {
+                self.acquired.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn release(&self) {
+                self.released.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let acquired = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicUsize::new(0));
+        let guard = RecordingGuard {
+            acquired: acquired.clone(),
+            released: released.clone(),
+        };
+
+        // 同样需要 tokio 运行时上下文：`bind_with_guard` 与 `rebuild` 都会创建
+        // `UdpSocket`（经 `from_std` 注册 reactor）。
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sock = rt
+            .block_on(async {
+                let mut s =
+                    PresenceSocket::bind_with_guard(49153, MULTICAST_GROUP, Box::new(guard))
+                        .expect("绑定应成功");
+                s.rebuild().expect("重建应成功");
+                s
+            });
+        assert_eq!(acquired.load(Ordering::SeqCst), 1, "重建不得重新 acquire");
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+
+        drop(sock);
+        assert_eq!(released.load(Ordering::SeqCst), 1, "销毁时释放一次即可");
     }
 }

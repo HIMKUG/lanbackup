@@ -70,10 +70,20 @@ thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 log = "0.4"
 
-[dev-dependencies]
-# 协议 conformance：校验生成的 schema 与 golden file
-jsonschema = "0.18"
+# ---------- Android JNI（仅 Android 构建启用，默认关闭，避免把 jni 拖进桌面/CI 构建） ----------
+# 启用 `android-jni` feature 后，`platform::android` 提供基于 JNI 的真实 `MulticastGuard`（M22）。
+jni = { version = "0.21", optional = true }
 
 # 发布优化：core 是性能热点，保持 opt-level 3
 [profile.release.package.lanbackup-core]
 opt-level = 3
+
+[features]
+default = []
+# Android 侧接入真实组播锁（M22）：启用后 `platform::android` 提供基于 JNI 的
+# `MulticastGuard` 实现，由 Android 侧把 `WifiManager` 经 JNI 注入 `PresenceSocket::bind_with_guard`。
+android-jni = ["jni"]
+
+[dev-dependencies]
+# 协议 conformance：校验生成的 schema 与 golden file
+jsonschema = "0.18"
