@@ -81,4 +81,8 @@ pub use version::{Capabilities, API_PREFIX, PROTOCOL_VERSION};
 //   模块实现即可，上层零改动。
 // - `server` 的 24 个端点已全部接线（`server::tests::every_declared_route_is_actually_wired`
 //   逐条验证 `routes::ALL` 都落到了 match 分支上）
+// - V4 core **原子替换契约**已定义于 `transfer::atomic_file`：临时文件与最终文件
+//   **同目录**（M20：SAF 无跨目录 rename）、同目录 rename 原子提交、跨目录降级为
+//   copy/delete 并明示读取窗口、并提供 `committed_bytes` 字节级续传种子。
+//   待桌面 / Android **平台层**接入（平台写盘路径不在本 crate，属阶段 6/7 工程化）。
 // - Android JNI 层需实现 `MulticastGuard`（M22：收发两条路径都要持锁）
