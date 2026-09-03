@@ -20,6 +20,8 @@ mobile/local-receiver/android/.idea/
 # 导致换机器构建时依赖版本可能漂移。改为显式放行，第三方库的 lock 仍不跟踪。
 **/target/
 third_party/localsend/target/
+# 备用构建目录（沙箱环境下 target/ 偶发不可写时的落脚点，同属构建产物）
+**/target-v/
 
 # 编辑器
 .vscode/

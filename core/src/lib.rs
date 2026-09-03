@@ -74,6 +74,9 @@ pub use version::{Capabilities, API_PREFIX, PROTOCOL_VERSION};
 // 这恰好守住了本 crate 存在的理由：协议与算法只此一份实现。
 //
 // ── 仍待推进（非阻塞，属后续工程化）───────────────────────────────────
-// - `SessionStore` 仍为内存实现，生产需换 rusqlite 持久化（依赖已就位）
-// - `server` 目前只实现了 6 个端点，其余 18 个路由常量已就位待接
+// - `SessionStore` 仍为内存实现，生产需换 rusqlite 持久化（依赖已就位）。
+//   注意这不只是"换个后端"：进程重启后已确认的 piece 位图全丢，
+//   续传会退化成全量重传（对端清单还在，但本端不记得收过什么）。
+// - `server` 的 24 个端点已全部接线（`server::tests::every_declared_route_is_actually_wired`
+//   逐条验证 `routes::ALL` 都落到了 match 分支上）
 // - Android JNI 层需实现 `MulticastGuard`（M22：收发两条路径都要持锁）

@@ -24,13 +24,25 @@ use crate::dto::session::{
     ReceiptRequest, SessionRegisterRequest, SessionRegisterResponse, TaskListResponse, TaskReceipt,
     TaskStatus, TransferPhase, VerifyFileResponse,
 };
+use crate::dto::DeviceType;
 use crate::error::ErrorCode;
+use crate::identity::DeviceIdentity;
 use crate::routes;
+use crate::server::control::{HandshakeStore, PeerStore};
 use crate::state::transfer::{TransferEvent, TransferState};
 use crate::transfer::chunk::piece_count;
 
+pub mod control;
+pub mod sync_api;
+
 /// 单个会话的运行时记录
 pub struct SessionRecord {
+    /// 发起这个会话的对端 deviceId（`session/register` 登记）。
+    ///
+    /// 必须记住"这个会话是谁的"，否则 `disconnect` 无法只收尾该设备名下的会话 ——
+    /// 要么谁都不收（对端断开后会话永远悬在 `Transferring`，下次连上撞到旧会话），
+    /// 要么全部收（A 设备断线顺手掐断 B 设备正在传的文件）。
+    pub device_id: String,
     pub phase: TransferState,
     pub algorithm: Algorithm,
     /// 降级原因；未降级为 None
@@ -57,6 +69,7 @@ pub struct SessionRecord {
 impl Default for SessionRecord {
     fn default() -> Self {
         Self {
+            device_id: String::new(),
             phase: TransferState::Idle,
             algorithm: Algorithm::Advanced,
             degrade_reason: None,
@@ -69,15 +82,58 @@ impl Default for SessionRecord {
     }
 }
 
-/// 内存会话存储（MVP；生产环境替换为 rusqlite 持久化，见阶段 TODO）
-#[derive(Default)]
+/// 服务端运行时状态：传输会话 + 控制面（身份 / 对端 / 握手）。
+///
+/// 传输会话与控制面共用一个 store，是刻意的：它们必须看到**同一份**配对状态。
+/// 拆成两个 store 就会出现"控制面已解绑、传输面还在传"的窗口 ——
+/// 这正是 V2 的老毛病（配对状态散落在多处，谁都不是权威）。
+///
+/// MVP 用内存实现；生产环境替换为 rusqlite 持久化（见阶段 TODO）。
 pub struct SessionStore {
     inner: Mutex<HashMap<String, SessionRecord>>,
+    /// 本机长期身份（P-256 静态密钥对）—— probe 公布的 `staticPub` 与
+    /// 路径 A transcript 里绑定的服务端身份都取自这里。
+    pub(crate) identity: DeviceIdentity,
+    /// 设备显示名
+    pub(crate) alias: String,
+    pub(crate) device_type: DeviceType,
+    /// 已知/已配对对端注册表（控制面）
+    pub(crate) peers: PeerStore,
+    /// 进行中的握手 + 一次性令牌 + 一次性 nonce + 线下连接码
+    pub(crate) handshake: HandshakeStore,
+    /// 本机清单 / 快照 / 目录映射（见 [`sync_api`]）
+    pub(crate) sync: sync_api::SyncStore,
 }
 
 impl SessionStore {
+    /// 用一把**新生成**的设备身份建 store。
+    ///
+    /// 注意：每次调用都是新身份。真实进程启动时应走 [`Self::with_identity`]
+    /// 传入从加密存储恢复的身份（`DeviceIdentity::restore`），
+    /// 否则重启一次就换个 deviceId，所有对端都会认为"这是台新设备"。
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Self::with_identity(DeviceIdentity::generate(), "lanbackup", DeviceType::Desktop)
+    }
+
+    pub fn with_identity(
+        identity: DeviceIdentity,
+        alias: &str,
+        device_type: DeviceType,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(HashMap::new()),
+            identity,
+            alias: alias.to_string(),
+            device_type,
+            peers: PeerStore::new(),
+            handshake: HandshakeStore::new(),
+            sync: sync_api::SyncStore::new(),
+        })
+    }
+
+    /// 设置用户线下输入的连接码（路径 A 首配用）。绝不经过网络。
+    pub async fn set_pairing_code(&self, code: impl Into<String>) {
+        self.handshake.set_pairing_code(code.into()).await;
     }
 }
 
@@ -153,6 +209,23 @@ pub async fn route(
     // 路径常量一律取自 routes：服务端与客户端必须对同一份清单，
     // 否则「两端代码看着都对、联调 404」会再次发生。
     match (method, path_only) {
+        // ── 发现与配对（控制面，见 control.rs）──
+        (Method::GET, routes::PROBE) => control::handle_probe(store, path).await,
+        (Method::POST, routes::HANDSHAKE_CHALLENGE) => {
+            control::handle_handshake_challenge(store, body).await
+        }
+        (Method::POST, routes::HANDSHAKE_VERIFY) => {
+            control::handle_handshake_verify(store, body).await
+        }
+        (Method::GET, routes::HANDSHAKE_STATUS) => {
+            control::handle_handshake_status(store, path).await
+        }
+        (Method::POST, routes::UNPAIR_REQUEST) => control::handle_unpair_request(store, body).await,
+        (Method::POST, routes::UNPAIR) => control::handle_unpair(store, body).await,
+        (Method::POST, routes::REVOKE_NOTIFY) => control::handle_revoke_notify(store, body).await,
+        (Method::POST, routes::REVOKE_ACK) => control::handle_revoke_ack(store, body).await,
+        (Method::GET, routes::SYNC_STATUS) => control::handle_sync_status(store, path).await,
+        // ── 传输会话 ──
         (Method::POST, routes::SESSION_REGISTER) => handle_register(store, body).await,
         (Method::POST, routes::SESSION_PREPARE) => handle_prepare(store, body).await,
         (Method::GET, routes::SESSION_PHASE) => handle_phase(store, path).await,
@@ -163,6 +236,15 @@ pub async fn route(
         (Method::GET, routes::SESSION_VERIFY) => handle_verify(store, path).await,
         (Method::POST, routes::SESSION_RECEIPT) => handle_receipt(store, body).await,
         (Method::GET, routes::SESSION_TASKS) => handle_tasks(store, path).await,
+        // ── 清单与同步（见 sync_api.rs）──
+        // manifest / chunk-status 是 GET：纯读、幂等，代理自动重试也不会改状态。
+        (Method::GET, routes::MANIFEST) => sync_api::handle_manifest(store, path).await,
+        (Method::GET, routes::CHUNK_STATUS) => sync_api::handle_chunk_status(store, path).await,
+        (Method::POST, routes::SYNC_DIR) => sync_api::handle_sync_dir(store, body).await,
+        (Method::POST, routes::MOVE_TO_DELETE) => {
+            sync_api::handle_move_to_delete(store, body).await
+        }
+        (Method::POST, routes::DISCONNECT) => sync_api::handle_disconnect(store, body).await,
         _ => not_found(),
     }
 }
@@ -193,6 +275,8 @@ async fn handle_register(store: &Arc<SessionStore>, body: &[u8]) -> Response<Ful
     }
 
     let rec = SessionRecord {
+        // 记下归属设备：`disconnect` 靠它区分"该收尾的会话"和"别人的会话"
+        device_id: req.device_id.clone(),
         phase: TransferState::Preparing, // 注册即进入 Preparing（Idle→Preparing）
         algorithm: Algorithm::Advanced,
         ..Default::default()
@@ -216,6 +300,16 @@ async fn handle_prepare(store: &Arc<SessionStore>, body: &[u8]) -> Response<Full
         Some(r) => r,
         None => return err_response(ErrorCode::NotFound, "会话不存在"),
     };
+
+    // 会话归属必须一致。sessionId 是 CSPRNG 生成的，但一旦泄漏（日志、抓包），
+    // 不校验归属就等于"知道 sessionId 就能往别人的会话里塞文件"。
+    // 同时这也守住了 `disconnect` 依赖的不变式：一个会话只属于一个设备。
+    if rec.device_id != req.device_id {
+        return err_response(
+            ErrorCode::Untrusted,
+            "sessionId 不属于该 deviceId：拒绝跨设备复用会话",
+        );
+    }
 
     // 协商：对端若无 CAP_ADVANCED 必须用基础算法（MVP 这里按请求声明，
     // 真实协商在阶段 4.5 密钥层完成；此处用算法字段演示降级入口）
@@ -942,6 +1036,75 @@ mod tests {
         let store = SessionStore::new();
         let r = route(&store, Method::GET, "/api/v3/probe", &[]).await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `routes::ALL` 里的每一条都必须真的接进了 `route()`。
+    ///
+    /// 这是"声明"与"接线"之间唯一的闸门。缺了它，一条端点可以在
+    /// `routes.rs` 里堂堂正正地声明、被 CI 的清单一致性检查放行、
+    /// 被 schema 导出、被客户端照着调 —— 而 `route()` 的 match 里
+    /// 根本没有那一支，于是联调时得到一个 404。
+    /// "两端代码看着都对、联调 404"正是 routes.rs 模块文档要消灭的那件事，
+    /// 但清单一致性只对齐了**文档与常量**，从没验证过**常量与 match 分支**。
+    ///
+    /// 判据是"不返回 404"而非"返回 200"：各端点有各自的前置条件
+    /// （缺参数 400、未配对 401、会话不存在 404……），这里只关心
+    /// **请求有没有落到某个分支上**。用空 body + 无查询串去打，
+    /// 期望的就是那些参数校验错误，唯一不可接受的是 `not_found()`
+    /// 那句"unknown V4 endpoint"。
+    #[tokio::test]
+    async fn every_declared_route_is_actually_wired() {
+        let store = SessionStore::new();
+        for r in routes::ALL {
+            let method = match r.method {
+                routes::Method::Get => Method::GET,
+                routes::Method::Post => Method::POST,
+            };
+            let resp = route(&store, method.clone(), r.path, &[]).await;
+            let status = resp.status();
+            let bytes = to_bytes(resp).await;
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                !text.contains("unknown V4 endpoint"),
+                "{} {} 在 routes::ALL 里声明了，却没接进 route() 的 match —— \
+                 客户端照着常量调用会得到 404（状态码 {status}）",
+                method.as_str(),
+                r.path,
+            );
+        }
+    }
+
+    /// 会话归属校验：知道 sessionId 也不能往别人的会话里塞文件。
+    ///
+    /// 同时这也是 `disconnect` 依赖的不变式 ——
+    /// 一个会话只属于一个设备，否则"断开 A"可能收尾了 B 的传输。
+    #[tokio::test]
+    async fn prepare_rejects_a_session_owned_by_another_device() {
+        let store = SessionStore::new();
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/register",
+            &body(serde_json::json!({"deviceId":"devA","alias":"A","sessionId":"s1"})),
+        )
+        .await;
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/prepare",
+            &body(serde_json::json!({
+                "sessionId":"s1","deviceId":"devB","files":{}
+            })),
+        )
+        .await;
+        assert_eq!(
+            r.status(),
+            StatusCode::UNAUTHORIZED,
+            "devB 用 devA 的 sessionId 登记了文件"
+        );
+        // 越权请求不得留下痕迹
+        let g = store.inner.lock().await;
+        assert_eq!(g.get("s1").unwrap().device_id, "devA");
     }
 
     // ============================================================
