@@ -27,6 +27,7 @@ pub mod error;
 pub mod ffi;
 pub mod identity;
 pub mod pairing;
+pub mod platform;
 pub mod presence;
 pub mod routes;
 pub mod server;
@@ -85,4 +86,11 @@ pub use version::{Capabilities, API_PREFIX, PROTOCOL_VERSION};
 //   **同目录**（M20：SAF 无跨目录 rename）、同目录 rename 原子提交、跨目录降级为
 //   copy/delete 并明示读取窗口、并提供 `committed_bytes` 字节级续传种子。
 //   待桌面 / Android **平台层**接入（平台写盘路径不在本 crate，属阶段 6/7 工程化）。
-// - Android JNI 层需实现 `MulticastGuard`（M22：收发两条路径都要持锁）
+// - M22 组播锁：core 运行时已接线——`PresenceSocket::bind_with_guard` 在绑定时
+//   `acquire()`、`Drop` 时 `release()`，桌面端用 `NoopMulticastGuard`，收发两条路径
+//   全生命周期持锁（见 `platform` 模块契约）。**仅剩 Android JNI 层需实现真实
+//   `MulticastGuard`**（调用 `WifiManager.createMulticastLock`），但 `mobile/` 尚无
+//   Rust 核心的 JNI 桥，故该实现暂无落点。
+// - `transfer::atomic_file` 已补「提交后恢复 mtime」的统一入口（`write_committed` /
+//   `restore_mtime`），发送端三路对比依赖 mtime 判变更，平台层必须在 commit 后调用。
+//   待桌面 / Android SAF 写盘路径接入该入口（属阶段 6/7 工程化）。

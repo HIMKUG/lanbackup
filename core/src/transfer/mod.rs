@@ -26,6 +26,7 @@ pub mod atomic_file;
 pub mod chunk;
 pub mod cleanup;
 pub mod degrade;
+pub mod piece_cache;
 pub mod schedule;
 pub mod session;
 
@@ -46,5 +47,7 @@ pub use schedule::{
 };
 
 pub use cleanup::{CleanupAction, CleanupPlan, CleanupTrigger};
+
+pub use piece_cache::{PieceCacheKey, PieceHashCache};
 
 pub use session::{Applied, Outcome, SessionDriver, SessionError, Step};

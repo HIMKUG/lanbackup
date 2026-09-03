@@ -42,6 +42,7 @@
 //! 这里再锁一次：原子替换**不**自动保留 mtime，是平台的事。
 
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 /// 临时文件名后缀里允许出现的字符：仅字母数字与 `-_`。
 ///
@@ -147,6 +148,46 @@ pub fn commit(part: &Path, final_path: &Path) -> std::io::Result<()> {
 /// `confirmed` 块位图互补（位图管「传哪些块」，`committed_bytes` 管「从哪接着写」）。
 pub fn committed_bytes(part: &Path) -> u64 {
     std::fs::metadata(part).map(|m| m.len()).unwrap_or(0)
+}
+
+/// 把最终文件的 mtime 恢复到发送端声明的原始值（见模块文档「提交后的关键收尾」）。
+///
+/// 原子替换（rename / copy）会把 final 的 mtime 写成「本次写入时间」，
+/// 而发送端三路对比依赖 mtime 判变更 —— 不恢复则每次都被误判为变更、全量重传。
+/// 平台在 [`commit`] 之后**必须**调用本函数把 [`crate::dto::session::FileMeta::mtime`]
+/// 写回。
+///
+/// `mtime_ns` 为纳秒级 Unix 时间戳（与 DTO 中的 `mtime` 字段语义一致）。
+pub fn restore_mtime(final_path: &Path, mtime_ns: i64) -> std::io::Result<()> {
+    let secs = mtime_ns.div_euclid(1_000_000_000).max(0) as u64;
+    let nsec = mtime_ns.rem_euclid(1_000_000_000) as u32;
+    let t = UNIX_EPOCH + std::time::Duration::new(secs, nsec);
+    let f = std::fs::OpenOptions::new().write(true).open(final_path)?;
+    f.set_modified(t)
+}
+
+/// 平台写盘的统一入口：写临时文件 → [`commit`] 原子替换 → 恢复 mtime（可选）。
+///
+/// `write_part` 由调用方提供：把数据落到 `part` 路径（本函数不关心写盘细节，
+/// 以便桌面 `std::fs` / Android SAF 各自实现）。这样把「写盘」留给平台，而
+/// 「原子替换 + mtime 恢复」这一易错步骤集中在核心里，杜绝各端各写一套导致漂移。
+///
+/// `mtime_ns` 为 `Some` 时，提交后会把 final 的 mtime 恢复为发送端原始值。
+pub fn write_committed<F>(
+    part: &Path,
+    final_path: &Path,
+    mtime_ns: Option<i64>,
+    write_part: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    write_part(part)?;
+    commit(part, final_path)?;
+    if let Some(ns) = mtime_ns {
+        restore_mtime(final_path, ns)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -269,5 +310,61 @@ mod tests {
         assert_eq!(committed_bytes(&part), 0, "不存在的临时文件应报 0（从头传）");
         std::fs::write(&part, b"1234567890").unwrap(); // 10 bytes
         assert_eq!(committed_bytes(&part), 10, "应读出已落盘字节数，供字节级续传");
+    }
+
+    #[test]
+    fn restore_mtime_sets_declared_timestamp() {
+        let dir = tmp();
+        let final_path = dir.join("f.txt");
+        std::fs::write(&final_path, b"data").unwrap();
+        // 2023-11-14T22:13:20Z 的纳秒时间戳
+        let want_ns: i64 = 1_700_000_000_000_000_000;
+        restore_mtime(&final_path, want_ns).expect("恢复 mtime 应成功");
+
+        let got = std::fs::metadata(&final_path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        // 部分平台 mtime 精度会落到秒级，容忍 2 秒偏差
+        assert!((got - want_ns).abs() <= 2_000_000_000, "mtime 应近似等于声明值（误差 {:.3}s）", (got - want_ns).abs() as f64 / 1e9);
+    }
+
+    #[test]
+    fn write_committed_writes_commits_and_restores_mtime() {
+        let dir = tmp();
+        let final_path = dir.join("final.bin");
+        let part = part_path(&final_path, "s9", "f9");
+        let want_ns: i64 = 1_700_000_000_000_000_000;
+
+        write_committed(&part, &final_path, Some(want_ns), |p| {
+            std::fs::write(p, b"payload-bytes")
+        })
+        .expect("write_committed 应成功");
+
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"payload-bytes");
+        assert!(!part.exists(), "提交后临时文件应被清理");
+
+        let got = std::fs::metadata(&final_path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        assert!((got - want_ns).abs() <= 2_000_000_000, "提交后 mtime 应被恢复");
+    }
+
+    #[test]
+    fn write_committed_can_skip_mtime_restore() {
+        let dir = tmp();
+        let final_path = dir.join("final2.bin");
+        let part = part_path(&final_path, "s9", "f9");
+        write_committed(&part, &final_path, None, |p| std::fs::write(p, b"x"))
+            .expect("无 mtime 时也应成功");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"x");
+        assert!(!part.exists());
     }
 }

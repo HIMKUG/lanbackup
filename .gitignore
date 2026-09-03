@@ -22,6 +22,8 @@ mobile/local-receiver/android/.idea/
 third_party/localsend/target/
 # 备用构建目录（沙箱环境下 target/ 偶发不可写时的落脚点，同属构建产物）
 **/target-v/
+# 本次会话显式指定的可写构建目录（CARGO_TARGET_DIR），同属构建产物
+**/cargo-target/
 
 # 编辑器
 .vscode/

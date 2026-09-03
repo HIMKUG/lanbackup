@@ -246,6 +246,10 @@ pub struct PresenceSocket {
     group: Ipv4Addr,
     /// 发送健康度（W5）
     health: SendHealth,
+    /// 组播锁（M22）。`None` 仅出现在 Drop 中临时取出时；正常运行恒为 `Some`。
+    /// 桌面端为 [`NoopMulticastGuard`]，Android 端由 JNI 层经
+    /// [`PresenceSocket::bind_with_guard`] 注入真实实现。
+    guard: Option<Box<dyn MulticastGuard>>,
 }
 
 impl PresenceSocket {
@@ -260,7 +264,27 @@ impl PresenceSocket {
     /// - `IP_MULTICAST_LOOP = true`：保留自环。收到自己的 beacon 无害
     ///   （本机不会为自己注册 tracker，验不过 HMAC 就丢），但关掉它会让
     ///   「同机双实例」的联调彻底收不到包。
+    ///
+    /// 绑定并加入组播组。桌面端使用 [`NoopMulticastGuard`]（无需组播锁）。
+    ///
+    /// 见 [`PresenceSocket::bind_with_guard`] 了解组播锁的获取时机与释放契约。
     pub fn bind(port: u16, group: Ipv4Addr) -> io::Result<Self> {
+        Self::bind_with_guard(port, group, Box::new(NoopMulticastGuard))
+    }
+
+    /// 绑定并加入组播组，**并持有调用方提供的组播锁（M22）**。
+    ///
+    /// 成功绑定后立即 `acquire()`：组播锁必须在任何 send/recv **之前**取得，
+    /// 否则 Wi-Fi 芯片在省电态会在硬件层丢弃组播帧，表现为「锁屏几秒后所有设备离线」。
+    /// `acquire` 失败（如 Android 权限不足）**不致命**——仍尽量继续收发并告警，
+    /// 让上层能提示用户开启权限，而不是整体起不来。
+    ///
+    /// 释放由 [`Drop`] 负责：套接字整个生命周期内始终持锁，收发两条路径都被覆盖。
+    pub fn bind_with_guard(
+        port: u16,
+        group: Ipv4Addr,
+        guard: Box<dyn MulticastGuard>,
+    ) -> io::Result<Self> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_reuse_address(true)?;
         #[cfg(unix)]
@@ -292,6 +316,13 @@ impl PresenceSocket {
             joined = 1;
         }
 
+        // M22：绑定成功即获取组播锁，失败仅告警不致命。
+        if let Err(e) = guard.acquire() {
+            log::warn!(
+                "MulticastGuard acquire failed (beacon may be dropped by Wi-Fi chip in power-save): {e}"
+            );
+        }
+
         let std_socket: std::net::UdpSocket = socket.into();
         Ok(Self {
             socket: UdpSocket::from_std(std_socket)?,
@@ -300,6 +331,7 @@ impl PresenceSocket {
             port,
             group,
             health: SendHealth::new(),
+            guard: Some(guard),
         })
     }
 
@@ -355,11 +387,14 @@ impl PresenceSocket {
     /// 仅在成功时清零健康度：`bind` 一直失败时保持 dead，下一轮继续重试。
     /// 若失败也清零，就会退化成「每轮都重建一次」的热循环。
     pub fn rebuild(&mut self) -> io::Result<()> {
-        let fresh = Self::bind(self.port, self.group)?;
-        self.socket = fresh.socket;
-        self.targets = fresh.targets;
-        self.joined = fresh.joined;
-        self.health = SendHealth::new();
+        // 保留原有组播锁（M22）：Android 的真实实现必须跨重建存活，
+        // 否则锁随套接字一起丢，等于没持锁。
+        let guard = self.guard.take();
+        let fresh = match guard {
+            Some(g) => Self::bind_with_guard(self.port, self.group, g)?,
+            None => Self::bind(self.port, self.group)?,
+        };
+        *self = fresh;
         Ok(())
     }
 
@@ -379,6 +414,17 @@ impl PresenceSocket {
         let mut buf = [0u8; BEACON_LEN + 1];
         let (n, from) = self.socket.recv_from(&mut buf).await?;
         Ok(BeaconPacket::from_bytes(&buf[..n]).map(|p| (p, from)))
+    }
+}
+
+/// M22：套接字销毁时释放组播锁。**必须释放**——持锁会显著增加待机耗电。
+///
+/// 由 `bind_with_guard` 获取、`Drop` 释放，覆盖套接字整个生命周期内的收发两条路径。
+impl Drop for PresenceSocket {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard.release();
+        }
     }
 }
 

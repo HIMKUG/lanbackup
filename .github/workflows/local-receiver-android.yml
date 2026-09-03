@@ -59,10 +59,12 @@ jobs:
         run: pnpm --filter backup-mobile cap sync android
 
       - name: Unit Tests
+        # 注意：测试失败必须让 job 失败，绝不能用 `|| true` 静默吞掉
+        # （否则坏代码照样产出可用 APK，Stage 8 CI 加固）。
         run: |
           cd mobile/local-receiver/android
           chmod +x gradlew
-          ./gradlew testDebugUnitTest --no-daemon -q || true
+          ./gradlew testDebugUnitTest --no-daemon
 
       - name: Upload Test Results
         if: always()
