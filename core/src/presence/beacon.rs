@@ -15,11 +15,7 @@
 //! 且 64 bit 认证标签对防伪造绰绰有余（伪造成功率 1/2⁶⁴，且 0.5s 内即失效）。
 //! 密钥直接用已建立的 `pairing_secret`（见 §4.3 L2），无需额外密钥交换。
 
-// hmac 0.13 起 `Mac` 不再以 `KeyInit` 为父 trait，`new_from_slice` 需显式导入 `KeyInit`。
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
-
-type HmacSha256 = Hmac<Sha256>;
+use crate::crypto::{ct_eq, hmac_sha256};
 
 /// beacon 报文总长度（字节）
 pub const BEACON_LEN: usize = 32;
@@ -64,9 +60,7 @@ pub fn sign_beacon(
     packet[DEVICE_ID_PREFIX_LEN..DEVICE_ID_PREFIX_LEN + 4].copy_from_slice(&ts.to_be_bytes());
     packet[DEVICE_ID_PREFIX_LEN + 4..DEVICE_ID_PREFIX_LEN + 8].copy_from_slice(&seq.to_be_bytes());
     // 认证载荷 = deviceId 前缀 + ts + seq（不含保留段与标签本身）
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC 接受任意长度密钥，不会失败");
-    mac.update(&packet[..DEVICE_ID_PREFIX_LEN + 8]);
-    let tag = mac.finalize().into_bytes();
+    let tag = hmac_sha256(secret, &packet[..DEVICE_ID_PREFIX_LEN + 8]);
     packet[BEACON_LEN - AUTH_TAG_LEN..].copy_from_slice(&tag[..AUTH_TAG_LEN]); // 截断前 8 字节置于尾部
     BeaconPacket(packet)
 }
@@ -81,28 +75,14 @@ pub fn verify_beacon(secret: &[u8], packet: &BeaconPacket) -> Option<BeaconClaim
     let ts = u32::from_be_bytes([p[8], p[9], p[10], p[11]]);
     let seq = u32::from_be_bytes([p[12], p[13], p[14], p[15]]);
 
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC 接受任意长度密钥，不会失败");
-    mac.update(&p[..DEVICE_ID_PREFIX_LEN + 8]);
-    let tag = mac.finalize().into_bytes();
+    let tag = hmac_sha256(secret, &p[..DEVICE_ID_PREFIX_LEN + 8]);
 
     let provided = &p[BEACON_LEN - AUTH_TAG_LEN..];
-    if constant_time_eq(&tag[..AUTH_TAG_LEN], provided) {
+    if ct_eq(&tag[..AUTH_TAG_LEN], provided) {
         Some((device_id_prefix, ts, seq))
     } else {
         None
     }
-}
-
-/// 恒定时间相等比较（防时序侧信道）
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(test)]
@@ -170,40 +150,32 @@ mod tests {
         );
     }
 
-    /// **RFC 4231 已知答案测试**：钉死 HMAC-SHA256 是标准实现。
+    /// **线路格式锚定**：标签 = HMAC-SHA256(secret, packet[0..16]) 的**前 8 字节**。
     ///
-    /// 登记表 E6 的教训：旧版 `scheduler.ts` 注释写 xxHash64，常量却是自造的，
-    /// 导致跨实现弱校验永不命中。凡影响线路格式的密码学原语，
-    /// **必须**用公开测试向量锚定，不能只靠「自己签自己验」的往返测试
-    /// —— 往返测试对一个算错的算法同样会通过。
+    /// 登记表 E6 的教训：旧版 `scheduler.ts` 注释写 xxHash64、常量却是自造的，
+    /// 结果跨实现的弱校验永不命中。凡影响线路格式的东西都要被独立复算钉死 ——
+    /// "自己签自己验"的往返测试对一个算错的实现同样会通过。
+    ///
+    /// HMAC-SHA256 本身的 RFC 4231 已知答案测试在 [`crate::crypto::mac`]，
+    /// 这里只负责钉住 beacon 这一层的两个协议决策：
+    /// **认证范围是前 16 字节**、**截断取前 8 字节且置于报文尾部**。
     #[test]
-    fn hmac_sha256_matches_rfc4231_vectors() {
-        fn tag(key: &[u8], msg: &[u8]) -> String {
-            let mut mac = HmacSha256::new_from_slice(key).unwrap();
-            mac.update(msg);
-            mac.finalize()
-                .into_bytes()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect()
-        }
+    fn tag_is_truncated_hmac_over_first_16_bytes() {
+        let pkt = sign_beacon(&secret(), &dev(), 0x0102_0304, 0x0506_0708);
+        // 用原语独立复算一遍，而不是复用 sign_beacon 内部的中间结果
+        let expected = crate::crypto::hmac_sha256(&secret(), &pkt.0[..16]);
 
-        // RFC 4231 Test Case 1：key = 0x0b × 20，data = "Hi There"
         assert_eq!(
-            tag(&[0x0b; 20], b"Hi There"),
-            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+            &pkt.0[BEACON_LEN - AUTH_TAG_LEN..],
+            &expected[..AUTH_TAG_LEN],
+            "标签必须是 HMAC(前16B) 的前 8 字节"
         );
-
-        // RFC 4231 Test Case 2：key = "Jefe"（短于块长，需右侧补零）
-        assert_eq!(
-            tag(b"Jefe", b"what do ya want for nothing?"),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
-
-        // RFC 4231 Test Case 3：key = 0xaa × 20，data = 0xdd × 50
-        assert_eq!(
-            tag(&[0xaa; 20], &[0xdd; 50]),
-            "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"
+        // 认证范围不含保留段：把保留段算进去会得到不同结果
+        let wrong_scope = crate::crypto::hmac_sha256(&secret(), &pkt.0[..24]);
+        assert_ne!(
+            &wrong_scope[..AUTH_TAG_LEN],
+            &pkt.0[BEACON_LEN - AUTH_TAG_LEN..],
+            "认证范围必须严格是前 16 字节"
         );
     }
 

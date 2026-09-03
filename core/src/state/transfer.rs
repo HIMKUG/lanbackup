@@ -12,7 +12,9 @@
 //!   （防止主/基反复横跳）；下次会话重新检测。
 //! - **连接断开即中止**：PeerLost 在任何非终态都直接进 Aborted。
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// serde 供 [`crate::ffi`] 的 `policy.can` 跨 FFI 传递上下文用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TransferState {
     Idle,
     Preparing,

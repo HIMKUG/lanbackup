@@ -19,7 +19,11 @@ use crate::state::connection::ConnectionState;
 use crate::state::transfer::TransferState;
 
 /// 六个受控动作（对应 UI 六个按钮，V4-TRANSFER-MODULE §3.1）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// serde 是为了让 [`crate::ffi`] 的 `policy.can` 能被移动端问到 ——
+/// **UI 不得自己判断按钮能不能点**，一律跨 FFI 问这里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum UiAction {
     /// 每设备：建立 V4 握手
     Connect,
@@ -36,7 +40,9 @@ pub enum UiAction {
 }
 
 /// 裁决所需的上下文快照（从三张状态机 + 设备级降级记忆取当前值）
-#[derive(Debug, Clone, Copy)]
+/// `camelCase` 与协议层其余 DTO 一致（`generatedAt` / `deviceCode` / `preferBasic`）。
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UiContext {
     pub presence: Presence,
     pub connection: ConnectionState,
@@ -50,7 +56,9 @@ pub struct UiContext {
 }
 
 /// 裁决结果
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 只 `Serialize` 不 `Deserialize`：`reason` 是 `&'static str`，
+/// 反序列化需要借用一个调用方给不出保证的生命周期，而它本来也只用于出参。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Verdict {
     pub enabled: bool,
     /// 禁用时的可读提示；启用时也可给正向说明（UI 作 tooltip）

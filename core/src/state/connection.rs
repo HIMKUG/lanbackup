@@ -7,7 +7,10 @@
 //! 状态：Disconnected / Connecting / Connected / Disconnecting / Lost / Failed
 //! （共 10 条迁移，见 V4-TRANSFER-MODULE.md §三）
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// serde 供 [`crate::ffi`] 的 `policy.can` 跨 FFI 传递上下文用；
+/// 小写与 [`crate::dto::Presence`] 的 `rename_all` 保持一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ConnectionState {
     Disconnected,
     Connecting,

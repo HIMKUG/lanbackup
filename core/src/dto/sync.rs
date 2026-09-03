@@ -93,7 +93,7 @@ impl Default for Manifest {
 ///
 /// `residual` 单独拎出来当"变更"处理是关键：只按"存在与否"判断，
 /// 上次传输中断留下的半截文件永远不会被修复（原 `sync.ts:97-100`）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SyncPlan {
     /// A 端新增
     pub added: Vec<String>,

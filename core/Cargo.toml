@@ -18,7 +18,11 @@ hyper-util = { version = "0.1", features = ["server", "tokio"] }
 http-body-util = "0.1"
 http = "1"
 bytes = "1"
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider"] }
+# **刻意不启用任何 TLS 后端**：本 crate 对 peer 的请求全部在局域网明文 http:// 上，
+# TLS 栈是纯粹的死重。曾经带 `rustls-no-provider`，而它在没装 crypto provider 时
+# `Client::builder().build()` 是 **panic** 而不是返回 Err ——
+# 任何构造客户端的代码路径都会炸，且从函数签名上完全看不出来。
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
 
@@ -29,13 +33,25 @@ serde_json = "1"
 schemars = "0.8"
 
 # ---------- 密码学 ----------
-# 版本与 localsend 上游对齐，避免 Cargo 多版本共存（rand 0.8+0.10、sha2 0.10+0.11 等）
-rand = "0.10"
-sha2 = "0.11"
+#
+# **RustCrypto 世代必须自洽**，这一段的版本号不是随便挑新的。
+#
+# 两个硬约束把可选范围锁死了：
+#   1. `p256` 最新稳定版是 0.13，绑定 `rand_core 0.6` 与 `digest 0.10`（内部 sha2 0.10）
+#   2. `hkdf` 至今没有 digest-0.11 世代的发布，最高仍是 0.12（digest 0.10）
+#
+# 曾经把这里升到「看起来更新」的 sha2 0.11 / hmac 0.13 / pbkdf2 0.13 / rand 0.10，
+# 结果是 16 个编译错误，全部源于世代错配而非代码写错：
+#   - `Hmac<Sha256>`（digest 0.11）不满足 hkdf 0.12 的 `HmacImpl<Sha256>`（digest 0.10）
+#   - `ThreadRng`（rand_core 0.9）不满足 p256 的 `CryptoRngCore`（rand_core 0.6）
+#
+# 因此统一钉在 **digest-0.10 / rand_core-0.6** 世代：与 p256 的内部依赖完全重合，
+# 依赖图里零重复版本。升级必须整代一起动（等 p256 0.14 与 hkdf 0.13 齐备），不许单点跳版。
+rand = "0.8"
+sha2 = "0.10"
 hkdf = "0.12"
-pbkdf2 = "0.13"
-# hmac 必须与 sha2 0.11 同属 digest 0.11 世代；0.12 走 digest 0.10，Hmac<Sha256> 无法满足 trait bound
-hmac = "0.13"
+pbkdf2 = "0.12"
+hmac = "0.12"
 ring = "0.17"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 base64 = "0.23"

@@ -24,6 +24,7 @@ use crate::dto::session::{
     SessionRegisterResponse,
 };
 use crate::error::ErrorCode;
+use crate::routes;
 use crate::state::transfer::{TransferEvent, TransferState};
 
 /// 单个会话的运行时记录
@@ -93,21 +94,23 @@ pub async fn route(
     path: &str,
     body: &[u8],
 ) -> Response<Full<bytes::Bytes>> {
-    // 仅匹配 /api/v4/... 前缀
-    let rest = match path.strip_prefix("/api/v4/") {
-        Some(r) => r,
-        None => return not_found(),
-    };
     // 匹配时用「去掉查询串」的路径，查询参数由各 handler 自行解析
-    let path_only = rest.split_once('?').map(|(p, _)| p).unwrap_or(rest);
+    let path_only = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+    // 版本前缀交给 routes 的单一来源把关：`/api/v40/...` 必须落到 404，
+    // 而不是被当成 `/api/v4/` 下的某个路径。前缀判断只有这一处，别处不得再手写。
+    if routes::strip_prefix(path_only).is_none() {
+        return not_found();
+    }
 
+    // 路径常量一律取自 routes：服务端与客户端必须对同一份清单，
+    // 否则「两端代码看着都对、联调 404」会再次发生。
     match (method, path_only) {
-        (Method::POST, "session/register") => handle_register(store, body).await,
-        (Method::POST, "session/prepare") => handle_prepare(store, body).await,
-        (Method::GET, "session/phase") => handle_phase(store, rest).await,
-        (Method::POST, "session/heartbeat") => handle_heartbeat(store, body).await,
-        (Method::POST, "session/abort") => handle_abort(store, body).await,
-        (Method::POST, "session/chunk") => handle_chunk(store, body).await,
+        (Method::POST, routes::SESSION_REGISTER) => handle_register(store, body).await,
+        (Method::POST, routes::SESSION_PREPARE) => handle_prepare(store, body).await,
+        (Method::GET, routes::SESSION_PHASE) => handle_phase(store, path).await,
+        (Method::POST, routes::SESSION_HEARTBEAT) => handle_heartbeat(store, body).await,
+        (Method::POST, routes::SESSION_ABORT) => handle_abort(store, body).await,
+        (Method::POST, routes::SESSION_CHUNK) => handle_chunk(store, body).await,
         _ => not_found(),
     }
 }

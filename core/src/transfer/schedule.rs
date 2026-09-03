@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use rand::Rng;
 use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::version::retry;
@@ -157,8 +158,11 @@ pub fn full_jitter_backoff_with(attempt: u32, base_ms: u64, max_ms: u64) -> u64 
         .unwrap_or(u64::MAX)
         .min(max_ms)
         .max(1);
-    // 均匀随机 [0, exp)（rand 0.10 的 free function）
-    rand::random_range(0..exp)
+    // 均匀随机 [0, exp)
+    //
+    // 用 rand 0.8 的 `Rng::gen_range` 而不是 0.9+ 的 `rand::random_range` free function：
+    // rand 的版本被 p256 0.13 的 rand_core 0.6 世代锁死（见 Cargo.toml 密码学段落）。
+    rand::thread_rng().gen_range(0..exp)
 }
 
 #[cfg(test)]

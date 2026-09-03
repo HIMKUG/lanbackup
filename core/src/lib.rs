@@ -21,15 +21,22 @@
 //! - `DESIGN-WISDOM-REGISTER.md` —— **既有代码的实测智慧清单，重构不得遗漏**
 
 pub mod crypto;
+pub mod discovery;
 pub mod dto;
 pub mod error;
+pub mod ffi;
+pub mod identity;
+pub mod pairing;
 pub mod presence;
+pub mod routes;
 pub mod server;
 pub mod state;
+pub mod sync;
 pub mod transfer;
 pub mod version;
 
 pub use error::{Error, ErrorCode, ErrorEnvelope, Result};
+pub use identity::DeviceIdentity;
 pub use version::{Capabilities, API_PREFIX, PROTOCOL_VERSION};
 
 // ── 已落地 ─────────────────────────────────────────────────────────────
@@ -47,11 +54,26 @@ pub use version::{Capabilities, API_PREFIX, PROTOCOL_VERSION};
 // 阶段 4.1 transfer::degrade       —— D1-D6 降级判定 + 设备级记忆 + UI 可见性快照
 // 阶段 4.3 presence::beacon        —— 32B UDP beacon 报文与 HMAC 认证（纯计算部分）
 //          presence::tracker       —— (ts,seq) 单调水位重放防护 + 在线性衰减
+// 阶段 4   presence::transport     —— UDP 收发、多网卡、组播锁抽象（M22）、套接字自愈（W5）
+//          routes                  —— 端点单一来源，逐行抄自文档 §六 24 个端点（含方法）
+// 阶段 4   sync::manifest          —— 路径归一化、墓碑目录、清单去重
+//          sync::plan              —— 三路增量六集合 + archive/mirror 策略
+// 阶段 5   identity                —— 设备身份（长生命周期 ECDSA）+ 连接码派生
+//          pairing::transcript     —— 长度前缀帧 + 域分隔（含服务端静态公钥，防 MITM）
+//          pairing::token          —— 紧凑 JWS，一次性 jti 才是真正的重放防御
+//          pairing::machine        —— 配对状态机（11 条迁移，越界迁移一律给可读原因）
+//          pairing::trust          —— 双向信任对账；对账兼任吊销 ack 的兜底通路
+//          discovery               —— /24 子网 HTTP 探测（掩码一律收窄到 /24）+ 并发窗口
+// 阶段 6   ffi                     —— 稳定 C ABI 门面：热路径定长签名 + 冷路径 JSON
 //
-// ── 待落地 ─────────────────────────────────────────────────────────────
-// TODO(阶段 4):   presence 传输层 —— UDP 收发、Android MulticastLock（W5/M22）
-// TODO(阶段 4):   pub mod sync;      —— 三路增量、manifest、archive/mirror 策略
-// TODO(阶段 5):   pub mod pairing;   —— 配对、解配对、吊销、双向对账
-// TODO(阶段 5):   pub mod discovery; —— 组播与子网探测
-// TODO(阶段 5):   pub mod identity;  —— 设备身份与连接码派生
-// TODO(阶段 6):   uniffi 绑定导出
+// ── 全部阶段已落地 ─────────────────────────────────────────────────────
+//
+// 唯一的例外是 uniffi：它不在可用的 registry 索引里（离线环境），
+// 故阶段 6 落地为**与绑定框架无关**的 C ABI 门面（见 `ffi` 模块文档）。
+// 等 uniffi 可用时，它接在这一层**之上**，core 无需改动 ——
+// 这恰好守住了本 crate 存在的理由：协议与算法只此一份实现。
+//
+// ── 仍待推进（非阻塞，属后续工程化）───────────────────────────────────
+// - `SessionStore` 仍为内存实现，生产需换 rusqlite 持久化（依赖已就位）
+// - `server` 目前只实现了 6 个端点，其余 18 个路由常量已就位待接
+// - Android JNI 层需实现 `MulticastGuard`（M22：收发两条路径都要持锁）
