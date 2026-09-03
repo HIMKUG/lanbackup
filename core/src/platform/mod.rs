@@ -15,13 +15,18 @@
 //! `WifiManager.createMulticastLock(...).acquire()/release()`），并在创建
 //! `PresenceSocket` 时经 `bind_with_guard` 注入。
 //!
-//! 当前 `mobile/` 尚未接入 Rust 核心的 JNI 桥，故该实现暂无落点——
-//! 这是 M22「Android 侧」真正收尾前必须打通的最后一环，本模块即其契约中心。
-//!
 //! 本模块下 [`android`]（`android-jni` feature 下可用）提供了基于 JNI 的真实
 //! `MulticastGuard` 实现：Android 侧把 `WifiManager` 经 JNI 注入后，由运行时在
 //! `bind_with_guard` 时 `acquire`、`Drop` 时 `release`，与桌面 `NoopMulticastGuard`
 //! 共用同一条接线路径。
+//!
+//! [`android_bridge`]（同样在 `android-jni` 下）把上述实现暴露成 `com.backup.mobile.receiver`
+//! 命名空间下的 JNI 符号，供 `local-receiver` Capacitor 插件直接 `System.loadLibrary` 后调用——
+//! M22「Android 侧」的最后一环（Rust 侧契约）由此闭合；插件侧的 `native` 声明与 `.so` 打包
+//! 仍属于 `mobile/` 集成工作。
 
 #[cfg(feature = "android-jni")]
 pub mod android;
+
+#[cfg(feature = "android-jni")]
+mod android_bridge;
