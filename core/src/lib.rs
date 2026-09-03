@@ -74,9 +74,11 @@ pub use version::{Capabilities, API_PREFIX, PROTOCOL_VERSION};
 // 这恰好守住了本 crate 存在的理由：协议与算法只此一份实现。
 //
 // ── 仍待推进（非阻塞，属后续工程化）───────────────────────────────────
-// - `SessionStore` 仍为内存实现，生产需换 rusqlite 持久化（依赖已就位）。
-//   注意这不只是"换个后端"：进程重启后已确认的 piece 位图全丢，
-//   续传会退化成全量重传（对端清单还在，但本端不记得收过什么）。
+// - `SessionStore` 现已接**磁盘持久化**（断点续传在重启/杀后台/切 Wi-Fi 后成立）：
+//   内存热表 + 写穿镜像 + 冷启动重载，接口在 `server::persist`。
+//   注意本环境无 C 工具链，`rusqlite`(bundled) 无法编译，故暂用**纯 Rust 原子写
+//   JSON** 作后端；接口与 rusqlite 后端同构，后续具备 C 工具链时替换 `persist`
+//   模块实现即可，上层零改动。
 // - `server` 的 24 个端点已全部接线（`server::tests::every_declared_route_is_actually_wired`
 //   逐条验证 `routes::ALL` 都落到了 match 分支上）
 // - Android JNI 层需实现 `MulticastGuard`（M22：收发两条路径都要持锁）

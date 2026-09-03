@@ -391,6 +391,17 @@ pub async fn handle_disconnect(
         }
         if let Ok(next) = s.phase.transition(TransferEvent::Abort) {
             s.phase = next;
+            // 写穿持久化 + 清理终态会话的磁盘行
+            if let Some(p) = &store.persist {
+                p.update_session(
+                    sid,
+                    s.phase,
+                    s.algorithm,
+                    s.degrade_reason,
+                    s.bitmap_version,
+                );
+                p.remove_session(sid);
+            }
             aborted.push(sid.clone());
         }
     }

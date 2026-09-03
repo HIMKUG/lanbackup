@@ -11,6 +11,7 @@
 //! - **错误统一信封**：所有失败走 `ErrorEnvelope`，前端一致处理。
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use http_body_util::{BodyExt, Full};
@@ -34,6 +35,8 @@ use crate::transfer::chunk::piece_count;
 
 pub mod control;
 pub mod sync_api;
+/// 传输会话的磁盘持久化（见 [`persist`] 模块文档：纯 Rust 原子写 JSON 后端）。
+pub(crate) mod persist;
 
 /// 单个会话的运行时记录
 pub struct SessionRecord {
@@ -88,7 +91,15 @@ impl Default for SessionRecord {
 /// 拆成两个 store 就会出现"控制面已解绑、传输面还在传"的窗口 ——
 /// 这正是 V2 的老毛病（配对状态散落在多处，谁都不是权威）。
 ///
-/// MVP 用内存实现；生产环境替换为 rusqlite 持久化（见阶段 TODO）。
+/// # 持久化
+///
+/// 内存 `inner` 是唯一热表（所有读零延迟）；每个状态变更**写穿**到
+/// [`persist::SessionPersister`]（磁盘镜像），进程重启时由 [`Self::open`]
+/// 把未终态的会话整组捞回内存。这样**断点续传在重启 / 杀后台 / 切 Wi-Fi 后
+/// 依然成立** —— 此前 `confirmed` 位图只活内存，重启即全量重传（真实缺口，
+/// 文档评审列为五层机制中未覆盖的一项）。
+///
+/// 传 `persist_dir: None` 则退化为纯内存（测试 / 尚未接 db），行为与原 MVP 一致。
 pub struct SessionStore {
     inner: Mutex<HashMap<String, SessionRecord>>,
     /// 本机长期身份（P-256 静态密钥对）—— probe 公布的 `staticPub` 与
@@ -103,31 +114,73 @@ pub struct SessionStore {
     pub(crate) handshake: HandshakeStore,
     /// 本机清单 / 快照 / 目录映射（见 [`sync_api`]）
     pub(crate) sync: sync_api::SyncStore,
+    /// 可选持久化后端。`None` = 纯内存（测试 / 尚未接 db）。
+    pub(crate) persist: Option<persist::SessionPersister>,
 }
 
 impl SessionStore {
-    /// 用一把**新生成**的设备身份建 store。
+    /// 用一把**新生成**的设备身份建 store（纯内存，不持久化）。
     ///
     /// 注意：每次调用都是新身份。真实进程启动时应走 [`Self::with_identity`]
     /// 传入从加密存储恢复的身份（`DeviceIdentity::restore`），
     /// 否则重启一次就换个 deviceId，所有对端都会认为"这是台新设备"。
     pub fn new() -> Arc<Self> {
-        Self::with_identity(DeviceIdentity::generate(), "lanbackup", DeviceType::Desktop)
+        Self::open(DeviceIdentity::generate(), "lanbackup", DeviceType::Desktop, None)
     }
 
+    /// 用指定身份建 store（纯内存，不持久化）。
     pub fn with_identity(
         identity: DeviceIdentity,
         alias: &str,
         device_type: DeviceType,
     ) -> Arc<Self> {
+        Self::open(identity, alias, device_type, None)
+    }
+
+    /// 构造 store，可选接持久化。
+    ///
+    /// - `persist_dir: Some(dir)`：打开（建）该目录下的 `meta/` + `pieces/`，
+    ///   并把磁盘上**未终态**的会话整组捞回内存。持久化打不开时**降级为纯内存**
+    ///   （打日志，不让整个服务起不来）。
+    /// - `persist_dir: None`：纯内存，与原 MVP 行为一致（也用于单元测试）。
+    ///
+    /// 平台层应传入 App 私有数据目录；该目录支持同盘 rename，与 M20「SAF 无
+    /// 跨目录 rename」无涉（那条约束针对的是把收到的备份文件搬进用户自选位置）。
+    pub fn open(
+        identity: DeviceIdentity,
+        alias: &str,
+        device_type: DeviceType,
+        persist_dir: Option<&Path>,
+    ) -> Arc<Self> {
+        let persist = match persist_dir {
+            Some(dir) => match persist::SessionPersister::open(dir) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    log::warn!("会话持久化不可用，降级为纯内存：{e}");
+                    None
+                }
+            },
+            None => None,
+        };
+
+        // 冷启动重载：把磁盘上的未终态会话恢复进内存热表
+        let mut inner = HashMap::new();
+        if let Some(p) = &persist {
+            match p.load_all() {
+                Ok(records) => inner = records,
+                Err(e) => log::warn!("重载会话失败，从空状态启动：{e}"),
+            }
+        }
+
         Arc::new(Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(inner),
             identity,
             alias: alias.to_string(),
             device_type,
             peers: PeerStore::new(),
             handshake: HandshakeStore::new(),
             sync: sync_api::SyncStore::new(),
+            persist,
         })
     }
 
@@ -281,6 +334,16 @@ async fn handle_register(store: &Arc<SessionStore>, body: &[u8]) -> Response<Ful
         algorithm: Algorithm::Advanced,
         ..Default::default()
     };
+    if let Some(p) = &store.persist {
+        p.new_session(
+            &req.session_id,
+            &rec.device_id,
+            rec.phase,
+            rec.algorithm,
+            rec.degrade_reason,
+            rec.bitmap_version,
+        );
+    }
     store.inner.lock().await.insert(req.session_id.clone(), rec);
 
     ok_json(SessionRegisterResponse {
@@ -317,6 +380,9 @@ async fn handle_prepare(store: &Arc<SessionStore>, body: &[u8]) -> Response<Full
     for (file_id, meta) in &req.files {
         rec.files.insert(file_id.clone(), meta.clone());
         rec.confirmed.insert(file_id.clone(), HashSet::new());
+        if let Some(p) = &store.persist {
+            p.set_file(&req.session_id, file_id, meta);
+        }
         // 上传 token 为纯字符串（不是对象，见 DTO 注释）
         tokens.insert(file_id.clone(), format!("tok:{file_id}"));
     }
@@ -368,6 +434,15 @@ async fn handle_heartbeat(store: &Arc<SessionStore>, body: &[u8]) -> Response<Fu
     };
     // 心跳自增位图版本（真实场景：比对对端版本，不一致触发对账）
     rec.bitmap_version = rec.bitmap_version.max(hb.bitmap_version) + 1;
+    if let Some(p) = &store.persist {
+        p.update_session(
+            &hb.session_id,
+            rec.phase,
+            rec.algorithm,
+            rec.degrade_reason,
+            rec.bitmap_version,
+        );
+    }
     let payload = json!({
         "sessionId": hb.session_id,
         "phase": to_phase(rec.phase),
@@ -394,6 +469,16 @@ async fn handle_abort(store: &Arc<SessionStore>, body: &[u8]) -> Response<Full<b
     match rec.phase.transition(TransferEvent::Abort) {
         Ok(next) => {
             rec.phase = next;
+            if let Some(p) = &store.persist {
+                p.update_session(
+                    &a.session_id,
+                    rec.phase,
+                    rec.algorithm,
+                    rec.degrade_reason,
+                    rec.bitmap_version,
+                );
+                p.remove_session(&a.session_id);
+            }
             ok_json(json!({"sessionId": a.session_id, "phase": to_phase(next)}))
         }
         Err(il) => err_response(ErrorCode::IllegalState, il.reason),
@@ -458,6 +543,22 @@ async fn handle_chunk(store: &Arc<SessionStore>, body: &[u8]) -> Response<Full<b
             .insert(c.piece_index, sha.to_ascii_lowercase());
     }
     rec.bitmap_version += 1;
+    // 写穿持久化：会话状态 + 这一块（保证重启后能续传，而非全量重传）
+    if let Some(p) = &store.persist {
+        p.update_session(
+            &c.session_id,
+            rec.phase,
+            rec.algorithm,
+            rec.degrade_reason,
+            rec.bitmap_version,
+        );
+        p.set_piece(
+            &c.session_id,
+            &c.file_id,
+            c.piece_index,
+            c.sha256.as_deref(),
+        );
+    }
     ok_json(json!({
         "sessionId": c.session_id,
         "fileId": c.file_id,
@@ -677,6 +778,19 @@ async fn handle_verify(store: &Arc<SessionStore>, path: &str) -> Response<Full<b
             }
         }
     }
+    // 写穿持久化（含终态）；终态会话不再有续传价值，清理磁盘行
+    if let Some(p) = &store.persist {
+        p.update_session(
+            &session_id,
+            rec.phase,
+            rec.algorithm,
+            rec.degrade_reason,
+            rec.bitmap_version,
+        );
+        if rec.phase.is_terminal() {
+            p.remove_session(&session_id);
+        }
+    }
 
     let sha = rec.files.get(&file_id).and_then(|m| m.sha256.clone());
     ok_json(VerifyFileResponse {
@@ -717,6 +831,9 @@ async fn handle_receipt(store: &Arc<SessionStore>, body: &[u8]) -> Response<Full
                 rejected.push(t.file_id.clone());
             }
             _ => {
+                if let Some(p) = &store.persist {
+                    p.set_receipt(&req.session_id, &t.file_id, &t);
+                }
                 rec.receipts.insert(t.file_id.clone(), t);
             }
         }
@@ -1466,6 +1583,107 @@ mod tests {
         .await;
         let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
         assert_eq!(v["tasks"][0]["status"].as_str(), Some("transferring"));
+    }
+
+    /// 断点续传在**进程重启**后依然成立 —— 这是持久化要解决的真实缺口。
+    ///
+    /// 复现「对端传了一半，本端进程被杀/重启」：先在进程 A 里
+    /// register→prepare→收块 0、1（size 取 2 块），进程 A 退出；
+    /// 再用**同一持久化目录**开进程 B，断言 `s1` 已从磁盘恢复，
+    /// 且 `chunk-status` 报 `nextChunk=2` 从断点继续，而非退化成全量重传。
+    #[tokio::test]
+    async fn resume_survives_restart_via_persistence() {
+        let dir = std::env::temp_dir().join(format!("lanbak-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let persist_dir = dir.join("sessions");
+        // 2 块：size = PIECE_SIZE*2
+        let size = crate::transfer::chunk::PIECE_SIZE * 2;
+        let sha = "abcdef0000000000000000000000000000000000000000000000000000000001";
+
+        // ── 进程 A：注册 / prepare / 收到块 0、1 ──
+        {
+            let store = SessionStore::open(
+                crate::identity::DeviceIdentity::generate(),
+                "srv",
+                crate::dto::DeviceType::Desktop,
+                Some(&persist_dir),
+            );
+            route(
+                &store,
+                Method::POST,
+                "/api/v4/session/register",
+                &body(serde_json::json!({"deviceId":"d","alias":"a","sessionId":"s1"})),
+            )
+            .await;
+            route(
+                &store,
+                Method::POST,
+                "/api/v4/session/prepare",
+                &body(serde_json::json!({
+                    "sessionId":"s1","deviceId":"d",
+                    "files":{"f1":{"fileId":"f1","fileName":"x","relPath":"x",
+                        "size":size,"mtime":1,"sha256":sha,"pieceHashes":[sha,sha]}}
+                })),
+            )
+            .await;
+            for i in [0u64, 1] {
+                route(
+                    &store,
+                    Method::POST,
+                    "/api/v4/session/chunk",
+                    &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":i,"sha256":sha})),
+                )
+                .await;
+            }
+            // 进程 A 在此块结束时 drop
+        }
+
+        // ── 进程 B：重启，复用同一持久化目录 ──
+        {
+            let store = SessionStore::open(
+                crate::identity::DeviceIdentity::generate(),
+                "srv",
+                crate::dto::DeviceType::Desktop,
+                Some(&persist_dir),
+            );
+            // 内存热表应已重载出 s1，且其确认位图含 0、1
+            let g = store.inner.lock().await;
+            let rec = g.get("s1").expect("重启后会话未从磁盘恢复");
+            assert_eq!(rec.phase, TransferState::Transferring, "重载后阶段丢失");
+            assert!(
+                rec.confirmed.get("f1").unwrap().contains(&0),
+                "重启后确认的块 0 丢失"
+            );
+            assert!(
+                rec.confirmed.get("f1").unwrap().contains(&1),
+                "重启后确认的块 1 丢失"
+            );
+            assert_eq!(
+                rec.piece_sha.get("f1").unwrap().get(&0).unwrap(),
+                sha,
+                "重启后本端自算哈希丢失，412 正确性判定会退化"
+            );
+            drop(g);
+
+            // chunk-status 应如实报出 nextChunk=2，从断点继续，而非全量重传
+            let r = route(
+                &store,
+                Method::GET,
+                "/api/v4/chunk-status?sessionId=s1&fileId=f1",
+                &[],
+            )
+            .await;
+            let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
+            assert_eq!(
+                v["nextChunk"],
+                json!(2),
+                "重启后 nextChunk 没从断点继续，续传退化成全量重传"
+            );
+            assert_eq!(v["receivedChunks"], json!([0, 1]));
+            assert_eq!(v["fileComplete"], json!(true));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // 辅助：把 Response 的 body 读成 Vec<u8>
