@@ -682,15 +682,12 @@ fn file_incomplete_reason(rec: &SessionRecord, file_id: &str) -> Option<String> 
     }
     if let Some(declared) = meta.piece_hashes.as_ref() {
         let bad = (0..total)
-            .filter(|i| {
-                match (
-                    declared.get(*i as usize),
-                    local_sha.and_then(|m| m.get(i)),
-                ) {
+            .filter(
+                |i| match (declared.get(*i as usize), local_sha.and_then(|m| m.get(i))) {
                     (Some(d), Some(l)) => !d.eq_ignore_ascii_case(l),
                     _ => false,
-                }
-            })
+                },
+            )
             .count();
         if bad > 0 {
             return Some(format!("{bad} 个块 SHA-256 不匹配"));
@@ -975,9 +972,13 @@ mod tests {
     #[tokio::test]
     async fn diff_missing_piece_returns_200_chunkdiff() {
         let store = SessionStore::new();
-        setup(&store, "s1", serde_json::json!({
-            "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
-        }))
+        setup(
+            &store,
+            "s1",
+            serde_json::json!({
+                "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
+            }),
+        )
         .await;
         let r = route(
             &store,
@@ -995,20 +996,39 @@ mod tests {
     #[tokio::test]
     async fn diff_confirmed_matching_sha_returns_206_with_quoted_etag() {
         let store = SessionStore::new();
-        setup(&store, "s1", serde_json::json!({
-            "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1,
-                   "sha256": SHA, "pieceHashes":[SHA]}
-        }))
+        setup(
+            &store,
+            "s1",
+            serde_json::json!({
+                "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1,
+                       "sha256": SHA, "pieceHashes":[SHA]}
+            }),
+        )
         .await;
         // 确认第 0 块，本端落盘自算 sha = SHA
-        route(&store, Method::POST, "/api/v4/session/chunk",
-            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0,"sha256":SHA}))).await;
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/chunk",
+            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0,"sha256":SHA})),
+        )
+        .await;
         // 对端声明 sha == 本端实测 sha → 206 + 双引号 ETag（A12）
-        let r = route(&store, Method::GET,
-            &format!("/api/v4/session/diff?sessionId=s1&fileId=f1&pieceIndex=0&sha256={SHA}"), &[]).await;
+        let r = route(
+            &store,
+            Method::GET,
+            &format!("/api/v4/session/diff?sessionId=s1&fileId=f1&pieceIndex=0&sha256={SHA}"),
+            &[],
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(
-            r.headers().get("etag").unwrap().to_str().unwrap().to_string(),
+            r.headers()
+                .get("etag")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
             format!("\"{SHA}\"")
         );
     }
@@ -1016,17 +1036,31 @@ mod tests {
     #[tokio::test]
     async fn diff_confirmed_mismatched_sha_returns_412() {
         let store = SessionStore::new();
-        setup(&store, "s1", serde_json::json!({
-            "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1,
-                   "sha256": SHA, "pieceHashes":[SHA]}
-        }))
+        setup(
+            &store,
+            "s1",
+            serde_json::json!({
+                "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1,
+                       "sha256": SHA, "pieceHashes":[SHA]}
+            }),
+        )
         .await;
-        route(&store, Method::POST, "/api/v4/session/chunk",
-            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0,"sha256":SHA}))).await;
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/chunk",
+            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0,"sha256":SHA})),
+        )
+        .await;
         // 对端声明 sha 与本端实测不同 → 412 + DiffMismatch（A11 的"正确性"态）
         let other = "bbcdef0000000000000000000000000000000000000000000000000000000002";
-        let r = route(&store, Method::GET,
-            &format!("/api/v4/session/diff?sessionId=s1&fileId=f1&pieceIndex=0&sha256={other}"), &[]).await;
+        let r = route(
+            &store,
+            Method::GET,
+            &format!("/api/v4/session/diff?sessionId=s1&fileId=f1&pieceIndex=0&sha256={other}"),
+            &[],
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::PRECONDITION_FAILED);
         let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
         assert_eq!(v["expected"].as_str(), Some(other));
@@ -1036,15 +1070,29 @@ mod tests {
     #[tokio::test]
     async fn diff_out_of_range_returns_416_with_content_range() {
         let store = SessionStore::new();
-        setup(&store, "s1", serde_json::json!({
-            "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
-        }))
+        setup(
+            &store,
+            "s1",
+            serde_json::json!({
+                "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
+            }),
+        )
         .await;
-        let r = route(&store, Method::GET,
-            "/api/v4/session/diff?sessionId=s1&fileId=f1&pieceIndex=1", &[]).await;
+        let r = route(
+            &store,
+            Method::GET,
+            "/api/v4/session/diff?sessionId=s1&fileId=f1&pieceIndex=1",
+            &[],
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(
-            r.headers().get("content-range").unwrap().to_str().unwrap().to_string(),
+            r.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
             "bytes */100"
         );
     }
@@ -1052,26 +1100,44 @@ mod tests {
     #[tokio::test]
     async fn diff_weak_etag_rejected_400() {
         let store = SessionStore::new();
-        setup(&store, "s1", serde_json::json!({
-            "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1,
-                   "sha256": SHA, "pieceHashes":[SHA]}
-        }))
+        setup(
+            &store,
+            "s1",
+            serde_json::json!({
+                "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1,
+                       "sha256": SHA, "pieceHashes":[SHA]}
+            }),
+        )
         .await;
         // W/ 弱校验器必须被拒（A12）：续传需要字节级强校验
-        let r = route(&store, Method::GET,
-            &format!("/api/v4/session/diff?sessionId=s1&fileId=f1&etag=W/{SHA}"), &[]).await;
+        let r = route(
+            &store,
+            Method::GET,
+            &format!("/api/v4/session/diff?sessionId=s1&fileId=f1&etag=W/{SHA}"),
+            &[],
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn verify_incomplete_returns_412_with_reason() {
         let store = SessionStore::new();
-        setup(&store, "s1", serde_json::json!({
-            "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
-        }))
+        setup(
+            &store,
+            "s1",
+            serde_json::json!({
+                "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
+            }),
+        )
         .await;
-        let r = route(&store, Method::GET,
-            "/api/v4/session/verify?sessionId=s1&fileId=f1", &[]).await;
+        let r = route(
+            &store,
+            Method::GET,
+            "/api/v4/session/verify?sessionId=s1&fileId=f1",
+            &[],
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::PRECONDITION_FAILED);
         let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
         assert!(v["reason"].as_str().unwrap().contains("缺少"));
@@ -1080,15 +1146,29 @@ mod tests {
     #[tokio::test]
     async fn verify_complete_advances_to_completed() {
         let store = SessionStore::new();
-        setup(&store, "s1", serde_json::json!({
-            "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1,"sha256":SHA}
-        }))
+        setup(
+            &store,
+            "s1",
+            serde_json::json!({
+                "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1,"sha256":SHA}
+            }),
+        )
         .await;
         // chunk 推到 Transferring 并确认全部块
-        route(&store, Method::POST, "/api/v4/session/chunk",
-            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0,"sha256":SHA}))).await;
-        let r = route(&store, Method::GET,
-            "/api/v4/session/verify?sessionId=s1&fileId=f1", &[]).await;
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/chunk",
+            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0,"sha256":SHA})),
+        )
+        .await;
+        let r = route(
+            &store,
+            Method::GET,
+            "/api/v4/session/verify?sessionId=s1&fileId=f1",
+            &[],
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::OK);
         let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
         assert_eq!(v["sha256"].as_str(), Some(SHA));
@@ -1100,21 +1180,35 @@ mod tests {
     #[tokio::test]
     async fn receipt_terminal_status_is_monotonic() {
         let store = SessionStore::new();
-        setup(&store, "s1", serde_json::json!({
-            "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
-        }))
+        setup(
+            &store,
+            "s1",
+            serde_json::json!({
+                "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
+            }),
+        )
         .await;
         // 第一次回执：Completed
-        let r = route(&store, Method::POST, "/api/v4/session/receipt",
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/receipt",
             &body(serde_json::json!({"sessionId":"s1","tasks":[
                 {"fileId":"f1","relPath":"x","status":"completed"}
-            ]}))).await;
+            ]})),
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::OK);
         // 乱序回执：Failed 不得踩回已完成（S1 终态单调）
-        let r = route(&store, Method::POST, "/api/v4/session/receipt",
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/receipt",
             &body(serde_json::json!({"sessionId":"s1","tasks":[
                 {"fileId":"f1","relPath":"x","status":"failed"}
-            ]}))).await;
+            ]})),
+        )
+        .await;
         let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
         assert_eq!(
             v["rejected"].as_array().unwrap(),
@@ -1130,14 +1224,23 @@ mod tests {
     #[tokio::test]
     async fn receipt_unknown_file_rejected() {
         let store = SessionStore::new();
-        setup(&store, "s1", serde_json::json!({
-            "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
-        }))
+        setup(
+            &store,
+            "s1",
+            serde_json::json!({
+                "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
+            }),
+        )
         .await;
-        let r = route(&store, Method::POST, "/api/v4/session/receipt",
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/receipt",
             &body(serde_json::json!({"sessionId":"s1","tasks":[
                 {"fileId":"ghost","relPath":"x","status":"completed"}
-            ]}))).await;
+            ]})),
+        )
+        .await;
         let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
         assert_eq!(
             v["rejected"].as_array().unwrap(),
@@ -1148,12 +1251,22 @@ mod tests {
     #[tokio::test]
     async fn tasks_lists_all_files_even_without_receipt() {
         let store = SessionStore::new();
-        setup(&store, "s1", serde_json::json!({
-            "f2": {"fileId":"f2","fileName":"y","relPath":"y","size":100,"mtime":1},
-            "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
-        }))
+        setup(
+            &store,
+            "s1",
+            serde_json::json!({
+                "f2": {"fileId":"f2","fileName":"y","relPath":"y","size":100,"mtime":1},
+                "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
+            }),
+        )
         .await;
-        let r = route(&store, Method::GET, "/api/v4/session/tasks?sessionId=s1", &[]).await;
+        let r = route(
+            &store,
+            Method::GET,
+            "/api/v4/session/tasks?sessionId=s1",
+            &[],
+        )
+        .await;
         let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
         let tasks = v["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), 2);
@@ -1166,13 +1279,28 @@ mod tests {
     #[tokio::test]
     async fn tasks_reflects_progress_when_chunks_confirmed() {
         let store = SessionStore::new();
-        setup(&store, "s1", serde_json::json!({
-            "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
-        }))
+        setup(
+            &store,
+            "s1",
+            serde_json::json!({
+                "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
+            }),
+        )
         .await;
-        route(&store, Method::POST, "/api/v4/session/chunk",
-            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0}))).await;
-        let r = route(&store, Method::GET, "/api/v4/session/tasks?sessionId=s1", &[]).await;
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/chunk",
+            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0})),
+        )
+        .await;
+        let r = route(
+            &store,
+            Method::GET,
+            "/api/v4/session/tasks?sessionId=s1",
+            &[],
+        )
+        .await;
         let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
         assert_eq!(v["tasks"][0]["status"].as_str(), Some("transferring"));
     }
