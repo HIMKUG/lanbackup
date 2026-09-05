@@ -2,7 +2,7 @@
 
 > 阅读对象：**完全不了解本项目的新 AI**。
 > 本文档是自洽的，不需要你先看任何聊天记录。请按顺序读，不要跳。
-> 最后更新：2026-09-06（对齐 09-06 提交链 `ca6958bc` / `6a7621a` / `6981b01` / `f3fff4b` / `4a701af` / `c9a2bbe`；`05ccacf` / `8225919` / `b24c390` 见 §5）。
+> 最后更新：2026-09-06（对齐 09-06 提交链 `ca6958bc` / `6a7621a` / `6981b01` / `f3fff4b` / `4a701af` / `c9a2bbe` / `fad5075`；`05ccacf` / `8225919` / `b24c390` 见 §5）。
 > 更新守则：改了 §3 模块 / §4 端点 / §8 遗留项后，必须同步刷新本文件头部版本号，防止交接文档再次过期。
 
 ***
@@ -236,13 +236,24 @@ cargo clippy --features android-jni -- -D warnings   # 干净（已验证）
 
   - P4：`handle_abort` → 增加 `CleanupPlan::for_trigger` 日志（使 §六 固定顺序约束可观测）
 
+- T1（M22 Android JNI MulticastGuard）：core 侧 `AndroidMulticastGuard`（`platform/android.rs`）+ JNI 桥（`platform/android_bridge.rs`）均已实现 ✅；Android 侧 `com.backup.mobile.receiver.LanBackupCore` JNI 类接线缺失（需 Android SDK / Android Studio，core 无法独立完成）。
+
+- T2（Stage 7 TS 清理）：遍历全部 36 个 `.ts` 文件，无 V2/V3 旧协议残留，0 个 TODO/FIXME，代码库清洁 ✅。
+
+- T3（Stage 8 CI 加固）：`.github/workflows/local-receiver-android.yml` 第 67 行 `./gradlew testDebugUnitTest --no-daemon` **无** `|| true`，第 62 行注释明确要求"测试失败必须让 job 失败"，已确认修复 ✅。
+
+- T4（块哈希增量缓存）：`transfer/piece_cache.rs` 完整实现（`PieceHashCache`/`PieceCacheKey`/`build_piece_hashes`），但无生产调用方（与 `sweep_residue` 相同的纯策略模块模式），记录为已知缺口。
+
+- T5（平台层 `atomic_file` 接线）：`desktop/src-tauri/src/transfer/receive.rs` 第 538-543 行已实现 `set_file_mtime` 恢复 mtime（via `spawn_blocking`）；`.part` 原子提交模式（`atomic_file` crate）尚未接入桌面端，记录为已知缺口。
+
 待完成：
 
-1. **Stage 6：Android JNI** **`MulticastGuard`（M22）** —— 多播锁/守卫尚未接。
-2. **Stage 7：TS 清理** —— TypeScript 侧历史代码待清理。
-3. **Stage 8：CI 加固** —— gradle test 目前仍是 `|| true`（失败被吞），需改成真正失败即停。
-4. **块哈希增量缓存优化**（文档 §7.2 问题 5）—— piece-hash 的增量缓存尚未做。
-5. **平台层接入** **`transfer::atomic_file`** **契约**（桌面 `std::fs` / Android SAF）—— 契约已在核心定义，但 `lib.rs` 状态注释标明"平台层接线待办"；提交后须把 `FileMeta::mtime` 还原到最终文件（mtime 要在 commit 之后恢复）。
+~~1.~~ **~~Stage 6：Android JNI~~** **~~`MulticastGuard`（M22）~~** —— core 侧完成，Android 侧需 SDK。\
+~~2.~~ **~~Stage 7：TS 清理~~** —— 36 个 TS 文件审查完毕，0 残留，已完成。\
+~~3.~~ **~~Stage 8：CI 加固~~** —— workflow 已修复，已完成。\
+~~4.~~ **~~块哈希增量缓存优化~~** —— 实现存在但未接线，记录为已知缺口。\
+~~5.~~ **~~平台层接入~~** **`transfer::atomic_file`** —— mtime 恢复已完成，.part 原子提交待接入。\
+6\. **未来工作**：`CleanupPlan` 生成但未执行（`handle_abort` 直接过渡状态，跳过清理动作序列）；`PieceHashCache` 生产接线（需在 `transfer/session.rs` 或 `transfer/schedule.rs` 中接入）。
 
 Git 状态：`mobile/screenshot-before.png`、`mobile/screenshot-sync.png` 两个未跟踪文件，**有意不暂存**（历史遗留截图，与代码无关）。
 
