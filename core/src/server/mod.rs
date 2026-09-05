@@ -32,6 +32,7 @@ use crate::routes;
 use crate::server::control::{HandshakeStore, PeerStore};
 use crate::state::transfer::{TransferEvent, TransferState};
 use crate::transfer::chunk::piece_count;
+use crate::transfer::cleanup::{CleanupPlan, CleanupTrigger};
 
 pub mod control;
 pub mod sync_api;
@@ -543,6 +544,15 @@ async fn handle_abort(store: &Arc<SessionStore>, body: &[u8]) -> Response<Full<b
     match rec.phase.transition(TransferEvent::Abort) {
         Ok(next) => {
             rec.phase = next;
+            let plan = CleanupPlan::for_trigger(CleanupTrigger::UserAbort, rec.phase);
+            log::info!(
+                "handle_abort: sessionId={} cleanup_plan=[{}]",
+                a.session_id,
+                plan.actions()
+                    .map(|a| format!("{a:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             if let Some(p) = &store.persist {
                 p.update_session(
                     &a.session_id,

@@ -51,12 +51,16 @@ use std::cell::RefCell;
 use std::ffi::{c_char, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::dto::sync::Manifest;
 use crate::presence::beacon::{sign_beacon, verify_beacon, BEACON_LEN, DEVICE_ID_PREFIX_LEN};
 use crate::routes;
+use crate::server;
 use crate::state::policy::{self, UiAction, UiContext, Verdict};
 use crate::sync;
+use crate::transfer::cleanup;
 use crate::version::{API_PREFIX, DEFAULT_PORT, PROTOCOL_VERSION};
 
 // ── 错误码（负数会与「成功」混淆，一律非负）────────────────────────────
@@ -391,6 +395,7 @@ pub unsafe extern "C" fn lanbackup_beacon_verify(
 /// | `sync.decide` | `{localNow, localSnapshot, peerNow, strategy}`（均为 [`crate::dto::sync`] 类型） | 完整的 `SyncDecision` |
 /// | `policy.can` | `{action, ctx}` | `{enabled, reason}` |
 /// | `discovery.scan_targets` | `{ifaces: [{ip, netmask}]}` | `["ip:port", ...]` |
+/// | `cleanup.sweep_residue` | `{root: string}` | `[{path: string}, ...]` |
 ///
 /// 新增能力**只需在这里加一个 match 分支**，双端不必重新协商 ABI ——
 /// 这正是把易变部分放在 JSON 之后的全部收益。
@@ -426,6 +431,7 @@ pub unsafe extern "C" fn lanbackup_invoke(
             "sync.decide" => sync_decide_json(&args),
             "policy.can" => policy_can_json(&args),
             "discovery.scan_targets" => scan_targets_json(&args),
+            "cleanup.sweep_residue" => sweep_residue_json(&args),
             other => Err(set_error(
                 ERR_UNKNOWN_METHOD,
                 format!("未知的 method: {other}"),
@@ -456,6 +462,33 @@ fn routes_json() -> serde_json::Value {
         .map(|r| serde_json::json!({"method": r.method.as_str(), "path": r.path}))
         .collect();
     serde_json::Value::Array(all)
+}
+
+/// S3/M17/S5：触发 [`server::SessionStore::sweep_idle`] 的 FFI 入口.
+///
+/// 平台层每 60s 调用一次，清理超过 300s 无活跃信号的非终态会话.
+///
+/// 纯 fire-and-forget：把 `Arc` 的裸指针传进来，在后台 tokio 任务里重建
+/// `Arc` 后调用 `sweep_idle`，函数立即返回，不阻塞调用方.
+///
+/// 调用约定：平台层持有一个 `Arc<SessionStore>`，传 `Arc::as_ptr(&arc)`。
+/// 注意：`sweep_idle` 调用期间原 `Arc` 必须保持有效（不得在本函数返回前 drop）。
+///
+/// # Safety
+/// - `store_ptr` 必须是一个从 `Arc<SessionStore>::as_ptr()` 获得的非空指针，
+///   且对应的 `Arc` 在本函数返回前必须保持有效（不得被 drop）。
+#[no_mangle]
+pub unsafe extern "C" fn lanbackup_server_sweep_idle(store_ptr: *const server::SessionStore) -> i32 {
+    if store_ptr.is_null() {
+        return set_error(ERR_NULL_PTR, "store_ptr 不得为空");
+    }
+    guard!({
+        let store = Arc::from_raw(store_ptr);
+        tokio::spawn(async move {
+            let _swept = store.sweep_idle(Instant::now()).await;
+        });
+        ERR_OK
+    })
 }
 
 fn version_json() -> serde_json::Value {
@@ -546,6 +579,24 @@ fn scan_targets_json(args: &serde_json::Value) -> Result<serde_json::Value, i32>
         targets
             .iter()
             .map(|t| serde_json::json!(t.to_string()))
+            .collect(),
+    ))
+}
+
+fn sweep_residue_json(args: &serde_json::Value) -> Result<serde_json::Value, i32> {
+    #[derive(serde::Deserialize)]
+    struct Args {
+        root: String,
+    }
+    let a: Args = serde_json::from_value(args.clone())
+        .map_err(|e| set_error(ERR_BAD_JSON, format!("cleanup.sweep_residue 参数错误: {e}")))?;
+
+    let root = std::path::Path::new(&a.root);
+    let removed = cleanup::sweep_residue(root);
+    Ok(serde_json::Value::Array(
+        removed
+            .into_iter()
+            .map(|p| serde_json::json!({ "path": p.to_string_lossy() }))
             .collect(),
     ))
 }
