@@ -117,7 +117,12 @@ pub const BASIC_CHUNK_PIECES: u64 = BASIC_CHUNK_SIZE / PIECE_SIZE;
 /// 聚合后"万次握手 → 1 次连接"。
 pub const TINY_THRESHOLD: u64 = 10 * 1024;
 
-/// tiny 文件每批打包数量。原注释：50-100 为工程平衡点
+/// tiny 文件每批打包数量。V4 决策：**75**。
+///
+/// 历史矛盾（登记簿 E9）：旧 `transfer.ts:669` 常量 = 20，注释（632/636 行）
+/// 却写「50-100 为工程平衡点」。V4 统一在 50-100 区间内取中值 75 ——
+/// 批量过小则聚合省不下逐文件握手的开销，过大则单批内存占用与
+/// 失败重试的放大成本上升。
 pub const TINY_BATCH_SIZE: usize = 75;
 
 /// 大文件阈值：超过此值才构建 Merkle 树

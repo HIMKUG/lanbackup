@@ -99,9 +99,19 @@
 
 ## A4 · 契约收尾（穿插）
 
-- [ ] E4 协议目录矛盾清理（v2/v3 残留文件标记删除）
-- [ ] E8/E9 连接码规范化、TINY_BATCH 统一
-- [ ] 登记簿「每阶段回填」机制固化
+> **执行记录（2026-09-06 A4 已落地）**：
+> - E4：`protocol/README.md` 重写为 V4 契约 —— 版本统一为 4（对齐 core `PROTOCOL_VERSION`）、
+>   端口 53317、端点表对齐 `schemas/v4/golden-manifest.json` 的 16 个 `/api/v4/*` 端点；
+>   v2/v3/v5 残留文件（`protocol/golden/` 全目录 + `schemas/` 根下 9 个旧 schema 含
+>   v5-unpair）已删除，README 内「3.0 vs 3.1」「无 pair/initiate vs manifest 列出」矛盾消除。
+> - E8：core 采用严格版连接码规范化 —— `identity.rs::normalize_connection_code`
+>   （只保留 `[A-Z0-9]` 并统一大写，幂等测试），输入边界 `HandshakeStore::set_pairing_code`
+>   统一调用；`path_a_request` 测试同步演示客户端同规则。
+> - E9：`version.rs::TINY_BATCH_SIZE = 75`（50-100 平衡区间中值），注释改写为 V4 决策说明。
+
+- [x] E4 协议目录矛盾清理（v2/v3 残留文件已删除）
+- [x] E8/E9 连接码规范化、TINY_BATCH 统一
+- [x] 登记簿「每阶段回填」机制固化
 
 ## 后续方向（C/D 简纲，本次不执行）
 
