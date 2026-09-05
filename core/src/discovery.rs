@@ -37,12 +37,14 @@
 //! |---|---|---|
 //! | [`subnet_hosts`] / [`scan_targets`] / [`prioritize_known`] | 纯计算：该探谁、按什么顺序 | 是 |
 //! | [`ProbeWave`] | 纯计算：并发窗口 | 是 |
+//! | [`should_drop_self`] | 纯计算：发现结果自过滤（M34） | 是 |
 //! | [`probe_one`] / [`probe_all`] | 纯 IO：真的发请求 | 否（需要网络） |
 
 use std::collections::{BTreeSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+use crate::identity::DeviceIdentity;
 use crate::routes;
 
 /// 子网探测的掩码**下限**（即最多扫到 /24）。
@@ -326,6 +328,27 @@ pub fn reachable(results: &[(SocketAddr, ProbeResult)]) -> Vec<SocketAddr> {
     v
 }
 
+// ============================================================
+// 纯计算：发现结果自过滤（M34）
+// ============================================================
+
+/// 该 fingerprint 是否应被丢弃（不进入设备列表）。
+///
+/// M34 修复：设备广播/探测响应的 `fingerprint` 是**完整 deviceId**
+/// （16 字节 hex），**不是** 8 位连接码。旧实现（Java `LocalReceiverPlugin`
+/// 的 `selfCode` 参数）拿 fingerprint 与本地 8 位连接码比较 —— 两者长度不同、
+/// 永不相等，于是设备**把自己扫进设备列表**（DESIGN-WISDOM-REGISTER M34）。
+///
+/// 自过滤必须拿 peer fingerprint 与本地 [`DeviceIdentity::device_id`]
+/// （完整 ID）比较。函数以本地身份为参数（调用方注入），内部只读
+/// `device_id`，在类型层面杜绝「拿连接码来比」的复发。
+///
+/// 空 fingerprint 同样丢弃：无身份的报文无法去重/识别，入列只会污染列表
+/// （旧实现同样丢弃空值）。
+pub fn should_drop_self(fingerprint: &str, local: &DeviceIdentity) -> bool {
+    fingerprint.is_empty() || fingerprint == local.device_id()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +564,42 @@ mod tests {
                 SocketAddr::from((ip(10, 0, 0, 9), DEFAULT_PORT)),
             ]
         );
+    }
+
+    // ── 自过滤（M34） ─────────────────────────────────────
+
+    /// 广播 fingerprint 恰好等于本地完整 deviceId → 必须被丢弃。
+    ///
+    /// 这正是旧实现的死穴：它拿 fingerprint 跟 8 位连接码比，永不相等，
+    /// 于是设备把自己扫进设备列表。
+    #[test]
+    fn own_device_id_fingerprint_is_dropped() {
+        let local = DeviceIdentity::generate();
+        // 本地 identity 的完整 deviceId（32 hex 字符）作为"收到的广播 fingerprint"
+        assert!(
+            should_drop_self(local.device_id(), &local),
+            "自己的 fingerprint（完整 deviceId）必须被过滤，不得进入设备列表"
+        );
+    }
+
+    /// 对端设备的 fingerprint（合法 16 字节 hex）≠ 本地 deviceId → 必须保留。
+    #[test]
+    fn peer_device_id_fingerprint_is_kept() {
+        let local = DeviceIdentity::generate();
+        // 对端设备合法的完整 deviceId（16 字节 hex）
+        let peer = "0123456789abcdef0123456789abcdef";
+        assert_ne!(local.device_id(), peer);
+        assert!(
+            !should_drop_self(peer, &local),
+            "对端设备的 fingerprint 必须保留"
+        );
+    }
+
+    /// 空 fingerprint：无身份的报文无法识别/去重，同样丢弃（旧实现同此）。
+    #[test]
+    fn empty_fingerprint_is_dropped() {
+        let local = DeviceIdentity::generate();
+        assert!(should_drop_self("", &local));
     }
 
     /// 192.0.2.0/24 是 RFC 5737 的 TEST-NET-1，保证不可路由。

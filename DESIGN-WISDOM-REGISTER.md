@@ -145,7 +145,7 @@
 | M31 | **解除配对通知重试 3 次** —— 对方短暂不可达也能收到，强制其同步解除 | `App.vue:1596-1607` | 配对解绑 | ✅ 已落地：`pairing/unpair.rs::UnpairRetry`（`UNPAIR_ATTEMPTS=3`；`unpair-request` 通道重试 3 次失败 → 切换 `revoke-notify` 兜底重试 3 次 → 仍失败放弃，依赖对账机制收敛） |
 | M32 | **取消收件两步走**：① 本地停止（无条件先行）② 通知对端；通知失败不影响本地停止，四种成败组合各有独立文案 | `App.vue:2150-2192` | 中止流程 | ⬜ |
 | M33 | **已知缺失的 8 个 TS 契约方法**：`v3Probe`、`v3PairClient`、`syncAllPeers`、`isPeerPaired`、`setDefensiveHidden`/`getDefensiveHidden`、`dumpNativeLogs`、事件 `java-log`、`pair-presence` —— Java 从未实现 | `receiver.ts` vs Java 全 0 命中 | core（必须补齐） | ⬜ |
-| M34 | **扫描自过滤失效（现存 bug）**：广播的 fingerprint 是 UUID，但自过滤拿它跟 8 位连接码比，永不相等 → **手机会把自己扫进设备列表** | `L1318,L1400,L1443` vs `App.vue:1482` | core 发现（**修复**） | ⬜ |
+| M34 | **扫描自过滤失效（现存 bug）**：广播的 fingerprint 是 UUID，但自过滤拿它跟 8 位连接码比，永不相等 → **手机会把自己扫进设备列表** | `L1318,L1400,L1443` vs `App.vue:1482` | core 发现（**修复**） | ✅ 已落地：`core/src/discovery.rs::should_drop_self` —— 自过滤以本地 `DeviceIdentity::device_id`（完整 16 字节 hex）为基准，函数签名只接收本地身份对象、内部只读 `device_id`，在类型层面杜绝「拿 8 位连接码来比」复发；空 fingerprint 一并丢弃。测试 `own_device_id_fingerprint_is_dropped` / `peer_device_id_fingerprint_is_kept` / `empty_fingerprint_is_dropped` 钉死「等于本地 deviceId → 丢弃；不等于 → 保留」 |
 | M35 | **分块 Base64 必须按 3 的倍数分块** —— 8192 不是 3 的倍数，每块独立编码会各自追加 `=` 填充，拼接后是非法 Base64（当前为潜伏地雷） | `L1573-1583` | core 编码（**避免重犯**） | ⬜ |
 | M36 | **上传长度必须精确上报** —— 接收端按声明的 size **硬校验 written == size**；空文件也返回 12 字节头，是真实开销非误判 | `backup.ts:200-209` | core 上传 | ⬜ |
 | M37 | **并发切片步长必须与索引步长一致**（`i += 8` 对 `slice(i, i+8)`）—— 曾误写 `i+3` 导致 85 个只传 33 个 | `backup.ts:295-297` | core 批量 | ⬜ |
