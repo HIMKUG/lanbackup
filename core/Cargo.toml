@@ -67,7 +67,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # ---------- 工具 ----------
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
-time = { version = "0.3", features = ["formatting", "parsing"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 log = "0.4"
 
 # ---------- Android JNI（仅 Android 构建启用，默认关闭，避免把 jni 拖进桌面/CI 构建） ----------

@@ -2,7 +2,7 @@
 
 > 阅读对象：**完全不了解本项目的新 AI**。
 > 本文档是自洽的，不需要你先看任何聊天记录。请按顺序读，不要跳。
-> 最后更新：2026-09-06（对齐 09-03 提交 `b24c390` / `eacbd40` / `4ff76ef` / `b1f6b3d`；`05ccacf` / `8225919` 见 §5）。
+> 最后更新：2026-09-06（对齐 09-06 提交 `ca6958bc` / `6a7621a` / `6981b01` / `f3fff4b`；`05ccacf` / `8225919` / `b24c390` 见 §5）。
 > 更新守则：改了 §3 模块 / §4 端点 / §8 遗留项后，必须同步刷新本文件头部版本号，防止交接文档再次过期。
 
 ---
@@ -54,7 +54,7 @@ dto         —— 请求/响应数据结构（契约即代码，靠 schemars �
 error       —— 统一错误
 ffi         —— 对外门面（Tauri + JNI/uniFFI 共用），含路由自检
 identity    —— 设备身份
-pairing     —— 配对（手 A 首配 / 路径 B 重连）
+pairing     —— 配对（手 A 首配 / 路径 B 重连 / 解除重试 `unpair.rs`）
 presence    —— 在线性
 routes      —— ★ 端点路径的**单一来源**（见第 4 节）
 server      —— hyper HTTP 服务 + 内存会话存储 + 状态机门控 + 持久化
@@ -147,7 +147,7 @@ transfer/
 - 默认 `target/` 在沙箱里不可写（`os error 5` 访问拒绝）。
 - 跑任何 cargo 命令前先：
   ```bash
-  export CARGO_TARGET_DIR="C:/Users/VOS_User/WorkBuddy/2026-08-29-06-42-14/cargo-target"
+  export CARGO_TARGET_DIR="D:/code/tools/6a7f5d5699c44b33268ede69/cargo-target"
   ```
 - `cargo clippy --all-targets` 会因为集成测试的指纹问题报 `os error 5`，**改用**：
   ```bash
@@ -171,8 +171,9 @@ RustCrypto 世代必须自洽，版本号不是随便挑新的：
 cd D:/code/tools/6a7f5d5699c44b33268ede69/core
 export CARGO_TARGET_DIR="D:/code/tools/6a7f5d5699c44b33268ede69/cargo-target"
 
-cargo test --lib            # 410 passed, 0 failed（09-03 已验证；402→408→410 随 M22/缓存落地递增）
-cargo clippy --lib --tests -- -D warnings   # 干净（已验证）
+cargo test --lib            # 473 passed, 0 failed（09-06 已验证；410→473 随 A3/M34 落地递增）
+cargo clippy --all-targets -- -D warnings   # 干净（09-06 已验证）
+cargo run --bin gen_schema -- --check        # 45 份 schema 与实现一致（09-06 已验证）
 cargo build --features android-jni          # 可选：M22 真实 AndroidMulticastGuard（jni 门控，默认构建不受影响）
 cargo clippy --features android-jni -- -D warnings   # 干净（已验证）
 ```
@@ -185,6 +186,13 @@ cargo clippy --features android-jni -- -D warnings   # 干净（已验证）
 
 以下均为**重构前的既有遗留项**，本次会话未要求处理，列出供接手时认领：
 
+已完成（09-06 并行 agent + 本次审查）：
+- A3 可靠性批（S3/M17 心跳续期+闲置巡检、M31 解除重试、M32 取消两步走、S5 握手有界、P36 崩溃清理）—— `server/control.rs` / `server/mod.rs` / `pairing/unpair.rs` / `transfer/cancel.rs` / `transfer/cleanup.rs`
+- A4 契约收尾（E4 协议 README 重写为 V4、E8 连接码规范化、E9 TINY_BATCH=75）
+- M34 扫描自过滤修复（`discovery.rs::should_drop_self`）
+- B 批登记簿条目（S9 mergeRecords、M3/M4 连接码派生、W6/P24 连接码缓存）
+
+待完成：
 1. **Stage 6：Android JNI `MulticastGuard`（M22）** —— 多播锁/守卫尚未接。
 2. **Stage 7：TS 清理** —— TypeScript 侧历史代码待清理。
 3. **Stage 8：CI 加固** —— gradle test 目前仍是 `|| true`（失败被吞），需改成真正失败即停。
@@ -213,6 +221,6 @@ Git 状态：`mobile/screenshot-before.png`、`mobile/screenshot-sync.png` 两�
 - [ ] 读 `V4-TRANSFER-MODULE.md`（状态机、§3 按钮表）
 - [ ] 扫 `DESIGN-WISDOM-REGISTER.md`（踩坑登记）
 - [ ] `cd core && export CARGO_TARGET_DIR=D:/code/tools/6a7f5d5699c44b33268ede69/cargo-target`
-- [ ] `cargo test --lib` 确认 410 通过
+- [ ] `cargo test --lib` 确认 473 通过
 - [ ] 看 `src/routes.rs`（24 端点单一来源）、`src/state.rs`（状态机）、`src/transfer/atomic_file.rs`（缺口②）、`src/server/persist.rs`（缺口①）、`src/platform/`（M22 组播锁 + JNI 桥）、`src/transfer/piece_cache.rs`（块哈希缓存）
 - [ ] 认领第 8 节遗留项（平台层接线 / 真机验证）之一开始工作
