@@ -168,6 +168,49 @@ impl PeerStore {
         self.inner.lock().await.insert(rec.device_id.clone(), rec);
     }
 
+    /// S9：逐字段合并 —— 新记录**缺字段时保留旧值**，绝不整条覆盖。
+    ///
+    /// 三代实测：后台巡检 / UDP 探测产生的记录字段不全（没有密钥材料），
+    /// 整条覆盖写会**清空 `public_key` / `pairing_secret`**，连接码刷新后
+    /// 历史数据永久无法解密（DESIGN-WISDOM-REGISTER S9）。合并规则：
+    ///
+    /// - `alias` / `public_key` / `pairing_secret`：新值为空 → 保留旧值
+    ///   （密钥材料只增不丢）；
+    /// - `trust`：新记录是默认构造（未配对 / 版本号全 0）→ 保留旧值；
+    /// - `presence`：新值为 `Unknown`（"无信息"而非"离线"，S12 语义）→ 保留旧值；
+    /// - `last_peer_status`：`None` → 保留旧值；
+    /// - 其余有明确新值的状态字段一律采用新值。
+    ///
+    /// 记录不存在时等价于 [`Self::put`]。
+    pub async fn merge(&self, rec: PeerRecord) {
+        let mut g = self.inner.lock().await;
+        match g.get_mut(&rec.device_id) {
+            Some(existing) => {
+                if !rec.alias.is_empty() {
+                    existing.alias = rec.alias;
+                }
+                if !rec.public_key.is_empty() {
+                    existing.public_key = rec.public_key;
+                }
+                if !rec.pairing_secret.is_empty() {
+                    existing.pairing_secret = rec.pairing_secret;
+                }
+                if rec.trust != TrustRecord::default() {
+                    existing.trust = rec.trust;
+                }
+                if rec.presence != Presence::Unknown {
+                    existing.presence = rec.presence;
+                }
+                if rec.last_peer_status.is_some() {
+                    existing.last_peer_status = rec.last_peer_status;
+                }
+            }
+            None => {
+                g.insert(rec.device_id.clone(), rec);
+            }
+        }
+    }
+
     /// 当前所有对端（诊断/测试）。
     pub async fn all(&self) -> Vec<PeerRecord> {
         self.inner.lock().await.values().cloned().collect()
@@ -216,8 +259,12 @@ impl HandshakeStore {
         Self::default()
     }
 
+    /// 连接码是网络协议线格式的一部分（KDF/HMAC 输入），入口统一做
+    /// E8 规范化（[`crate::identity::normalize_connection_code`]，严格版：
+    /// 只保留 `[A-Z0-9]` 并统一大写），否则双端从同一原始输入会得出
+    /// 不同字节 → 派生的密钥永不相等。
     pub async fn set_pairing_code(&self, code: String) {
-        *self.pairing_code.lock().await = Some(code);
+        *self.pairing_code.lock().await = Some(crate::identity::normalize_connection_code(&code));
     }
 
     pub async fn get_pairing_code(&self) -> Option<String> {
@@ -897,7 +944,10 @@ mod tests {
         let client_eph = EphemeralKeyPair::generate().public_key_bytes();
         let cn = hex_dec(&client_nonce).unwrap();
         let sn = hex_dec(&server_nonce).unwrap();
-        let key = transcript::path_a_key(CODE, &cn, &sn);
+        // E8：客户端与 set_pairing_code 用同一规范化规则 —— 双端必须从同一
+        // 原始输入得出相同字节，否则服务端永远验不过 HMAC。
+        let code = crate::identity::normalize_connection_code(CODE);
+        let key = transcript::path_a_key(&code, &cn, &sn);
         let tr = transcript::path_a_transcript(
             device_id,
             &client_eph,
@@ -1801,5 +1851,62 @@ mod tests {
             .collect();
         ids.sort();
         assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    // ── S9：巡检式更新不得清空配对密钥材料 ────────────────────────
+
+    /// S9 回归：后台巡检 / UDP 探测产生的字段不全记录，merge 后
+    /// `public_key` / `pairing_secret` / `alias` 必须原样保留 ——
+    /// 否则连接码刷新后历史数据永久无法解密。
+    #[tokio::test]
+    async fn merge_keeps_key_material_when_new_record_is_partial() {
+        let s = app();
+        // 配对流程产生的一条完整记录（有密钥材料 + 别名）
+        let mut trust = active_trust();
+        trust.trust_version = 3;
+        s.peers
+            .put(PeerRecord::new("peer-1", "小明的手机", vec![7u8; 32], vec![9u8; 32], trust))
+            .await;
+
+        // 巡检式更新：只携带在线状态，密钥材料 / 别名 / 信任全空
+        let mut partial = PeerRecord::new("peer-1", "", vec![], vec![], TrustRecord::new());
+        partial.presence = Presence::Online;
+        s.peers.merge(partial).await;
+
+        let rec = s.peers.entry("peer-1").await.unwrap();
+        assert_eq!(rec.public_key, vec![7u8; 32], "S9：public_key 被巡检覆盖清空");
+        assert_eq!(rec.pairing_secret, vec![9u8; 32], "S9：pairing_secret 被巡检覆盖清空");
+        assert_eq!(rec.alias, "小明的手机", "S9：alias 被空值覆盖");
+        assert_eq!(rec.trust.state, PairingState::Active, "S9：默认 trust 覆盖了 Active");
+        assert_eq!(rec.trust.trust_version, 3, "S9：trust 版本号被默认值覆盖");
+        assert_eq!(rec.presence, Presence::Online, "presence 采用新值");
+    }
+
+    /// S9：merge 到不存在的设备等价于 put（直接插入）。
+    #[tokio::test]
+    async fn merge_into_unknown_device_inserts() {
+        let s = app();
+        s.peers
+            .merge(PeerRecord::new("ghost", "g", vec![1], vec![2], active_trust()))
+            .await;
+        let rec = s.peers.entry("ghost").await.unwrap();
+        assert_eq!(rec.device_id, "ghost");
+        assert_eq!(rec.public_key, vec![1]);
+        assert_eq!(rec.pairing_secret, vec![2]);
+    }
+
+    /// S9：显式提供新密钥材料时 merge 允许更新（配对流程重写密钥）。
+    #[tokio::test]
+    async fn merge_accepts_explicit_key_material() {
+        let s = app();
+        s.peers
+            .put(PeerRecord::new("peer-1", "", vec![1u8; 32], vec![1u8; 32], active_trust()))
+            .await;
+        s.peers
+            .merge(PeerRecord::new("peer-1", "", vec![2u8; 32], vec![2u8; 32], active_trust()))
+            .await;
+        let got = s.peers.entry("peer-1").await.unwrap();
+        assert_eq!(got.public_key, vec![2u8; 32]);
+        assert_eq!(got.pairing_secret, vec![2u8; 32]);
     }
 }

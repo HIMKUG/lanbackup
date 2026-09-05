@@ -23,7 +23,7 @@
 | W3 | **OTLP/gRPC（tonic）连接会持有 Windows 加载器锁**，挂起即连锁锁死主线程。症状：主线程永久阻塞、窗口无响应，**但进程其余部分与 WebView2 渲染正常**。复用条件：专用线程 + connect timeout + 地址可配置 | `lib.rs:123-127` | 遥测层（若保留） | ⬜ |
 | W4 | **`reg.exe` 必须 `CREATE_NO_WINDOW(0x08000000)`**，否则配对/启动时闪黑框 | `identity.rs:22-23` | — | ⬜ |
 | W5 | **Windows UDP socket 会偶发性失效**，必须检测 `send_to` 失败并重建 socket，不能当网络问题处理 | `bcpd.rs:296-299` | core presence/beacon | ⚠️ 报文层（`presence::beacon`）与重放防护（`presence::tracker`）已落地且不依赖 socket；**socket 重建策略属传输层，待阶段 4 网络栈**，届时必须落这条 |
-| W6 | **Defender 实时扫描下每次 syscall 都不便宜** → 连接码必须进程内缓存 | `identity.rs:145-148` | core identity | ⬜ |
+| W6 | **Defender 实时扫描下每次 syscall 都不便宜** → 连接码必须进程内缓存 | `identity.rs:145-148` | core identity | ✅ 已落地：`identity.rs::ConnectionCodeCache`（`Mutex<Option<String>>` 进程内缓存，`get_or_derive`/`set`/`clear` 刷新接口），把接收端"每文件事件一次取码"从磁盘读收敛为一次内存读 |
 | W7 | 路径穿越必须按 `/` 和 `\` **双切分**：Windows 下 `a\..\..\evil` 作为单组件可绕过纯 `/` 切分 | `util.rs:58` | `sync/manifest.rs::is_safe_rel_path`（`normalize_rel_path` 先 `\`→`/` 再否决 `..` 段） | ✅ |
 | W8 | 必须过滤含 `:` 的组件 —— 盘符 `C:` 与 NTFS 备用数据流，`Path::join` 遇盘符会**整体替换前缀** | `util.rs:59` | `sync/manifest.rs::is_safe_rel_path`（`seg.len()==2 && ends_with(':')` 否决盘符组件） | ✅ |
 | W9 | **Windows 大小写不敏感** → 必须做大小写冲突检测，否则 `Photo.jpg` 与 `photo.JPG` 互相覆盖 | `util.rs:108-110` | core 冲突处理 | ⬜ |
@@ -58,7 +58,7 @@
 | S6 | **jti 清理键必须与插入键一致** —— 此前用 payload 段原文当 key，`remove` 永远删不到真实 jti，导致 `used_jtis` 无限增长 | `pairing/v3.rs:241-242` | 握手防重放 | ⬜ |
 | S7 | **验签失败 / 缺关键字段不占用 jti**，防攻击者耗尽 jti 空间 | `pairing/v3.rs:265,275` | 握手防重放 | ⬜ |
 | S8 | **`sync_paired` 不得清空重建信任锚字段**（peerPublicKey/status 只能由配对流程写入），否则门禁 `check_trusted` 误拒已配对设备 | `store.rs:154-159` | 前端↔core 同步契约 | ⬜ |
-| S9 | **`mergeRecords` 逐字段合并，新记录缺字段时保留旧值** —— 后台巡检/UDP 探测产生的记录字段不全，覆盖写会**清空 previousKeys**，连接码刷新后历史数据永久无法解密 | `pairing.ts:125-138` | 配对记录合并 | ⬜ |
+| S9 | **`mergeRecords` 逐字段合并，新记录缺字段时保留旧值** —— 后台巡检/UDP 探测产生的记录字段不全，覆盖写会**清空 previousKeys**，连接码刷新后历史数据永久无法解密 | `pairing.ts:125-138` | 配对记录合并 | ✅ 已落地：`server/control.rs::PeerStore::merge` 逐字段合并 —— `public_key`/`pairing_secret`/`alias` 新值为空保留旧值（密钥材料只增不丢）、默认 trust / Unknown presence 不覆盖旧状态；回归测试 `merge_keeps_key_material_when_new_record_is_partial` 锁死巡检式更新不清空配对密钥材料 |
 | S10 | **`lastManifest` 必须持久化** —— 曾存在 Vue 组件状态里，App 重启后丢失 → **每次重启都退化成全量备份** | `pairing.ts:65-66` | 增量快照存储 | ⬜ |
 | S11 | **上一版本密钥滚动解密**（`previousKeys` 保留 7 天 / 最多 5 个，按 version 降序尝试）—— 连接码刷新后，已在传输中的文件仍能用旧密钥解密 | `pairing.ts:15-22,191-246` | 密钥轮换 | ⬜ |
 | S12 | **UDP 广播不得覆盖 WebSocket 连接状态** —— 两个状态源写同一对象，用 `?? existing ?? false` 三级 fallback | `discovery.ts:85-93` | 设备状态合并 | ✅ 从「靠 fallback 兜」升级为**结构上不可能**：在线性（`presence::PresenceTracker`）与连接态（`state::connection`）是两套独立类型、各自存储，没有共享可变对象可供覆盖。方向依赖单向固定为 `Connected ⇒ Online` |
@@ -114,8 +114,8 @@
 |---|---|---|---|---|
 | M1 | **所有网络调用必须走原生，绝不走 WebView fetch/XHR** —— 目标端无 CORS 头，会被浏览器拦截，表现为"手机端从没同步成功"。这是整个手机端架构的根因 | `LocalReceiverPlugin.java:2117-2122`; `receiver.ts:172` | core（Rust 天然在原生侧） | ✅ 架构上已满足 |
 | M2 | **连接码绝不上线**：不进广播、不进 register/info 响应、不进任何响应体。明文 HTTP 下会暴露加密密钥给局域网嗅探者 | `L1163,L3231`; `backup.ts:187-188`; `protocol/README.md:27,59,98` | V4 握手 | ✅ 全量排查：连接码只出现在加密派生（`crypto/kdf.rs` / `pairing/transcript.rs` / `identity.rs`），无任何响应 DTO 携带它。`dto/sync.rs::Manifest.device_id` 由 `device_code` 重命名而来（线格式保留 `deviceCode` 键名兼容旧协议），`build_manifest` 参数改名并加注释声明**值只能是设备公开指纹**。测试 `serialized_manifest_has_no_extra_code_field` 锁住 wire schema：顶层键集合只有 `deviceCode` 一处、值必须等于传入的 deviceId |
-| M3 | **`fingerprint` 一律用公开 deviceId，不用连接码** | `L1171,L3236` | V4 发现 | ⬜ |
-| M4 | **连接码默认派生算法必须与 `identity.ts` 逐位一致**：FNV-1a 32（`0x811c9dc5` / `0x01000193`，int 溢出即 32 位乘法 ≡ `Math.imul`）+ xorshift(13,17,5) + 字母表 31 字符，输入 `deviceId + "\|localsend-backup\|v1"`，取 8 位 | `L534-552`; `identity.ts:32-42` | core identity | ⬜ |
+| M3 | **`fingerprint` 一律用公开 deviceId，不用连接码** | `L1171,L3236` | V4 发现 | ✅ 已落地：beacon 载荷只带 deviceId 前 8 字节（`presence/beacon.rs`，公开标识）；probe 响应 `deviceId` 字段注释明确「不是连接码」（`dto/handshake.rs::ProbeResponse`）；发现自过滤 `discovery.rs::should_drop_self` 用完整 deviceId（16 字节 hex）比较（与 M34 修复同源），类型层面杜绝「拿连接码来比」 |
+| M4 | **连接码默认派生算法必须与 `identity.ts` 逐位一致**：FNV-1a 32（`0x811c9dc5` / `0x01000193`，int 溢出即 32 位乘法 ≡ `Math.imul`）+ xorshift(13,17,5) + 字母表 31 字符，输入 `deviceId + "\|localsend-backup\|v1"`，取 8 位 | `L534-552`; `identity.ts:32-42` | core identity | ✅ 已落地：`identity.rs::generate_connection_code`（FNV-1a 32 + xorshift(13,17,5) + 31 字符字母表，输入 `stableId + "|localsend-backup|v1"`，取 8 位，空输入走 `unknown-device` 确定性兜底）；与 `identity.ts` 逐位一致，测试 `connection_code_matches_ts_vectors`（向量由 Node 直跑 `identity.ts` 产出）锁死 |
 | M5 | **接收服务未启动时也要有有效本机码**（兜底链：prefs → 服务传入 → 派生默认码），否则电脑端输入本机码验证会永远失败 | `L515-532` | core identity | ⬜ |
 | M6 | **IO 全程流式、内存 O(1)**：网络流 → 缓存临时文件 → 流式解密 → SAF，缓冲 64/128KB，**禁止整文件读入**（曾修复 800MB 文件 OOM） | `L2370-2374`; `L2944-2946` | core 传输 | ⬜ |
 | M7 | **发送端中途断开必须判定失败并 throw**，否则**半截数据被当作完整文件保存** | `L2420-2421` | core 接收 | ⬜ |
@@ -144,7 +144,7 @@
 | M30 | **冷启动日志回放**：WebView 就绪前原生侧产生的日志前端收不到，需环形缓冲 + 注册监听后回放 | `receiver.ts:753-779`; `App.vue:1429` | core 日志桥 | ⬜ |
 | M31 | **解除配对通知重试 3 次** —— 对方短暂不可达也能收到，强制其同步解除 | `App.vue:1596-1607` | 配对解绑 | ✅ 已落地：`pairing/unpair.rs::UnpairRetry`（`UNPAIR_ATTEMPTS=3`；`unpair-request` 通道重试 3 次失败 → 切换 `revoke-notify` 兜底重试 3 次 → 仍失败放弃，依赖对账机制收敛） |
 | M32 | **取消收件两步走**：① 本地停止（无条件先行）② 通知对端；通知失败不影响本地停止，四种成败组合各有独立文案 | `App.vue:2150-2192` | 中止流程 | ⬜ |
-| M33 | **已知缺失的 8 个 TS 契约方法**：`v3Probe`、`v3PairClient`、`syncAllPeers`、`isPeerPaired`、`setDefensiveHidden`/`getDefensiveHidden`、`dumpNativeLogs`、事件 `java-log`、`pair-presence` —— Java 从未实现 | `receiver.ts` vs Java 全 0 命中 | core（必须补齐） | ⬜ |
+| M33 | **已知缺失的 8 个 TS 契约方法**：`v3Probe`、`v3PairClient`、`syncAllPeers`、`isPeerPaired`、`setDefensiveHidden`/`getDefensiveHidden`、`dumpNativeLogs`、事件 `java-log`、`pair-presence` —— Java 从未实现 | `receiver.ts` vs Java 全 0 命中 | core（必须补齐） | ⚠️ 核对结论（2026-09-06）：**4 个 core 已有等价物** —— v3Probe→`GET /api/v4/probe`（`control.rs::handle_probe`）、v3PairClient→`handshake/challenge+verify` 路径 A/B（`server/control.rs`）、syncAllPeers→`PeerStore::all()`、isPeerPaired→`PeerStore::entry()`+`trust.state`/`machine.rs::allows_transfer`；**2 个属 mobile 平台层** —— `setDefensiveHidden`/`getDefensiveHidden`（core 无防御总闸，待阶段 4 网络栈）、`dumpNativeLogs`（core 无日志模块，P3-P8 未落地）；**2 个判定在 core、派发在平台层** —— 事件 `java-log`（D1 事件桥 ⬜）、`pair-presence`（判定已在 `presence::tracker`+`state::presence`，事件派发待平台层接线） |
 | M34 | **扫描自过滤失效（现存 bug）**：广播的 fingerprint 是 UUID，但自过滤拿它跟 8 位连接码比，永不相等 → **手机会把自己扫进设备列表** | `L1318,L1400,L1443` vs `App.vue:1482` | core 发现（**修复**） | ✅ 已落地：`core/src/discovery.rs::should_drop_self` —— 自过滤以本地 `DeviceIdentity::device_id`（完整 16 字节 hex）为基准，函数签名只接收本地身份对象、内部只读 `device_id`，在类型层面杜绝「拿 8 位连接码来比」复发；空 fingerprint 一并丢弃。测试 `own_device_id_fingerprint_is_dropped` / `peer_device_id_fingerprint_is_kept` / `empty_fingerprint_is_dropped` 钉死「等于本地 deviceId → 丢弃；不等于 → 保留」 |
 | M35 | **分块 Base64 必须按 3 的倍数分块** —— 8192 不是 3 的倍数，每块独立编码会各自追加 `=` 填充，拼接后是非法 Base64（当前为潜伏地雷） | `L1573-1583` | core 编码（**避免重犯**） | ⬜ |
 | M36 | **上传长度必须精确上报** —— 接收端按声明的 size **硬校验 written == size**；空文件也返回 12 字节头，是真实开销非误判 | `backup.ts:200-209` | core 上传 | ⬜ |
@@ -182,7 +182,7 @@
 | P21 | **子网扫描失败用 `continue` 而非 `return`** —— 曾误用 return，64 线程池随失败迅速枯竭 | `discovery.rs:346` | core 发现 | ⬜ |
 | P22 | **子网扫描启动顺序**：先清空设备缓存、再 spawn 线程。反序会抹掉扫描头几秒的结果 | `discovery.rs:146-147` | core 发现 | ⬜ |
 | P23 | **MachineGuid `OnceLock` 缓存** —— `reg query` 是一次进程创建（10~50ms），一次子网扫描最多 254 个并发 reg.exe | `identity.rs:96-99` | core identity | ⬜ |
-| P24 | **连接码进程内缓存** —— 接收端每个文件事件都要取码，此前每文件一次磁盘读 | `identity.rs:145-148` | core identity | ⬜ |
+| P24 | **连接码进程内缓存** —— 接收端每个文件事件都要取码，此前每文件一次磁盘读 | `identity.rs:145-148` | core identity | ✅ 已落地：与 W6 同源，`identity.rs::ConnectionCodeCache`（`Mutex<Option<String>>` 进程内缓存 + `clear` 刷新接口），测试 `connection_code_cache_*` 锁死「派生一次 / 显式码优先 / 刷新重派生」 |
 | P25 | **CSPRNG + 拒绝采样消除模偏差**（248 = 31×8，丢弃 ≥248 的字节）；同一毫秒内多次调用不再产出相同码 | `identity.rs:198-209` | core identity | ⬜ |
 | P26 | **sessionId / folderId 必须用 CSPRNG** —— 曾用 `Date.now() + Math.random()`，sessionId 可预测意味着同网段攻击者能劫持会话；folderId 会在同一毫秒碰撞导致配置互相覆盖 | `scheduler.ts:391-397`; `config.ts:57-63` | `crypto/id.rs::new_session_id` / `new_file_id`（32 字节 CSPRNG → 64 hex） | ✅ |
 | P27 | **`maxRetries` 必须夹紧**（`Math.max(0, Math.min(n, 100))`）—— 传 `Infinity` 会让循环永不退出 | `transfer.ts:588-589` | core 重试 | ⬜ |
@@ -209,12 +209,12 @@
 | E1 | 「保留 `AndroidSessionStore` / `SessionDatabase`（SAF 写入仍需 Java）」 | 这两个类**零调用方**，与 SAF 写入毫无关系，是孤儿代码 | 改为：删除，仅保留其「热/温/冷 + 脏标记批量刷盘」的**设计模式** |
 | E2 | 隐含假设 Java 是"一份能跑的完整实现，需用 Rust 重写" | Java 是**停在 v2 阶段的残骸**；`receiver.ts` 声明的 8 个方法在 Java 中不存在；`protocol/README.md:5` 明确 v3 硬升级不兼容 v2 端点 | 改为：这次不是平移重写，是**补齐一个从未真正实现的契约**。Rust 实现须对齐 `receiver.ts` 而非 Java |
 | E3 | 认为 golden file 校验在生效 | `golden/manifest.json` 的 `schemaHash` 是 `PENDING_FIRST_CAPTURE`，`capturedAt` 为 null —— **从未回填，校验事实上未生效** | ✅ 已落实：V4 golden 迁移到 `protocol/schemas/v4/golden-manifest.json`（`core/src/bin/gen_schema.rs --golden` 生成，schemaHash 为真实 SHA-256）；旧 v2/v3 golden 标记为待删除（2026-09-06 核对） |
-| E4 | 未发现协议目录自相矛盾 | README 说 3.0，golden 写 3.1；README 说"无 pair/initiate 端点"，manifest.json 的 endpoints 又列了它们 | V4 路由表定稿时一次性清理 |
+| E4 | 未发现协议目录自相矛盾 | README 说 3.0，golden 写 3.1；README 说"无 pair/initiate 端点"，manifest.json 的 endpoints 又列了它们 | ✅ 已落地（2026-09-06 A4）：`protocol/README.md` 重写为 V4 契约 —— 版本统一为 **4**（对齐 core `PROTOCOL_VERSION`），端口 53317，端点表以 `schemas/v4/golden-manifest.json` 的 16 个 `/api/v4/*` 端点为唯一事实源（无 pair/initiate 与 pair/status 轮询，配对生命周期由 pair/unpair + pair/revoke 承担）；v2/v3/v5 残留文件（`protocol/golden/` 全目录 + `schemas/` 根下 9 个旧 schema 含 v5-unpair）已删除，README 中的「README 3.0 vs probe schema 3.0/3.1」「README 无 pair/initiate vs manifest 列出」两处矛盾随 V3 残留文件一并消除 |
 | E5 | 未发现扫描自过滤失效 | 广播 fingerprint 是 UUID，自过滤却拿它跟 8 位连接码比，永不相等 → 手机把自己扫进设备列表 | 列入 M34 修复 |
 | E6 | 未发现弱校验实现与注释不符 | `scheduler.ts` 注释写 xxHash64，但常量 `PRIME64_4 = 9650019240527522597` 与标准 xxHash64（`9650029242287828579`）不同，轮函数也非标准 —— **不是标准 xxHash64** | ✅ 已统一：V4 弃用含糊的 xxHash64，改用无歧义的 **Adler-32** 作为弱校验（`transfer/chunk.rs::weak_checksum`），根除「常量对不上 → 弱校验永不命中」风险；强校验仍由 SHA-256 担责 |
 | E7 | 未发现分块大小四处不一致 | `transfer.ts:196` 4MB / `transfer.ts:659` 8MB / `scheduler.ts:601` 16MB / 我文档里「小文件 <16MB 跳过 diff」 | ✅ 常量源已统一：`PIECE_SIZE`(4MiB)/`BASIC_CHUNK_SIZE`(16MiB) 单一来源 + 编译期对齐断言（`transfer/chunk.rs`）。另：「小文件跳过 diff」与「tiny tar 聚合」的冲突见 A9，仍待定 |
 | E8 | 未发现两个连接码规范化函数行为不同 | `identity.ts:80` 只去 `[\s\-_]`，`pairing.ts:259` 去所有 `[^A-Z0-9]`。`a.b` 在前者保留为 `A.B`（非法） | V4 统一为一个 |
-| E9 | 未发现 `TINY_BATCH_SIZE = 20` 与注释「50-100 为工程平衡点」矛盾 | `transfer.ts:669` vs `transfer.ts:632,636` | V4 统一 |
+| E9 | 未发现 `TINY_BATCH_SIZE = 20` 与注释「50-100 为工程平衡点」矛盾 | `transfer.ts:669` vs `transfer.ts:632,636` | ✅ 已落地（2026-09-06 A4）：core 已设 `version.rs::TINY_BATCH_SIZE = 75`（在 50-100 平衡区间内取中值），注释同步改写为 V4 决策说明（含历史矛盾出处）；原 TS「常量 20 vs 注释 50-100」矛盾根除 |
 | E10 | 以为阶段 2 落地的 `policy.rs` 已忠实实现 `V4-TRANSFER-MODULE` §3.2/§3.3/§3.4 三张按钮表 | **逐行对表发现 5 处不一致**：① `Lost`/`Failed` 被判为不可连接（用户困死）② `Completed`/`Failed`/`Aborted` 不可开新传输 ③ `Unknown`/`Stale` 一律提示"对方离线"（误导）④ `Failed` 被判为可中止 ⑤ `ReenableAdvanced` 挂在 `degraded_now` + 连接态上，与 §3.4「只看设备级记忆」矛盾 | ✅ 已重写 `policy.rs`，并把三张表转成**表驱动测试**（`doc_table_3_2_*`/`doc_table_3_3_*`/`doc_table_3_4_*`）—— 今后代码一旦偏离文档，测试立即失败。**教训：文档里的表格必须以测试形式存在，否则它只是注释** |
 
 ---
