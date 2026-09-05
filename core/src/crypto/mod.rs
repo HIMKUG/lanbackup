@@ -6,10 +6,12 @@
 //! - `sign`   握手层 ECDSA P-256 签名 + ECDH 密钥协商（§4.2：握手只认证不加密）
 //! - `aead`   统一加密层：单一 AES-256-GCM 实例（§4.2 规则二）
 //! - `id`     CSPRNG 会话/文件 ID 生成（P26）
+//! - `keyring` 密钥滚动轮换 previousKeys（S11）
 
 pub mod aead;
 pub mod id;
 pub mod kdf;
+pub mod keyring;
 pub mod mac;
 pub mod merkle;
 pub mod sign;

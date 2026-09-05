@@ -57,6 +57,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use crate::dto::session::{Algorithm, DegradeReason, FileMeta, TaskReceipt};
+use crate::dto::sync::Manifest;
 use crate::state::transfer::TransferState;
 
 use super::SessionRecord;
@@ -111,6 +112,49 @@ impl SessionPersister {
 
     fn pieces_path(&self, sid: &str) -> PathBuf {
         self.pieces_dir.join(format!("{sid}.jsonl"))
+    }
+
+    /// S10：写穿 last-manifest 快照 —— 原子写 `last-manifest.json`。
+    ///
+    /// `snapshot` 是「上次成功同步后的本机清单」（三路对比的第三路）。它此前只活
+    /// 在内存（`SyncState.snapshot`）：进程一重启就丢，下一轮同步退化成全量备份。
+    /// 与 `write_meta` 同一手法：临时文件 + `sync_all` + 原子 rename。
+    pub(crate) fn write_last_manifest(&self, m: &Manifest) {
+        let data = match serde_json::to_vec(m) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("序列化 last-manifest 失败: {e}");
+                return;
+            }
+        };
+        let tmp = self.meta_dir.join("last-manifest.json.tmp");
+        let result = (|| -> std::io::Result<()> {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&data)?;
+            f.sync_all()?;
+            fs::rename(&tmp, self.meta_dir.join("last-manifest.json"))?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            log::warn!("写 last-manifest 失败: {e}");
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+
+    /// S10：冷启动重载 last-manifest 快照。缺失/损坏时返回 `None`（从无快照启动，
+    /// 下一轮同步按首次全量处理 —— 这是可接受的退级，绝不因快照损坏而拒绝启动）。
+    pub(crate) fn load_last_manifest(&self) -> Option<Manifest> {
+        let path = self.meta_dir.join("last-manifest.json");
+        match fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<Manifest>(&bytes) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    log::warn!("last-manifest 损坏（忽略，按首次同步处理）: {e}");
+                    None
+                }
+            },
+            Err(_) => None,
+        }
     }
 
     /// 原子写 `meta/<sid>.json`：先写 `.tmp`，`sync_all` 后 rename 覆盖。

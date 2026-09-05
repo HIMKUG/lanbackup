@@ -49,7 +49,7 @@ use crate::sync::manifest::{
 use crate::transfer::chunk::piece_count;
 
 use super::{err_response, extract_query, file_incomplete_reason, ok_json, parse_body};
-use super::{json_response, SessionStore};
+use super::{json_response, persist::SessionPersister, SessionStore};
 
 /// 一个对端的目录映射约定（`sync-dir` 登记的内容）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,11 +86,28 @@ pub enum MoveOutcome {
 #[derive(Default)]
 pub struct SyncStore {
     inner: Mutex<SyncState>,
+    /// S10：last-manifest 快照的写穿后端。`None` = 纯内存（测试 / 尚未接 db）。
+    persist: Option<Arc<SessionPersister>>,
 }
 
 impl SyncStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 接持久化后端的构造。打开时把磁盘上的 `last-manifest.json` 重载回
+    /// `snapshot` —— 否则进程一重启，上次同步快照丢失，下一轮退化成全量备份。
+    /// （`SessionStore::open` 与 `s10` 测试使用；lib 非测试构建暂无其他调用点。）
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_persist(persist: Option<Arc<SessionPersister>>) -> Self {
+        let mut s = Self { inner: Mutex::default(), persist };
+        if let Some(p) = &s.persist {
+            if let Some(m) = p.load_last_manifest() {
+                // 快照只供三路对比读取，重载失败可接受（按首次同步处理）
+                s.inner.get_mut().snapshot = Some(m);
+            }
+        }
+        s
     }
 
     /// 平台层推入一次扫描结果。传入的清单会被原样保存
@@ -104,8 +121,14 @@ impl SyncStore {
     }
 
     /// 记录"本次同步已成功"的快照，供下一轮三路对比使用。
+    ///
+    /// S10：同步写穿到磁盘（失败只告警，绝不让同步流程报错 —— 持久化是增强，
+    /// 不是正确性前提；下次成功同步会再覆盖）。
     pub async fn set_snapshot(&self, m: Manifest) {
-        self.inner.lock().await.snapshot = Some(m);
+        self.inner.lock().await.snapshot = Some(m.clone());
+        if let Some(p) = &self.persist {
+            p.write_last_manifest(&m);
+        }
     }
 
     pub async fn snapshot(&self) -> Option<Manifest> {
@@ -457,6 +480,35 @@ mod tests {
 
     fn entry(size: u64, mtime: i64) -> ManifestEntry {
         ManifestEntry { size, mtime }
+    }
+
+    #[tokio::test]
+    async fn s10_last_manifest_survives_store_restart() {
+        use crate::server::persist::SessionPersister;
+        let dir = std::env::temp_dir().join(format!("lanbak-s10-{}", uuid::Uuid::new_v4()));
+        let p = SessionPersister::open(&dir).unwrap();
+
+        // 第一次"进程"：写快照
+        let m1 = crate::sync::manifest::build_manifest(
+            "srv",
+            1700,
+            [("a.txt".to_string(), entry(7, 8))],
+        );
+        p.write_last_manifest(&m1);
+
+        // 第二次"进程"：from 同一目录重载，快照必须还在
+        let p2 = SessionPersister::open(&dir).unwrap();
+        let loaded = p2.load_last_manifest().expect("重载 last-manifest");
+        assert_eq!(loaded.generated_at, 1700);
+        assert_eq!(loaded.files.len(), 1);
+        assert!(loaded.files.contains_key("a.txt"));
+
+        // SyncStore 级验证：with_persist 后 snapshot 直接可用（不退化全量）
+        let store = SyncStore::with_persist(Some(Arc::new(p2)));
+        let snap = store.snapshot().await.expect("快照应被冷启动重载");
+        assert_eq!(snap.files.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     async fn seed_manifest(s: &Arc<SessionStore>, files: &[(&str, u64, i64)]) {

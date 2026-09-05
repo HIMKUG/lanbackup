@@ -48,16 +48,26 @@
 
 ## A2 · 数据正确性批
 
+> **执行偏差记录（2026-09-06 已核实）**：
+> - A11/A12（diff 四态 + ETag 双引号）在 core 已天然满足 —— `server/mod.rs::handle_diff`
+>   全四态 + `etag_of`/`parse_validator`，回填 ✅；
+> - A6（size 不一致 = 残留）在 core 已实现 —— `sync/plan.rs::decide` 单列 `residual` 并入
+>   uploads，回填 ✅；
+> - M2 补强：`device_code` 字段重命名为 `device_id` + `build_manifest` 参数改名 + 新增
+>   序列化契约测试 `serialized_manifest_has_no_extra_code_field` 锁住 wire schema。
+
 | # | 条目 | 落点 | 测试 |
 |---|---|---|---|
-| A2-1 | S10 lastManifest 持久化 | `server/persist.rs`（对齐 05ccacf 写穿模式） | 重启后增量不清零测试 |
-| A2-2 | M2 连接码不进响应体 | 排查 `dto/sync.rs` + 全部响应 DTO | 序列化后断言无 code 字段 |
-| A2-3 | A11/A12 GET /diff 四态 + ETag 双引号 | `server/` diff 端点 | 四态状态码测试 |
-| A2-4 | A18/A19 冲突处理（绝不覆盖、幂等跳过） | `transfer/` | 冲突重命名/幂等测试 |
-| A2-5 | S11 密钥轮换（previousKeys 7 天/5 个） | `crypto/` + `pairing/` | 旧密钥解密回退测试 |
-| A2-6 | A6 size 不一致 = 变更非缺失 | `sync/` 三路对比 | 半截文件判定测试 |
+| A2-1 | S10 lastManifest 持久化 | `server/persist.rs::write_last_manifest` / `load_last_manifest`（临时文件 + sync_all + 原子 rename） | ✅ `s10_last_manifest_survives_store_restart`（两轮进程模拟） |
+| A2-2 | M2 连接码不进响应体 | 全量排查 DTO + `dto/sync.rs` 重命名 + 注释；`build_manifest` 参数改名 | ✅ `serialized_manifest_has_no_extra_code_field`（顶层键集合锁死） |
+| A2-3 | A11/A12 GET /diff 四态 + ETag 双引号 | `server/mod.rs::handle_diff`（206/412/416/200）+ `etag_of`/`parse_validator` | ✅ 5 条（200 摘要/206 匹配/412 NACK/416 越界/W/ 拒绝） |
+| A2-4 | A18/A19 冲突处理（绝不覆盖、幂等跳过） | `transfer/atomic_file.rs::resolve_conflict` → `ConflictOutcome` | ✅ 冲突重命名/幂等跳过测试 |
+| A2-5 | S11 密钥轮换（previousKeys 7 天/5 个） | `crypto/keyring.rs::KeyRing`（rotate/prune/降序解密） | ✅ 旧密钥解密回退测试 |
+| A2-6 | A6 size 不一致 = 变更非缺失 | `sync/plan.rs::decide`（residual 单列） | ✅ `size_mismatch_on_peer_is_residual` |
 
-- [ ] 完成
+**验收**：`cargo test --lib` 全绿（433 passed）、`cargo clippy --lib --tests -- -D warnings` 干净 —— **已达标**。
+
+- [x] 完成
 
 ## A3 · 可靠性批
 

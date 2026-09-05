@@ -115,7 +115,7 @@ pub struct SessionStore {
     /// 本机清单 / 快照 / 目录映射（见 [`sync_api`]）
     pub(crate) sync: sync_api::SyncStore,
     /// 可选持久化后端。`None` = 纯内存（测试 / 尚未接 db）。
-    pub(crate) persist: Option<persist::SessionPersister>,
+    pub(crate) persist: Option<Arc<persist::SessionPersister>>,
 }
 
 impl SessionStore {
@@ -154,7 +154,7 @@ impl SessionStore {
     ) -> Arc<Self> {
         let persist = match persist_dir {
             Some(dir) => match persist::SessionPersister::open(dir) {
-                Ok(p) => Some(p),
+                Ok(p) => Some(Arc::new(p)),
                 Err(e) => {
                     log::warn!("会话持久化不可用，降级为纯内存：{e}");
                     None

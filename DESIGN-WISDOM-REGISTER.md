@@ -81,7 +81,7 @@
 | A3 | **archive（默认）只增不删**：B 端已删除的文件不自动补回（删除视为有意，仅告警）；mirror 才补传并清理（**需用户显式开启**）。备份工具不能复活用户手动删掉的文件 | `sync.ts:9-11` | core sync 策略 | ⬜ |
 | A4 | **archive 的"自愈补全"第三条规则**：只补**上次快照里存在过**的对端缺失文件（判据 `nfcPrev.has(p)`）—— 之前备份过、对端误删的重新推送；从未备份过的仍不补 | `sync.ts:140-147` | core sync 策略 | ⬜ |
 | A5 | **`delete/` 前缀必须排除出 peerExtra 判定** —— moveToDelete 后文件仍留在 delete 文件夹，若仍算"对端多余"会导致**镜像模式无限弹确认框**（问题5 死循环） | `sync.ts:131-137` | core sync 策略 | ⬜ |
-| A6 | **"对端有这个文件但 size 不一致"归为「变更」而非「缺失」** —— 这是上次传输中断留下的半截文件，两类语义不同、处置策略也不同。只按"存在与否"判断则损坏文件永不修复 | `sync.ts:97-100` | core sync 策略 | ⬜ |
+| A6 | **"对端有这个文件但 size 不一致"归为「变更」而非「缺失」** —— 这是上次传输中断留下的半截文件，两类语义不同、处置策略也不同。只按"存在与否"判断则损坏文件永不修复 | `sync.ts:97-100` | core sync 策略 | ✅ `sync/plan.rs::decide`：对端条目存在但 `size` 不等 → 单列 `residual` 并入 `uploads` 重传。测试 `size_mismatch_on_peer_is_residual`（400/1000 字节半截文件被判 residual 并上传） |
 | A7 | **增量判据用 mtime + size，不用内容哈希** —— 手机端 CPU 弱，相册几万文件算哈希会把扫描从秒级拖到分钟级。已知限制：同 path 同 size 但内容损坏的文件检测不出来 | `sync.ts:5,101-102` | core sync | ⬜ |
 | A8 | **接收端必须保留发送端 mtime（RFC3339）** —— 一旦被重置为写入时间，A 端三路对比会**永久误判为变更，每次全量重传**。这是整条增量链路的命脉 | `transfer.ts:187`; `receive.rs:535-536` | core 接收 | ⬜ |
 | A9 | **tiny 文件 ustar tar 聚合**：<10KB 文件按批打包为单一 tar 流，一次 prepare-upload + 一次 upload。**万次握手 → 1 次连接**。batchSize 50-100 为工程平衡点 | `transfer.ts:626-650` | core 批量传输 | ⬜ |
@@ -93,8 +93,8 @@
 | A15 | **422 刻意视为可重试** —— 违背 HTTP 惯例，因为本协议里 422 = 块 SHA-256 校验失败，重传大概率成功 | `scheduler.rs:204-207` | core 重试判定 | ⬜ |
 | A16 | **Merkle 奇数节点复制自身而非补零**（BEP-0052 规定）。填错规则会与标准实现根哈希不一致 | `crypto/merkle.rs`（含 proof/verify 补完） | core merkle | ✅ |
 | A17 | **Merkle 三层结构**：Leaf 16KiB / Piece 4MB / Root。容易在实现时混为两层 | `crypto/merkle.rs`（piece 级叶子，16KiB 子层校验待补） | core merkle | ⚠️ |
-| A18 | **冲突处理：绝不覆盖、绝不弹窗**，由接收端按 `原名_MMDDhhmmss.扩展名` 重命名。局域网备份常在无人值守时跑，弹窗会挂死流程。宁可多一份副本，不可静默丢数据 | `conflict.ts:1-7` | core 冲突处理 | ⬜ |
-| A19 | **冲突的幂等跳过**：同名且 size/mtime 完全一致 → 视为已存在不冲突（否则上次中断重试会产生 `_0815234500` 副本） | `conflict.ts:35-42` | core 冲突处理 | ⬜ |
+| A18 | **冲突处理：绝不覆盖、绝不弹窗**，由接收端按 `原名_MMDDhhmmss.扩展名` 重命名。局域网备份常在无人值守时跑，弹窗会挂死流程。宁可多一份副本，不可静默丢数据 | `conflict.ts:1-7` | core 冲突处理 | ✅ `transfer/atomic_file.rs::resolve_conflict`：目标存在且 size/mtime 不一致 → 旧文件 `conflict_rename_path` 改名（`原名_MMDDhhmmss.扩展名`），新文件正常提交；`ConflictOutcome::Renamed(path)` 返回改名后的路径 |
+| A19 | **冲突的幂等跳过**：同名且 size/mtime 完全一致 → 视为已存在不冲突（否则上次中断重试会产生 `_0815234500` 副本） | `conflict.ts:35-42` | core 冲突处理 | ✅ `resolve_conflict`：size 严格相等 + mtime 容差 2s（与 `restore_mtime` 测试容忍一致）→ `ConflictOutcome::Identical` 幂等跳过，不产生副本 |
 | A20 | **心跳失败不阻断传输**（catch 只 log 不 rethrow）—— 心跳是尽力而为，心跳失败 ≠ 传输失败，否则弱网抖动会误杀大传输 | `transfer.ts:533-554` | core 心跳 | ⬜ |
 | A21 | **能力协商用显式响应头而非版本号猜测**，且要求**完全匹配**才启用 —— 宁可降级也不让半兼容的实现跑出静默数据损坏 | `scheduler.ts:539-560` | V4 能力位图（`Capabilities::negotiate` 按位与）+ D1 判定：协商结果无 `CAP_ADVANCED` 即刻降级，绝不"先试试看"（`transfer/degrade.rs`） | ✅ |
 | A22 | **header key 必须 lowercase 后取** —— Node 全小写 / 浏览器保留原样 | `scheduler.ts:562-567` | core HTTP | ⬜ |
@@ -113,7 +113,7 @@
 | # | 经验 | 原始位置 | V4 落地位置 | 状态 |
 |---|---|---|---|---|
 | M1 | **所有网络调用必须走原生，绝不走 WebView fetch/XHR** —— 目标端无 CORS 头，会被浏览器拦截，表现为"手机端从没同步成功"。这是整个手机端架构的根因 | `LocalReceiverPlugin.java:2117-2122`; `receiver.ts:172` | core（Rust 天然在原生侧） | ✅ 架构上已满足 |
-| M2 | **连接码绝不上线**：不进广播、不进 register/info 响应、不进任何响应体。明文 HTTP 下会暴露加密密钥给局域网嗅探者 | `L1163,L3231`; `backup.ts:187-188`; `protocol/README.md:27,59,98` | V4 握手 | ⬜ |
+| M2 | **连接码绝不上线**：不进广播、不进 register/info 响应、不进任何响应体。明文 HTTP 下会暴露加密密钥给局域网嗅探者 | `L1163,L3231`; `backup.ts:187-188`; `protocol/README.md:27,59,98` | V4 握手 | ✅ 全量排查：连接码只出现在加密派生（`crypto/kdf.rs` / `pairing/transcript.rs` / `identity.rs`），无任何响应 DTO 携带它。`dto/sync.rs::Manifest.device_id` 由 `device_code` 重命名而来（线格式保留 `deviceCode` 键名兼容旧协议），`build_manifest` 参数改名并加注释声明**值只能是设备公开指纹**。测试 `serialized_manifest_has_no_extra_code_field` 锁住 wire schema：顶层键集合只有 `deviceCode` 一处、值必须等于传入的 deviceId |
 | M3 | **`fingerprint` 一律用公开 deviceId，不用连接码** | `L1171,L3236` | V4 发现 | ⬜ |
 | M4 | **连接码默认派生算法必须与 `identity.ts` 逐位一致**：FNV-1a 32（`0x811c9dc5` / `0x01000193`，int 溢出即 32 位乘法 ≡ `Math.imul`）+ xorshift(13,17,5) + 字母表 31 字符，输入 `deviceId + "\|localsend-backup\|v1"`，取 8 位 | `L534-552`; `identity.ts:32-42` | core identity | ⬜ |
 | M5 | **接收服务未启动时也要有有效本机码**（兜底链：prefs → 服务传入 → 派生默认码），否则电脑端输入本机码验证会永远失败 | `L515-532` | core identity | ⬜ |

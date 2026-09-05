@@ -62,9 +62,14 @@ pub struct Manifest {
     /// 生成时间戳（**秒**，与 golden 文件一致）
     #[serde(rename = "generatedAt")]
     pub generated_at: i64,
-    /// 所属设备的公开 deviceId（**不是连接码**）
+    /// 所属设备的公开 deviceId。
+    ///
+    /// **M2：这里绝不是连接码！** `deviceCode` 是历史命名，线格式为了兼容
+    /// 旧协议保留 `deviceCode` 键名，但**值只能是设备公开指纹**。连接码是
+    /// 加密密钥材料，一旦进任何响应体就会被局域网嗅探者拿到明文密钥。
+    /// 平台层调用 `build_manifest` 时若把连接码传进来，此处是最后一道防线。
     #[serde(rename = "deviceCode")]
-    pub device_code: String,
+    pub device_id: String,
     /// 相对路径 → 条目
     pub files: std::collections::HashMap<String, ManifestEntry>,
 }
@@ -74,7 +79,7 @@ impl Default for Manifest {
         Self {
             version: 1,
             generated_at: 0,
-            device_code: String::new(),
+            device_id: String::new(),
             files: std::collections::HashMap::new(),
         }
     }

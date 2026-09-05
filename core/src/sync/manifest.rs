@@ -95,20 +95,24 @@ pub fn normalize_manifest(m: &Manifest) -> Manifest {
     Manifest {
         version: m.version,
         generated_at: m.generated_at,
-        device_code: m.device_code.clone(),
+        device_id: m.device_id.clone(),
         files,
     }
 }
 
 /// 从平台扫描结果直接构建**已归一化**的清单。
-pub fn build_manifest<I>(device_code: &str, generated_at: i64, entries: I) -> Manifest
+///
+/// `device_id` 必须是设备的公开指纹（M2：**绝不是连接码** —— 连接码进任何
+/// 响应体都会被局域网嗅探者拿到明文加密密钥）。线格式仍序列化为 `deviceCode`，
+/// 只是历史命名，值必须是 deviceId。
+pub fn build_manifest<I>(device_id: &str, generated_at: i64, entries: I) -> Manifest
 where
     I: IntoIterator<Item = (String, ManifestEntry)>,
 {
     let raw = Manifest {
         version: 1,
         generated_at,
-        device_code: device_code.to_string(),
+        device_id: device_id.to_string(),
         files: entries.into_iter().collect(),
     };
     normalize_manifest(&raw)
@@ -192,9 +196,32 @@ mod tests {
     #[test]
     fn build_manifest_normalizes_and_preserves_metadata() {
         let m = build_manifest("dev-1", 1700, [(r".\x\y.bin".to_string(), entry(7, 8))]);
-        assert_eq!(m.device_code, "dev-1");
+        assert_eq!(m.device_id, "dev-1");
         assert_eq!(m.generated_at, 1700);
         assert_eq!(m.version, 1);
         assert!(m.files.contains_key("x/y.bin"));
+    }
+
+    /// M2：序列化产物里**只有** `deviceCode` 一处设备标识键，且值必须是传入的
+    /// deviceId —— 连接码是加密密钥材料，一旦混进任何响应体就会被局域网嗅探者
+    /// 拿到明文密钥。此测试锁住 wire schema：顶层键集合不允许悄悄长出第二个
+    /// code 字段（平台层误把连接码塞进来时，这里会先于联调暴露问题）。
+    #[test]
+    fn serialized_manifest_has_no_extra_code_field() {
+        let m = build_manifest("dev-9f3a", 1700, [("a.txt".to_string(), entry(1, 1))]);
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        let obj = v.as_object().unwrap();
+        let mut keys: Vec<&String> = obj.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["deviceCode", "files", "generatedAt", "version"],
+            "wire schema 长出新的顶层键：设备标识必须只有 deviceCode 一处"
+        );
+        assert_eq!(
+            v["deviceCode"],
+            serde_json::json!("dev-9f3a"),
+            "deviceCode 值必须是设备公开指纹，绝不能是连接码"
+        );
     }
 }

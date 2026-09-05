@@ -44,6 +44,75 @@
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+/// 冲突检查结果（A18/A19）。
+///
+/// 平台在 [`commit`] **之前**调用 [`resolve_conflict`] 决定如何落盘：
+/// - [`ConflictOutcome::None`] —— 目标不存在，可正常提交；
+/// - [`ConflictOutcome::Identical`] —— 已存在且 size/mtime 一致，**幂等跳过**
+///   （A19：否则上次中断后的重试会造出一堆 `_0815234500` 副本）；
+/// - [`ConflictOutcome::Renamed`] —— 旧文件已按 `原名_MMDDhhmmss.扩展名` 改名，
+///   新文件可正常提交（A18：**绝不覆盖、绝不弹窗**，局域网备份无人值守时
+///   弹窗会挂死流程，宁可多一份副本也不静默丢数据）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictOutcome {
+    /// 目标文件不存在，可正常提交
+    None,
+    /// A19：同名且 size/mtime 完全一致 → 视为已存在，跳过本次落盘
+    Identical,
+    /// A18：旧文件已重命名（返回改名后的路径），新文件可正常提交
+    Renamed(PathBuf),
+}
+
+/// 检查并处理最终文件路径上的冲突（A18/A19），返回落盘决策。
+///
+/// `expected_size` / `expected_mtime_ns` 来自发送端清单（`FileMeta`）。判断"是否
+/// 幂等已存在"用 size 严格相等 + mtime 容差 2s（部分平台 mtime 精度落秒级，
+/// 与 [`restore_mtime`] 的测试容忍一致）。改名时间戳用本地时间 `MMDDhhmmss`。
+pub fn resolve_conflict(
+    final_path: &Path,
+    expected_size: u64,
+    expected_mtime_ns: i64,
+) -> std::io::Result<ConflictOutcome> {
+    let meta = match std::fs::metadata(final_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ConflictOutcome::None),
+        Err(e) => return Err(e),
+    };
+
+    // A19：size/mtime 都一致 → 上次已成功落盘，幂等跳过
+    let existing_ns = meta
+        .modified()
+        .map(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0))
+        .unwrap_or(0);
+    if meta.len() == expected_size && (existing_ns - expected_mtime_ns).abs() <= 2_000_000_000 {
+        return Ok(ConflictOutcome::Identical);
+    }
+
+    // A18：存在但内容对不上 → 旧文件改名保留，绝不覆盖
+    let renamed = conflict_rename_path(final_path);
+    std::fs::rename(final_path, &renamed)?;
+    Ok(ConflictOutcome::Renamed(renamed))
+}
+
+/// 冲突副本路径：`原名_MMDDhhmmss.扩展名`（无扩展名则直接追加）。
+fn conflict_rename_path(final_path: &Path) -> PathBuf {
+    let name = final_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (&name[..], ""),
+    };
+    // UTC 时间戳（10 位 MMDDhhmmss）：避免引入 local-offset feature 的平台差异；
+    // 时间戳只用于「副本名不冲突」，时区不影响正确性
+    let stamp = time::OffsetDateTime::now_utc()
+        .format(&time::macros::format_description!("[month][day][hour][minute][second]"))
+        .unwrap_or_default();
+    let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{stem}_{stamp}{ext}"))
+}
+
 /// 临时文件名后缀里允许出现的字符：仅字母数字与 `-_`。
 ///
 /// `session_id` / `file_id` 虽由本端 CSPRNG 生成（可控），但契约面向「任何调用方」，
@@ -366,5 +435,85 @@ mod tests {
             .expect("无 mtime 时也应成功");
         assert_eq!(std::fs::read(&final_path).unwrap(), b"x");
         assert!(!part.exists());
+    }
+
+    // ---- A18/A19 冲突处理 ----
+
+    fn mtime_ns_of(p: &Path) -> i64 {
+        std::fs::metadata(p)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64
+    }
+
+    #[test]
+    fn a18_no_conflict_when_target_absent() {
+        let dir = tmp();
+        let final_path = dir.join("new.txt");
+        assert_eq!(
+            resolve_conflict(&final_path, 3, 0).unwrap(),
+            ConflictOutcome::None,
+            "目标不存在时应放行提交"
+        );
+    }
+
+    #[test]
+    fn a19_identical_existing_file_is_skipped_idempotently() {
+        let dir = tmp();
+        let final_path = dir.join("photo.jpg");
+        std::fs::write(&final_path, b"ABC").unwrap();
+        let want_ns = mtime_ns_of(&final_path);
+
+        // size+mtime 一致 → 幂等跳过，绝不产生 `_MMDDhhmmss` 副本
+        assert_eq!(
+            resolve_conflict(&final_path, 3, want_ns).unwrap(),
+            ConflictOutcome::Identical
+        );
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"ABC", "原文件不动");
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names.len(), 1, "不应出现冲突副本");
+    }
+
+    #[test]
+    fn a18_mismatch_renames_old_file_never_overwrites() {
+        let dir = tmp();
+        let final_path = dir.join("photo.jpg");
+        std::fs::write(&final_path, b"OLD-CONTENT").unwrap();
+
+        // size 不一致 → 旧文件改名保留，新文件路径腾空
+        let outcome = resolve_conflict(&final_path, 999, 0).unwrap();
+        let ConflictOutcome::Renamed(renamed) = outcome else {
+            panic!("应返回 Renamed，实际 {outcome:?}");
+        };
+        assert!(renamed.exists(), "旧内容必须保留在副本里");
+        assert_eq!(std::fs::read(&renamed).unwrap(), b"OLD-CONTENT");
+        assert!(!final_path.exists(), "目标路径应腾空供新文件提交");
+
+        // 副本命名遵循 `原名_MMDDhhmmss.扩展名`（扩展名保留）
+        let name = renamed.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("photo_"), "副本名 {name}");
+        assert!(name.ends_with(".jpg"), "扩展名应保留：{name}");
+        assert!(
+            name.len() == "photo_".len() + 10 + ".jpg".len(),
+            "时间戳应为 10 位 MMDDhhmmss：{name}"
+        );
+    }
+
+    #[test]
+    fn a18_extensionless_file_still_gets_stamp() {
+        let dir = tmp();
+        let final_path = dir.join("README");
+        std::fs::write(&final_path, b"OLD").unwrap();
+
+        let outcome = resolve_conflict(&final_path, 42, 0).unwrap();
+        let ConflictOutcome::Renamed(renamed) = outcome else {
+            panic!("应返回 Renamed，实际 {outcome:?}");
+        };
+        let name = renamed.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("README_"), "无扩展名文件也应有时间戳：{name}");
+        assert_eq!(renamed.parent(), final_path.parent(), "副本与原文件同目录");
     }
 }
