@@ -23,6 +23,7 @@
 //! 变成了纯同步断言 —— 否则这部分永远不会有测试。
 
 pub mod atomic_file;
+pub mod cancel;
 pub mod chunk;
 pub mod cleanup;
 pub mod degrade;
@@ -45,6 +46,8 @@ pub use degrade::{
 pub use schedule::{
     chunk_backoff_ms, full_jitter_backoff_ms, ChunkPermit, RetryPermit, TransferScheduler,
 };
+
+pub use cancel::{CancelOutcome, CancelStep, CancelTwoStep, StepResult};
 
 pub use cleanup::{CleanupAction, CleanupPlan, CleanupTrigger};
 

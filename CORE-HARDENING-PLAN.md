@@ -71,15 +71,31 @@
 
 ## A3 · 可靠性批
 
+> **执行偏差记录（2026-09-06 已核实）**：
+> - S3/M17 实现中挖出两个真实 bug 并同批修复：① `handle_heartbeat` 原未续期
+>   `last_activity`，在线会话会被闲置巡检误杀（心跳就是"我还在线"的信号）；
+>   ② `sweep_idle` 原只把孤儿会话迁到 `Aborted` 却不移出内存热表，泄漏依旧。
+>   测试 `s3_heartbeat_renews_activity_and_defers_sweep` / `m17_orphan_session_is_swept_after_idle_timeout`
+>   锁死两条路径。
+> - S5 落地为握手会话**有界管理**：`HandshakeStore::insert` 满员驱逐（64，优先赶走
+>   最旧 Pending）+ `prune_sessions` 过期清理（Pending TTL=challenge TTL，终态宽限
+>   300s 后移除）。会话内 `pairing_secret` 随之释放，无密钥滞留。
+> - M32 实现中修正顺序契约：`CancelTwoStep::feed` 只接受 `next()` 指出的那一步，
+>   乱序上报直接拒绝（原实现先喂 `NotifyPeer` 会提前占用槽位）。
+> - P36 已落地为 `transfer/cleanup.rs::is_residue_name` + `sweep_residue`（递归删、
+>   尽力而为、目录本身不删）。
+
 | # | 条目 | 落点 | 测试 |
 |---|---|---|---|
-| A3-1 | S3/M17 会话闲置巡检（60s/300s） | `server/` 会话存储 | 闲置清理计时测试 |
-| A3-2 | M31 解除配对重试 3 次 | `pairing/` | 重试/放弃测试 |
-| A3-3 | M32 取消收件两步走 | 状态机 + `server/` | 四成败组合测试 |
-| A3-4 | S5 拒绝会话清理 ECDH 密钥 | `server/` 会话存储 | 无界增长防护测试 |
-| A3-5 | P36 崩溃残留 `.tmp_*` 清理 | `transfer/cleanup.rs` | 残留清理测试 |
+| A3-1 | S3/M17 会话闲置巡检（60s/300s） | `server/mod.rs::IDLE_SWEEP_INTERVAL`/`IDLE_TIMEOUT`/`sweep_idle` + `handle_chunk`/`handle_heartbeat` 续期 | ✅ 闲置清理/心跳续期/终态保留计时测试 |
+| A3-2 | M31 解除配对重试 3 次 | `pairing/unpair.rs::UnpairRetry`（request→revoke-notify 通道切换） | ✅ 重试/放弃测试 |
+| A3-3 | M32 取消收件两步走 | `transfer/cancel.rs::CancelTwoStep` | ✅ 四成败组合/乱序拒绝测试 |
+| A3-4 | S5 拒绝会话清理 ECDH 密钥 | `server/control.rs::HandshakeStore`（满员驱逐 + prune_sessions） | ✅ 无界增长防护/过期清理测试 |
+| A3-5 | P36 崩溃残留 `.tmp_*` 清理 | `transfer/cleanup.rs::sweep_residue` | ✅ 残留清理测试 |
 
-- [ ] 完成
+**验收**：`cargo test --lib` 全绿（460 passed）、`cargo clippy --lib --tests -- -D warnings` 干净 —— **已达标**。
+
+- [x] 完成
 
 ## A4 · 契约收尾（穿插）
 

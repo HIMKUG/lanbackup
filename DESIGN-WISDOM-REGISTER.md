@@ -52,7 +52,7 @@
 |---|---|---|---|---|
 | S1 | **解配对必须三处防复活**：① REVOKED/REVOKE_PENDING 对 UI 列表不可见（否则解除后 10s 内被轮询拉回，**2026-08-23 22:3x 实测**；REVOKE_PENDING 同样会被拉回，**2026-08-26 补充**）② `confirm_paired` 回填不得把终态踩回 ACTIVE ③ persist 必须用**全量快照**而非 UI 过滤列表 | `store.rs:53-59,123-125,221-223` | 配对生命周期状态机 | ⬜ |
 | S2 | **连续 3 次 unknown 才吊销** —— 对端一次 unknown 可能是瞬时错乱/时钟偏差，直接吊销会把仍有效的 pairing_secret 清掉（**数据面即刻失效**）。对端明确回「revoked + 令牌」则即时吊销 | `store.rs:9-14,632-660` | 配对对账 | ⬜ |
-| S3 | **会话闲置清理必须巡检式而非固定延时** —— 每 60s 检查"距最后分片到达是否超过 300s"，活跃长传输在 FileUpload 处**持续续期**，不会被误杀 | `receive.rs:161-164,337` | 会话状态机 | ⬜ |
+| S3 | **会话闲置清理必须巡检式而非固定延时** —— 每 60s 检查"距最后分片到达是否超过 300s"，活跃长传输在 FileUpload 处**持续续期**，不会被误杀 | `receive.rs:161-164,337` | 会话状态机 | ✅ 已落地：`server/mod.rs` `IDLE_SWEEP_INTERVAL`(60s)/`IDLE_TIMEOUT`(300s) + `sweep_idle` 巡检 + `handle_chunk`/`handle_heartbeat` 双续期（心跳就是"我还在线"的信号） |
 | S4 | **解密失败也必须计入"会话是否到齐"**，以便尽快触发 finalize，而不是永远等待缺失文件 | `receive.rs:484-498,569` | 会话 finalize | ⬜ |
 | S5 | **拒绝/超时未批准的会话必须同步清掉 ECDH 会话密钥**，否则恶意方反复发起请求再放弃 → map 无界增长 | `receive.rs:275-276` | 会话清理 | ⬜ |
 | S6 | **jti 清理键必须与插入键一致** —— 此前用 payload 段原文当 key，`remove` 永远删不到真实 jti，导致 `used_jtis` 无限增长 | `pairing/v3.rs:241-242` | 握手防重放 | ⬜ |
@@ -128,7 +128,7 @@
 | M14 | **verify 的 `probe` 标志必须透传** —— 漏传会导致手机端轮询被对方误认为连接问候 → **连接状态不对称（电脑已连接、手机在线）** | `L479-481` | V4 probe | ⬜ |
 | M15 | **本端作为验证方配对成功后，必须回写原生信任表**，否则对端问候本机时返回"未信任"，被误判为解除配对 | `L598-603` | V4 配对 | ⬜ |
 | M16 | **配对信任表持久化用"清空后重建"而非 merge** —— 只增不删会导致已解除配对的残留继续被信任，造成**状态横跳** | `L628-631` | core 配对存储 | ⬜ |
-| M17 | **孤立会话 5 分钟自动清理**（prepare-upload 后客户端断开未上传） | `L1872-1873` | core 会话清理 | ⬜ |
+| M17 | **孤立会话 5 分钟自动清理**（prepare-upload 后客户端断开未上传） | `L1872-1873` | core 会话清理 | ✅ 已落地：`server/mod.rs::sweep_idle`（非终态 + 超 300s 闲置 → 状态机迁 `Aborted` + 写穿 + **移出内存热表**） |
 | M18 | **HTTP 输入三道硬上限**：请求行 16384B、body 10MB、tar 单成员 100MB | `L3450-3465,L3002-3006` | `server/mod.rs`：body 10MB 双闸（`body_limit_check`）+ 请求行 16384B 经 `MAX_REQUEST_LINE_BYTES`/`hyper_http1_builder` 注入 | ⚠️ tar 单成员 100MB 属 mobile/ 集成（core 无 tar 路径），随 D 手机接入落地 |
 | M19 | **SAF tree URI 必须 `takePersistableUriPermission`**，否则重启后目录不可用 | `L1494-1503` | Android 平台层 | ⬜ |
 | M20 | **SAF 无跨目录 rename** → 移动用"复制 + 删除"实现假删除 | `L1642-1693` | Android 平台层 | ⬜ |
@@ -142,7 +142,7 @@
 | M28 | **探针不完全可达设备降频**（每 10 轮 ≈5s 一次），成功即恢复 500ms | `App.vue:1629-1630` | core presence | ⬜ |
 | M29 | **误删防抖已移除**：配对记录只在显式解除/收到对端解除时删除，**绝不因轮询失败自动删除** | `App.vue:1627` | 配对对账 | ⬜ |
 | M30 | **冷启动日志回放**：WebView 就绪前原生侧产生的日志前端收不到，需环形缓冲 + 注册监听后回放 | `receiver.ts:753-779`; `App.vue:1429` | core 日志桥 | ⬜ |
-| M31 | **解除配对通知重试 3 次** —— 对方短暂不可达也能收到，强制其同步解除 | `App.vue:1596-1607` | 配对解绑 | ⬜ |
+| M31 | **解除配对通知重试 3 次** —— 对方短暂不可达也能收到，强制其同步解除 | `App.vue:1596-1607` | 配对解绑 | ✅ 已落地：`pairing/unpair.rs::UnpairRetry`（`UNPAIR_ATTEMPTS=3`；`unpair-request` 通道重试 3 次失败 → 切换 `revoke-notify` 兜底重试 3 次 → 仍失败放弃，依赖对账机制收敛） |
 | M32 | **取消收件两步走**：① 本地停止（无条件先行）② 通知对端；通知失败不影响本地停止，四种成败组合各有独立文案 | `App.vue:2150-2192` | 中止流程 | ⬜ |
 | M33 | **已知缺失的 8 个 TS 契约方法**：`v3Probe`、`v3PairClient`、`syncAllPeers`、`isPeerPaired`、`setDefensiveHidden`/`getDefensiveHidden`、`dumpNativeLogs`、事件 `java-log`、`pair-presence` —— Java 从未实现 | `receiver.ts` vs Java 全 0 命中 | core（必须补齐） | ⬜ |
 | M34 | **扫描自过滤失效（现存 bug）**：广播的 fingerprint 是 UUID，但自过滤拿它跟 8 位连接码比，永不相等 → **手机会把自己扫进设备列表** | `L1318,L1400,L1443` vs `App.vue:1482` | core 发现（**修复**） | ⬜ |
@@ -194,7 +194,7 @@
 | P33 | **读/写超时 30s** 防 Slowloris | `mod.rs:357-360` | `server/mod.rs::IO_TIMEOUT`（30s）+ 接线文档（`tokio::time::timeout` 包住每次 service 调用） | ⚠️ 接入端接线 |
 | P34 | **batch tar 文件名必须加序号** —— 同一毫秒内多个 batch 会冲突互相覆盖（**致命**） | `send.rs:261` | core 批量 | ⬜ |
 | P35 | **不可读目录条目跳过而非中止整个扫描**；**符号链接不跟随**（rsync -a 隐含 -l）；**特殊文件跳过**（rsync -D 需 root） | `util.rs:339-345,360-363,375-377` | core 扫描 | ⬜ |
-| P36 | **崩溃残留 `.tmp_*` 与 `.dec_tmp` 必须清理** —— 后者扫描器刻意排除该扩展名，**用户不可见的隐形泄漏** | `receive.rs:94-98,715-717,854` | core 清理 | ⬜ |
+| P36 | **崩溃残留 `.tmp_*` 与 `.dec_tmp` 必须清理** —— 后者扫描器刻意排除该扩展名，**用户不可见的隐形泄漏** | `receive.rs:94-98,715-717,854` | core 清理 | ✅ 已落地：`transfer/cleanup.rs::is_residue_name`（`.tmp_*` / `*.dec_tmp` 判定）+ `sweep_residue`（递归删除，尽力而为，目录本身不删） |
 | P37 | **解密候选 key 多版本依次尝试，顺序不影响正确性**（GCM tag + LSBK 魔数双重把关），防止后人"优化"成只试第一个 | `receive.rs:452-456` | core 加解密 | ⬜ |
 | P38 | **手机端无 mtime 时 identical 判定退化为仅按大小** | `util.rs:161-162` | core 冲突 | ⬜ |
 

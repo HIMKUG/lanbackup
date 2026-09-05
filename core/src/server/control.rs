@@ -49,7 +49,7 @@ use crate::dto::handshake::*;
 use crate::dto::Presence;
 use crate::error::ErrorCode;
 use crate::pairing::machine::PairingEvent;
-use crate::pairing::token::{self, Claims, ConsumedTokens, TokenKind};
+use crate::pairing::token::{self, Claims, ConsumedTokens, TokenKind, CHALLENGE_TTL_SECS};
 use crate::pairing::transcript;
 use crate::pairing::trust::{self, TrustRecord};
 use crate::version::{Capabilities, DEFAULT_PORT, PROTOCOL_VERSION};
@@ -61,6 +61,28 @@ use super::{err_response, ok_json, parse_body, SessionStore};
 /// 有上界才不会被"疯狂 probe"打成内存泄漏：满了就丢最旧的。
 /// 丢掉的后果只是那次握手要重新 probe，不影响安全性。
 const MAX_PENDING_NONCES: usize = 256;
+
+/// S5：进行中握手会话的驻留上限。
+///
+/// 恶意方可以反复 `handshake/challenge`（每次换一个新的 requestId）把会话
+/// map 撑爆 —— 每个会话都携带 `pairing_secret`（长期配对密钥），无界增长
+/// 既是内存泄漏也是密钥滞留。满了就赶走最旧的一个 Pending 会话
+/// （[`HandshakeStore::insert`] 的兜底驱逐）。
+const MAX_PENDING_HANDSHAKES: usize = 64;
+
+/// S5：Pending（未批准 / 未拒绝）会话的存活上限（秒）。
+///
+/// 与 challenge 令牌 TTL 对齐（[`CHALLENGE_TTL_SECS`]）：令牌都过期了，
+/// 会话更没有留着的理由。超过即视为客户端已放弃，清掉并释放其中
+/// 暂存的密钥（这正是登记簿 S5 的「拒绝 / 超时未批准的会话必须同步
+/// 清掉 ECDH 会话密钥，否则恶意方反复发起请求再放弃 → map 无界增长」）。
+const PENDING_TTL_SECS: i64 = CHALLENGE_TTL_SECS;
+
+/// S5：终态（Done / Failed）会话的保留宽限（秒）。
+///
+/// `handshake/status` 还要能查到结果（「握手发出去就失联」的场景），
+/// 所以终态不能立刻删；宽限过后再清，避免 status 查询被挂起的会话拖累。
+const SETTLED_GRACE_SECS: i64 = 300;
 
 // ── 编码小工具 ────────────────────────────────────────────────
 fn b64u(b: &[u8]) -> String {
@@ -171,6 +193,10 @@ pub struct HandshakeSession {
     pub error: Option<String>,
     /// 幂等：同一 requestId 直接回放已签发的 challenge
     pub challenge_response: Option<ChallengeResponse>,
+    /// 会话创建时刻（unix 秒，S5 的 Pending TTL 依据）。
+    pub created_at: i64,
+    /// 终态时刻（unix 秒）：Done / Failed 时写入。
+    pub settled_at: Option<i64>,
 }
 
 /// 握手过程态：进行中的握手 + 一次性令牌防重放 + 用户线下输入的 6 位连接码。
@@ -215,7 +241,25 @@ impl HandshakeStore {
     }
 
     pub async fn insert(&self, rid: &str, sess: HandshakeSession) {
-        self.inner.lock().await.insert(rid.to_string(), sess);
+        let mut g = self.inner.lock().await;
+        // S5：满员驱逐。优先赶走最旧的 Pending（未批准的会话 —— 最可能是
+        // 恶意方反复发起又放弃的），若全是终态则赶走最旧的一个。
+        if !g.contains_key(rid) && g.len() >= MAX_PENDING_HANDSHAKES {
+            let victim = g
+                .iter()
+                .filter(|(_, s)| s.status == HandshakePhase::Pending)
+                .min_by_key(|(_, s)| s.created_at)
+                .map(|(k, _)| k.clone())
+                .or_else(|| {
+                    g.iter()
+                        .min_by_key(|(_, s)| s.created_at)
+                        .map(|(k, _)| k.clone())
+                });
+            if let Some(v) = victim {
+                g.remove(&v);
+            }
+        }
+        g.insert(rid.to_string(), sess);
     }
 
     pub async fn get(&self, rid: &str) -> Option<HandshakeSession> {
@@ -236,6 +280,7 @@ impl HandshakeStore {
         if let Some(s) = g.get_mut(rid) {
             s.status = HandshakePhase::Done;
             s.result = Some(state);
+            s.settled_at = Some(now_secs());
         }
     }
 
@@ -245,7 +290,39 @@ impl HandshakeStore {
         if let Some(s) = g.get_mut(rid) {
             s.status = HandshakePhase::Failed;
             s.error = Some(reason.to_string());
+            s.settled_at = Some(now_secs());
         }
+    }
+
+    /// S5：清除过期会话，返回被移除的 requestId 列表。
+    ///
+    /// - Pending 会话超过 [`PENDING_TTL_SECS`] 未推进 → 视为客户端放弃，
+    ///   清掉并释放其中暂存的密钥；
+    /// - 终态（Done / Failed）超过 [`SETTLED_GRACE_SECS`] → 宽限已过，
+    ///   `handshake/status` 该查不到了，同样清掉。
+    ///
+    /// 由平台层周期性调用（与传输会话的闲置巡检同节奏）；
+    /// [`Self::insert`] 的满员驱逐是它的兜底，二者共同保证 map 有界。
+    pub async fn prune_sessions(&self, now: i64) -> Vec<String> {
+        let mut g = self.inner.lock().await;
+        let mut swept = Vec::new();
+        g.retain(|rid, s| {
+            let keep = match s.status {
+                HandshakePhase::Pending => {
+                    now.saturating_sub(s.created_at) < PENDING_TTL_SECS
+                }
+                HandshakePhase::Done | HandshakePhase::Failed => match s.settled_at {
+                    Some(at) => now.saturating_sub(at) < SETTLED_GRACE_SECS,
+                    // 理论上不会发生（终态必由 mark_* 写入），保守保留
+                    None => true,
+                },
+            };
+            if !keep {
+                swept.push(rid.clone());
+            }
+            keep
+        });
+        swept
     }
 
     /// 一次性消费令牌 jti（真正的重放防护，不依赖时钟）。
@@ -343,6 +420,8 @@ pub async fn handle_handshake_challenge(
                 result: None,
                 error: None,
                 challenge_response: Some(resp.clone()),
+                created_at: now_secs(),
+                settled_at: None,
             },
         )
         .await;
@@ -1304,6 +1383,8 @@ mod tests {
                     result: None,
                     error: None,
                     challenge_response: None,
+                    created_at: now_secs(),
+                    settled_at: None,
                 },
             )
             .await;
@@ -1311,6 +1392,133 @@ mod tests {
         let v = body_json(handle_handshake_status(&s, "/x?requestId=rid-f").await).await;
         assert_eq!(v["done"], true);
         assert!(v["error"].as_str().is_some());
+    }
+
+    // ── S5：握手会话有界 / 过期清理 ─────────────────────────────
+
+    /// 构造一条指定年龄的 Pending 握手会话并插入。
+    async fn insert_pending(
+        s: &Arc<SessionStore>,
+        rid: &str,
+        created_at: i64,
+        key: &[u8],
+    ) {
+        s.handshake
+            .insert(
+                rid,
+                HandshakeSession {
+                    device_id: "peer-1".to_string(),
+                    client_nonce: "cn".to_string(),
+                    server_nonce: "sn".to_string(),
+                    pairing_secret: key.to_vec(),
+                    status: HandshakePhase::Pending,
+                    result: None,
+                    error: None,
+                    challenge_response: None,
+                    created_at,
+                    settled_at: None,
+                },
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn handshake_sessions_are_bounded_under_abuse() {
+        // S5：恶意方反复 challenge（每次一个新 requestId）→ map 必须停在
+        // 上界，不能无界增长。
+        let s = app();
+        for i in 0..(MAX_PENDING_HANDSHAKES + 20) {
+            insert_pending(&s, &format!("rid-{i}"), i as i64, b"key").await;
+        }
+        let n = s.handshake.inner.lock().await.len();
+        assert_eq!(n, MAX_PENDING_HANDSHAKES, "会话 map 必须被钳制在上界");
+    }
+
+    #[tokio::test]
+    async fn eviction_prefers_the_oldest_pending() {
+        let s = app();
+        // 塞满
+        for i in 0..MAX_PENDING_HANDSHAKES {
+            insert_pending(&s, &format!("rid-{i}"), i as i64, b"key").await;
+        }
+        // 再插一个更新的 → 最旧的 rid-0 应被赶走
+        insert_pending(&s, "rid-new", MAX_PENDING_HANDSHAKES as i64, b"key").await;
+        let g = s.handshake.inner.lock().await;
+        assert!(!g.contains_key("rid-0"), "满员应驱逐最旧的 Pending 会话");
+        assert!(g.contains_key("rid-new"));
+    }
+
+    #[tokio::test]
+    async fn stale_pending_sessions_are_pruned() {
+        // 超过 PENDING_TTL_SECS 的 Pending 会话（客户端放弃）→ 清掉并释放密钥
+        let s = app();
+        insert_pending(&s, "stale", 0, b"sensitive-key").await;
+        insert_pending(&s, "fresh", PENDING_TTL_SECS, b"key").await;
+        let swept = s.handshake.prune_sessions(PENDING_TTL_SECS + 10).await;
+        assert_eq!(swept, vec!["stale".to_string()]);
+        assert!(s.handshake.get("stale").await.is_none());
+        assert!(s.handshake.get("fresh").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn settled_sessions_keep_a_grace_period_then_prune() {
+        // Done/Failed 需要保留给 handshake/status 查询（宽限），之后才清
+        let s = app();
+        let now = 1_000_000;
+        s.handshake
+            .insert(
+                "done-old",
+                HandshakeSession {
+                    device_id: "peer-1".to_string(),
+                    client_nonce: "cn".to_string(),
+                    server_nonce: "sn".to_string(),
+                    pairing_secret: vec![],
+                    status: HandshakePhase::Done,
+                    result: Some(PairingState::Active),
+                    error: None,
+                    challenge_response: None,
+                    created_at: 0,
+                    settled_at: Some(now - SETTLED_GRACE_SECS - 1),
+                },
+            )
+            .await;
+        s.handshake
+            .insert(
+                "done-fresh",
+                HandshakeSession {
+                    device_id: "peer-1".to_string(),
+                    client_nonce: "cn".to_string(),
+                    server_nonce: "sn".to_string(),
+                    pairing_secret: vec![],
+                    status: HandshakePhase::Done,
+                    result: Some(PairingState::Active),
+                    error: None,
+                    challenge_response: None,
+                    created_at: 0,
+                    settled_at: Some(now),
+                },
+            )
+            .await;
+        let swept = s.handshake.prune_sessions(now).await;
+        assert_eq!(swept, vec!["done-old".to_string()], "超宽限的终态应清理");
+        assert!(s.handshake.get("done-fresh").await.is_some(), "宽限内保留（status 可查）");
+    }
+
+    #[tokio::test]
+    async fn mark_failed_records_settled_at_for_later_prune() {
+        let s = app();
+        insert_pending(&s, "rid-x", 0, b"key").await;
+        s.handshake.mark_failed("rid-x", "serverNonce 无效").await;
+        let sess = s.handshake.get("rid-x").await.unwrap();
+        assert!(sess.settled_at.is_some(), "失败必须写入终态时刻");
+        // 刚失败 → 宽限内保留
+        assert!(s.handshake.prune_sessions(sess.settled_at.unwrap()).await.is_empty());
+        // 宽限过后 → 清理
+        let swept = s
+            .handshake
+            .prune_sessions(sess.settled_at.unwrap() + SETTLED_GRACE_SECS + 1)
+            .await;
+        assert_eq!(swept, vec!["rid-x".to_string()]);
     }
 
     #[tokio::test]

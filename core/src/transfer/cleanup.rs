@@ -25,6 +25,8 @@
 //! 真正的 `abort()` / `remove_file()` 由平台侧执行 —— 因为桌面端与
 //! Android 的文件语义（SAF vs 路径）根本不同，混进来就没法共用了。
 
+use std::path::{Path, PathBuf};
+
 use crate::state::transfer::TransferState;
 
 /// 触发清理的原因。决定"数据库会话记录里写什么"以及 UI 提示语。
@@ -179,6 +181,56 @@ impl CleanupPlan {
     }
 }
 
+// ============================================================
+// P36：崩溃残留（.tmp_* / .dec_tmp）判定与清理
+// ============================================================
+
+/// P36：文件名是否属于崩溃残留。
+///
+/// 两类残留都只在崩溃 / 强杀时出现，正常流程会在提交后删掉它们：
+/// - `.tmp_*` —— 原子写入的临时文件（写一半崩溃）；
+/// - `*.dec_tmp` —— 解密中间文件（扫描器刻意排除该扩展名，用户不可见
+///   → 若不清，是**隐形泄漏**，占着磁盘却永远不被扫到）。
+///
+/// 启动时应清一次（桌面用 [`sweep_residue`]；Android SAF 用同一判定 +
+/// `DocumentFile` 删除，名字判据必须一致，否则两端行为漂移）。
+pub fn is_residue_name(name: &str) -> bool {
+    name.starts_with(".tmp_") || name.ends_with(".dec_tmp")
+}
+
+/// 递归删除 `root` 下所有崩溃残留文件（P36），返回已删除的路径列表。
+///
+/// 清理是**尽力而为**：残留文件不影响正确性，只是隐形占用；
+/// 单个文件的删除失败只跳过它（下次启动再清），不让整个清理因一个
+/// 锁定的文件而中断。目录本身不删，只删匹配 [`is_residue_name`] 的文件。
+pub fn sweep_residue(root: &Path) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    sweep_into(root, &mut removed);
+    removed
+}
+
+fn sweep_into(dir: &Path, removed: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ft.is_dir() {
+            sweep_into(&path, removed);
+        } else if ft.is_file() {
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                if is_residue_name(name) && std::fs::remove_file(&path).is_ok() {
+                    removed.push(path);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +379,61 @@ mod tests {
         ] {
             assert!(t.is_abnormal(), "{t:?} 应视为异常收场");
         }
+    }
+
+    // ── P36 崩溃残留 ────────────────────────────────────────
+
+    #[test]
+    fn tmp_and_dec_tmp_residues_are_detected() {
+        for name in [
+            ".tmp_1234",
+            ".tmp_x.part",
+            "photo.jpg.dec_tmp",
+            "a.dec_tmp",
+        ] {
+            assert!(is_residue_name(name), "{name:?} 应判为残留");
+        }
+        // 正常文件绝不误判
+        for name in [
+            "photo.jpg",
+            "a.txt",
+            ".tmp",
+            "dec_tmp",
+            ".dec_tmp_backup",
+            "keep.dec_tmp.bak",
+        ] {
+            assert!(!is_residue_name(name), "{name:?} 不是残留，误判会删正常文件");
+        }
+    }
+
+    /// P36：递归清理只删残留、不动正常文件，并如实报告删了什么。
+    #[test]
+    fn sweep_residue_removes_only_crash_leftovers() {
+        let dir = std::env::temp_dir().join(format!("lanbak-p36-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("sub/deep")).unwrap();
+
+        let keep1 = dir.join("photo.jpg");
+        let keep2 = dir.join("sub/normal.txt");
+        let residue1 = dir.join(".tmp_abc");
+        let residue2 = dir.join("sub/deep/photo.jpg.dec_tmp");
+        std::fs::write(&keep1, b"1").unwrap();
+        std::fs::write(&keep2, b"2").unwrap();
+        std::fs::write(&residue1, b"3").unwrap();
+        std::fs::write(&residue2, b"4").unwrap();
+
+        let removed = sweep_residue(&dir);
+        assert_eq!(removed.len(), 2, "应恰好删掉两个残留：{removed:?}");
+        assert!(removed.iter().any(|p| p == &residue1));
+        assert!(removed.iter().any(|p| p == &residue2));
+        assert!(keep1.exists() && keep2.exists(), "正常文件被误删");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P36：目录不存在时清理安静返回，不让启动流程因清理报错。
+    #[test]
+    fn sweep_residue_on_missing_dir_is_quiet() {
+        let ghost = std::env::temp_dir().join("lanbak-p36-ghost-uuid-never-exists");
+        assert!(sweep_residue(&ghost).is_empty());
     }
 }

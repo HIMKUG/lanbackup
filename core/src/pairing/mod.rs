@@ -29,6 +29,7 @@ pub mod machine;
 pub mod token;
 pub mod transcript;
 pub mod trust;
+pub mod unpair;
 
 pub use machine::{
     allows_transfer, is_terminal, should_emit_beacon, transition, IllegalTransition, PairingEvent,
@@ -41,4 +42,5 @@ pub use transcript::{
     frame, path_a_key, path_a_transcript, revoke_payload, tag, unpair_payload, verify_tag,
     DOMAIN_PATH_A, DOMAIN_PATH_A_KEY, DOMAIN_REVOKE, DOMAIN_UNPAIR,
 };
+pub use unpair::{Delivery, UnpairChannel, UnpairRetry, UnpairStep, UNPAIR_ATTEMPTS};
 pub use trust::{effective_state, peer_still_trusts, reconcile, TrustRecord, TrustVerdict};

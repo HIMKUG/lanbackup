@@ -67,6 +67,18 @@ pub struct SessionRecord {
     /// 终态**单调不可回退**：数据在谁磁盘上谁说了算，且一旦确认就不接受
     /// 被后到的乱序回执踩回中间态（登记表 S1 的"三处防复活"同源教训）。
     pub receipts: HashMap<String, TaskReceipt>,
+    /// 距最后一次活跃信号（register / chunk / heartbeat）的时间点。
+    ///
+    /// S3/M17 闲置巡检的依据：非终态会话若超过 [`IDLE_TIMEOUT`] 无任何活跃
+    /// 信号，即视为孤儿（prepare-upload 后客户端断开未上传 / 传输卡死 /
+    /// 对端放弃），由平台层每 [`IDLE_SWEEP_INTERVAL`] 调一次
+    /// [`SessionStore::sweep_idle`] 清理。用 `Instant`（单调时钟）：
+    /// 闲置判定不能被系统时间回拨 / 拨快误导。
+    ///
+    /// 持久化重载时 `..Default::default()` 会把该字段重置为加载时刻 ——
+    /// 语义是"重启后闲置计时从重启时刻重新开始"（给对端机会回来续传），
+    /// 因此该字段不落盘（`Instant` 本也不可序列化，正好一致）。
+    pub last_activity: std::time::Instant,
 }
 
 impl Default for SessionRecord {
@@ -81,6 +93,7 @@ impl Default for SessionRecord {
             confirmed: HashMap::new(),
             piece_sha: HashMap::new(),
             receipts: HashMap::new(),
+            last_activity: std::time::Instant::now(),
         }
     }
 }
@@ -187,6 +200,62 @@ impl SessionStore {
     /// 设置用户线下输入的连接码（路径 A 首配用）。绝不经过网络。
     pub async fn set_pairing_code(&self, code: impl Into<String>) {
         self.handshake.set_pairing_code(code.into()).await;
+    }
+
+    /// S3/M17/S5：清理闲置的非终态会话，返回被清理的 sessionId（排序）。
+    ///
+    /// 平台层每 [`IDLE_SWEEP_INTERVAL`] 调一次。清理对象：**非终态**且
+    /// `now - last_activity > IDLE_TIMEOUT` 的会话 —— 覆盖三类孤儿：
+    /// - M17：prepare-upload 后客户端断开、再无分块上传；
+    /// - S3：传输中途对端卡死 / 放弃（最后分片到达已超 300s）；
+    /// - S5：恶意方反复 register 后放弃（若无人清理，map 只增不减）。
+    ///
+    /// 终态会话（Completed/Failed/Aborted）不参与 —— 它们不占传输资源，
+    /// 留给 `disconnect` 收尾与历史展示，不是内存泄漏源。
+    ///
+    /// 清理动作与 `disconnect` 一致：状态机迁到 `Aborted` → 写穿持久化 →
+    /// 移除磁盘行与内存条目。`Abort` 对全部非终态均合法（状态机保证），
+    /// 因此这里只对 `is_terminal` 做前置过滤，不需要再逐态匹配。
+    pub async fn sweep_idle(&self, now: std::time::Instant) -> Vec<String> {
+        let mut swept = Vec::new();
+        let mut guard = self.inner.lock().await;
+        // 先收集待清会话（非终态 + 超过闲置阈值），再逐一遍历迁移与移除 ——
+        // 不能在 iter_mut 的同一遍里 remove（借用冲突），分两遍做。
+        let idle: Vec<String> = guard
+            .iter()
+            .filter(|(_, rec)| {
+                !rec.phase.is_terminal()
+                    && now.saturating_duration_since(rec.last_activity) > IDLE_TIMEOUT
+            })
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        for sid in &idle {
+            let mut removable = false;
+            if let Some(rec) = guard.get_mut(sid) {
+                if let Ok(next) = rec.phase.transition(TransferEvent::Abort) {
+                    rec.phase = next;
+                    if let Some(p) = &self.persist {
+                        p.update_session(
+                            sid,
+                            rec.phase,
+                            rec.algorithm,
+                            rec.degrade_reason,
+                            rec.bitmap_version,
+                        );
+                        p.remove_session(sid);
+                    }
+                    removable = true;
+                }
+            }
+            // 状态机迁到 Aborted 的会话同步移出内存热表，否则孤儿仍驻留
+            if removable {
+                guard.remove(sid);
+                swept.push(sid.clone());
+            }
+        }
+        drop(guard);
+        swept.sort();
+        swept
     }
 }
 
@@ -434,6 +503,9 @@ async fn handle_heartbeat(store: &Arc<SessionStore>, body: &[u8]) -> Response<Fu
     };
     // 心跳自增位图版本（真实场景：比对对端版本，不一致触发对账）
     rec.bitmap_version = rec.bitmap_version.max(hb.bitmap_version) + 1;
+    // S3：心跳就是"我还在线"的信号 —— 续期，避免对端在线（无数据流动）
+    // 却被闲置巡检误杀成孤儿。
+    rec.last_activity = std::time::Instant::now();
     if let Some(p) = &store.persist {
         p.update_session(
             &hb.session_id,
@@ -536,6 +608,8 @@ async fn handle_chunk(store: &Arc<SessionStore>, body: &[u8]) -> Response<Full<b
         .entry(c.file_id.clone())
         .or_default()
         .insert(c.piece_index);
+    // S3：FileUpload 续期 —— 活跃长传输在这里持续续期，不会被闲置巡检误杀。
+    rec.last_activity = std::time::Instant::now();
     if let Some(sha) = c.sha256.as_deref() {
         rec.piece_sha
             .entry(c.file_id.clone())
@@ -1009,6 +1083,18 @@ pub const MAX_REQUEST_LINE_BYTES: u64 = 16 * 1024;
 pub const MAX_UPSTREAM_CONNECTIONS: usize = 32;
 pub const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// S3/M17/S5：会话闲置巡检的周期（60s）。
+///
+/// 平台层每 [`IDLE_SWEEP_INTERVAL`] 调一次 [`SessionStore::sweep_idle`]，
+/// 清理超过 [`IDLE_TIMEOUT`] 无活跃信号的**非终态**会话。
+pub const IDLE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// S3/M17/S5：会话闲置判定阈值（300s）。
+///
+/// 对齐登记簿 S3「距最后分片到达超过 300s」：活跃长传输在
+/// `handle_chunk` / `handle_heartbeat` 处持续续期，不会被误杀。
+pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// 平台层接线时的**默认 http1 服务构建器**（M18 请求行硬上限已注入）。
 ///
 /// hyper 的 `http1::Builder::max_buf_size` 只能接受 `usize`，`MAX_REQUEST_LINE_BYTES`
@@ -1134,6 +1220,139 @@ mod tests {
         let b = hyper_http1_builder();
         let _ = b; // max_buf_size 无 getter，能构建即证明注入路径存在；
                    // 上限值本身由上面的常量断言兜底
+    }
+
+    // ---- A3 可靠性批：会话闲置巡检（S3/M17/S5）----
+
+    #[test]
+    fn s3_17_idle_parameters_match_registry() {
+        // S3：60s 巡检 / 300s 闲置；M17：孤立会话 5 分钟 = 300s，两者对齐
+        assert_eq!(IDLE_SWEEP_INTERVAL, std::time::Duration::from_secs(60));
+        assert_eq!(IDLE_TIMEOUT, std::time::Duration::from_secs(300));
+    }
+
+    /// M17：register 后对端消失、再无任何分块 → 超过 300s 必须被巡检清掉。
+    #[tokio::test]
+    async fn m17_orphan_session_is_swept_after_idle_timeout() {
+        let store = SessionStore::new();
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/register",
+            &body(serde_json::json!({
+                "deviceId": "devA", "alias": "A", "sessionId": "orphan"
+            })),
+        )
+        .await;
+        // 未到 300s：不清理
+        assert!(store.sweep_idle(std::time::Instant::now()).await.is_empty());
+        // 拨回 301s 前：孤儿判定成立，必须清掉
+        {
+            let mut g = store.inner.lock().await;
+            g.get_mut("orphan").unwrap().last_activity =
+                std::time::Instant::now() - std::time::Duration::from_secs(301);
+        }
+        assert_eq!(
+            store.sweep_idle(std::time::Instant::now()).await,
+            vec!["orphan"]
+        );
+        assert!(
+            store.inner.lock().await.get("orphan").is_none(),
+            "孤儿会话未被清掉 —— map 会随恶意 register 无界增长（S5）"
+        );
+    }
+
+    /// S3：活跃长传输在 chunk 处续期，巡检不得误杀。
+    #[tokio::test]
+    async fn s3_recently_active_session_is_not_swept() {
+        let store = SessionStore::new();
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/register",
+            &body(serde_json::json!({
+                "deviceId": "devA", "alias": "A", "sessionId": "live"
+            })),
+        )
+        .await;
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/chunk",
+            &body(serde_json::json!({
+                "sessionId": "live", "fileId": "f1", "pieceIndex": 0
+            })),
+        )
+        .await;
+        // 刚有 chunk 活动，即使巡检此刻到来也不该清
+        assert!(store.sweep_idle(std::time::Instant::now()).await.is_empty());
+    }
+
+    /// S3：心跳续期 —— 对端在线（无数据流动）也不是孤儿。
+    #[tokio::test]
+    async fn s3_heartbeat_renews_activity_and_defers_sweep() {
+        let store = SessionStore::new();
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/register",
+            &body(serde_json::json!({
+                "deviceId": "devA", "alias": "A", "sessionId": "hb"
+            })),
+        )
+        .await;
+        // 把活动时间拨回 301s 前，然后来一发心跳续期
+        {
+            let mut g = store.inner.lock().await;
+            g.get_mut("hb").unwrap().last_activity =
+                std::time::Instant::now() - std::time::Duration::from_secs(301);
+        }
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/heartbeat",
+            &body(serde_json::json!({"sessionId": "hb", "bitmapVersion": 0})),
+        )
+        .await;
+        assert!(
+            store.sweep_idle(std::time::Instant::now()).await.is_empty(),
+            "心跳续期后仍被误杀 —— 对端在线的会话不是孤儿"
+        );
+    }
+
+    /// 终态会话不参与闲置清理：它们是历史展示与 disconnect 的职责，不是泄漏源。
+    #[tokio::test]
+    async fn s3_sweep_keeps_terminal_sessions() {
+        let store = SessionStore::new();
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/register",
+            &body(serde_json::json!({
+                "deviceId": "devA", "alias": "A", "sessionId": "done"
+            })),
+        )
+        .await;
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/abort",
+            &body(serde_json::json!({"sessionId": "done"})),
+        )
+        .await;
+        {
+            let mut g = store.inner.lock().await;
+            g.get_mut("done").unwrap().last_activity =
+                std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        }
+        assert!(
+            store.sweep_idle(std::time::Instant::now()).await.is_empty(),
+            "终态会话被闲置清理误删"
+        );
+        assert_eq!(
+            store.inner.lock().await.get("done").unwrap().phase,
+            TransferState::Aborted
+        );
     }
 
     #[tokio::test]
