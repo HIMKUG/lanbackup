@@ -2,7 +2,7 @@
 
 > 阅读对象：**完全不了解本项目的新 AI**。
 > 本文档是自洽的，不需要你先看任何聊天记录。请按顺序读，不要跳。
-> 最后更新：2026-09-06（对齐 09-06 提交 `ca6958bc` / `6a7621a` / `6981b01` / `f3fff4b`；`05ccacf` / `8225919` / `b24c390` 见 §5）。
+> 最后更新：2026-09-06（对齐 09-06 提交链 `ca6958bc` / `6a7621a` / `6981b01` / `f3fff4b` / `4a701af` / `c9a2bbe`；`05ccacf` / `8225919` / `b24c390` 见 §5）。
 > 更新守则：改了 §3 模块 / §4 端点 / §8 遗留项后，必须同步刷新本文件头部版本号，防止交接文档再次过期。
 
 ***
@@ -216,7 +216,7 @@ cargo clippy --features android-jni -- -D warnings   # 干净（已验证）
 
 以下均为**重构前的既有遗留项**，本次会话未要求处理，列出供接手时认领：
 
-已完成（09-06 并行 agent + 本次审查）：
+已完成（09-06 并行 agent + 本次审查 + 本次集成修复）：
 
 - A3 可靠性批（S3/M17 心跳续期+闲置巡检、M31 解除重试、M32 取消两步走、S5 握手有界、P36 崩溃清理）—— `server/control.rs` / `server/mod.rs` / `pairing/unpair.rs` / `transfer/cancel.rs` / `transfer/cleanup.rs`
 
@@ -225,6 +225,16 @@ cargo clippy --features android-jni -- -D warnings   # 干净（已验证）
 - M34 扫描自过滤修复（`discovery.rs::should_drop_self`）
 
 - B 批登记簿条目（S9 mergeRecords、M3/M4 连接码派生、W6/P24 连接码缓存）
+
+- P1-P4 集成链路修复（09-06 深度审查后发现）：
+
+  - P1：`cleanup.sweep_residue` → FFI JSON 冷路径 `"cleanup.sweep_residue"`
+
+  - P2：`sweep_idle` → `lanbackup_server_sweep_idle()` extern "C" 函数（fire-and-forget tokio 任务）
+
+  - P3：`UnpairRetry` → 确认已通过 `pairing/mod.rs` 导出，无需额外 FFI
+
+  - P4：`handle_abort` → 增加 `CleanupPlan::for_trigger` 日志（使 §六 固定顺序约束可观测）
 
 待完成：
 
