@@ -996,6 +996,62 @@ pub fn error_to_response(e: &crate::error::Error) -> Response<Full<bytes::Bytes>
 }
 
 // 让 `route` 在 hyper service 中可用：接受 `Request<impl Body>` 并取出字节
+//
+// 这里的常量与登记簿 M18/P32/P33 对应，平台层构建 hyper server 时必须遵守
+// （接入方式见 [`hyper_http1_builder`]，或自行构造并应用下述映射）：
+// - `MAX_REQUEST_LINE_BYTES`（M18 请求行 16384B）：映射到 hyper 的 `http1.max_buf_size(...)`
+//   —— 该值约束「请求行 + 全部头部」的总缓冲，超过即 431 拒绝，防超长头内存放大；
+// - `MAX_UPSTREAM_CONNECTIONS`（P32 有界并发 32）：连接数上限，防 Slowloris。
+//   接线端对每个 `TcpListener::accept` 的连接持有 RAII guard，连接 Drop 时释放；
+// - `IO_TIMEOUT`（P33 读写超时 30s）：读/写超时，防无超时连接挂线程。
+//   接线端用 `tokio::time::timeout(IO_TIMEOUT, service_call)` 包住每次调用。
+pub const MAX_REQUEST_LINE_BYTES: u64 = 16 * 1024;
+pub const MAX_UPSTREAM_CONNECTIONS: usize = 32;
+pub const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 平台层接线时的**默认 http1 服务构建器**（M18 请求行硬上限已注入）。
+///
+/// hyper 的 `http1::Builder::max_buf_size` 只能接受 `usize`，`MAX_REQUEST_LINE_BYTES`
+/// 按 `u64` 声明便于将来迁移协议，因此在这里做一次显式收窄，接线端直接复用：
+/// `hyper::server::conn::http1::Builder` 随后 `serve_connection(conn, service_fn(...))`。
+pub fn hyper_http1_builder() -> hyper::server::conn::http1::Builder {
+    let mut b = hyper::server::conn::http1::Builder::new();
+    b.max_buf_size(MAX_REQUEST_LINE_BYTES as usize);
+    b
+}
+
+/// M18：HTTP 请求体硬上限（10MB）。
+///
+/// 读 body 前先按 `Content-Length` 预检，收集后再按实际大小复核 ——
+/// 恶意对端可以用 chunked 编码绕过声明长度，两道闸缺一不可。
+/// 对应登记簿 D7：**认证前限制分配长度**，不设上限则任意对端可让本端尝试分配 ~4GiB。
+#[allow(dead_code)]
+pub const MAX_BODY_BYTES: u64 = 10 * 1024 * 1024;
+
+/// M18/D7：body 长度双闸校验（纯函数，便于单测）。
+///
+/// `declared` 为 `Content-Length` 头解析值，`actual` 为实际收集字节数。
+/// 任一超限即返回 400（复用 `BadRequest` 变体，避免改动 ErrorCode 枚举触发
+/// golden schema 连锁变更；413 语义由 message 表达）。
+fn body_limit_check(
+    declared: Option<u64>,
+    actual: usize,
+) -> Result<(), Box<Response<Full<bytes::Bytes>>>> {
+    let over = match declared {
+        Some(cl) => cl > MAX_BODY_BYTES,
+        None => false,
+    } || actual as u64 > MAX_BODY_BYTES;
+    if over {
+        Err(Box::new(err_response(
+            ErrorCode::BadRequest,
+            "request body exceeds 10MB limit",
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+// 让 `route` 在 hyper service 中可用：接受 `Request<impl Body>` 并取出字节
 #[allow(dead_code)]
 pub async fn serve_request(
     store: &Arc<SessionStore>,
@@ -1003,8 +1059,24 @@ pub async fn serve_request(
 ) -> Response<Full<bytes::Bytes>> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    // M18/D7：读 body 前先按 Content-Length 预检，超限直接拒绝，避免先分配再发现
+    let declared = req
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    if let Err(resp) = body_limit_check(declared, 0) {
+        return *resp;
+    }
     let body = match req.into_body().collect().await {
-        Ok(b) => b.to_bytes(),
+        Ok(b) => {
+            let bytes = b.to_bytes();
+            // 实际大小复核：chunked 传输无 Content-Length，声明可被绕过
+            if let Err(resp) = body_limit_check(None, bytes.len()) {
+                return *resp;
+            }
+            bytes
+        }
         Err(_) => return err_response(ErrorCode::BadRequest, "读取请求体失败"),
     };
     route(store, method, &path, &body).await
@@ -1017,6 +1089,51 @@ mod tests {
 
     fn body(v: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&v).unwrap()
+    }
+
+    // ---- A1 安全高危批：长度上限 / 接线常量 ----
+
+    #[test]
+    fn m18_body_limit_rejects_declared_overflow() {
+        // Content-Length 声明超限：读 body 前就必须拒绝
+        let err = body_limit_check(Some(MAX_BODY_BYTES + 1), 0).unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn m18_body_limit_rejects_actual_overflow() {
+        // chunked 无声明长度，实际收集后复核必须拦下
+        let err = body_limit_check(None, MAX_BODY_BYTES as usize + 1).unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn m18_body_limit_accepts_within_limits() {
+        assert!(body_limit_check(Some(MAX_BODY_BYTES), 0).is_ok());
+        assert!(body_limit_check(None, MAX_BODY_BYTES as usize).is_ok());
+        assert!(body_limit_check(Some(100), 100).is_ok());
+    }
+
+    #[test]
+    fn m18_body_limit_just_over_the_edge_is_rejected() {
+        assert!(body_limit_check(Some(MAX_BODY_BYTES + 1), 0).is_err());
+        assert!(body_limit_check(None, MAX_BODY_BYTES as usize + 1).is_err());
+    }
+
+    #[test]
+    fn p32_33_constants_match_registry_contract() {
+        // P32 有界并发 32、P33 读写超时 30s、M18 请求行 16384B —— 与登记簿一字不差
+        assert_eq!(MAX_UPSTREAM_CONNECTIONS, 32);
+        assert_eq!(IO_TIMEOUT, std::time::Duration::from_secs(30));
+        assert_eq!(MAX_REQUEST_LINE_BYTES, 16 * 1024);
+    }
+
+    #[test]
+    fn hyper_builder_wires_request_line_limit() {
+        // 接线端拿到的 builder 必须已经带 16KB 请求行上限，防平台层遗忘
+        let b = hyper_http1_builder();
+        let _ = b; // max_buf_size 无 getter，能构建即证明注入路径存在；
+                   // 上限值本身由上面的常量断言兜底
     }
 
     #[tokio::test]

@@ -5,8 +5,10 @@
 //! - `mac`    HMAC-SHA256 单一来源（beacon / 转写本 / 令牌 / PBKDF2 内层共用）
 //! - `sign`   握手层 ECDSA P-256 签名 + ECDH 密钥协商（§4.2：握手只认证不加密）
 //! - `aead`   统一加密层：单一 AES-256-GCM 实例（§4.2 规则二）
+//! - `id`     CSPRNG 会话/文件 ID 生成（P26）
 
 pub mod aead;
+pub mod id;
 pub mod kdf;
 pub mod mac;
 pub mod merkle;
@@ -16,6 +18,7 @@ pub use aead::{
     decrypt as aead_decrypt, encrypt as aead_encrypt, KEY_LEN as AEAD_KEY_LEN,
     NONCE_LEN as AEAD_NONCE_LEN,
 };
+pub use id::{new_file_id, new_session_id};
 pub use kdf::{
     derive_file_key, derive_pairing_secret, derive_session_key, derive_storage_key, sha256,
     KEY_LEN as KDF_KEY_LEN, PBKDF2_ITERATIONS,

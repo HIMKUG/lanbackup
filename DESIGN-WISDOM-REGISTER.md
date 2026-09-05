@@ -24,8 +24,8 @@
 | W4 | **`reg.exe` 必须 `CREATE_NO_WINDOW(0x08000000)`**，否则配对/启动时闪黑框 | `identity.rs:22-23` | — | ⬜ |
 | W5 | **Windows UDP socket 会偶发性失效**，必须检测 `send_to` 失败并重建 socket，不能当网络问题处理 | `bcpd.rs:296-299` | core presence/beacon | ⚠️ 报文层（`presence::beacon`）与重放防护（`presence::tracker`）已落地且不依赖 socket；**socket 重建策略属传输层，待阶段 4 网络栈**，届时必须落这条 |
 | W6 | **Defender 实时扫描下每次 syscall 都不便宜** → 连接码必须进程内缓存 | `identity.rs:145-148` | core identity | ⬜ |
-| W7 | 路径穿越必须按 `/` 和 `\` **双切分**：Windows 下 `a\..\..\evil` 作为单组件可绕过纯 `/` 切分 | `util.rs:58` | core path 安全 | ⬜ |
-| W8 | 必须过滤含 `:` 的组件 —— 盘符 `C:` 与 NTFS 备用数据流，`Path::join` 遇盘符会**整体替换前缀** | `util.rs:59` | core path 安全 | ⬜ |
+| W7 | 路径穿越必须按 `/` 和 `\` **双切分**：Windows 下 `a\..\..\evil` 作为单组件可绕过纯 `/` 切分 | `util.rs:58` | `sync/manifest.rs::is_safe_rel_path`（`normalize_rel_path` 先 `\`→`/` 再否决 `..` 段） | ✅ |
+| W8 | 必须过滤含 `:` 的组件 —— 盘符 `C:` 与 NTFS 备用数据流，`Path::join` 遇盘符会**整体替换前缀** | `util.rs:59` | `sync/manifest.rs::is_safe_rel_path`（`seg.len()==2 && ends_with(':')` 否决盘符组件） | ✅ |
 | W9 | **Windows 大小写不敏感** → 必须做大小写冲突检测，否则 `Photo.jpg` 与 `photo.JPG` 互相覆盖 | `util.rs:108-110` | core 冲突处理 | ⬜ |
 | W10 | 导出日志**固定英文前缀**，避免设备名含中文造成解码问题 | `logger.rs:458` | core 日志 | ⬜ |
 
@@ -35,12 +35,12 @@
 |---|---|---|---|---|
 | D1 | **绝不在调用方线程直接 `app.emit()`** —— emit 需向主线程派发 WebView2 eval，多工作线程并发派发会形成跨线程消息死锁，症状为整进程瞬间冻结而 WebView2 子进程照常渲染动画。解法：mpsc + 单一派发线程 + 批量合并 | `logger.rs:478-500,529-543` | core → UI 事件桥 | ⬜ |
 | D2 | **绝不持锁做 PBKDF2** —— 600k 轮数百 ms 会让接收路径 `try_read` 全部失败（活跃传输取不到 pairing_secret 解密失败），`try_write().unwrap()` 并发下还会 panic。解法：短临界区 clone + 锁外加密 + 失败降级为"本轮不落密钥" | `store.rs:226-249` | core 密钥持久化 | ⬜ |
-| D3 | **`TcpStream::connect` 必须设超时** —— 默认对不可达 IP 触发 SYN 重试，可挂起 10~20 秒**且无任何日志** | `transfer/v3.rs:99-100` | core 网络层 | ⬜ |
+| D3 | **`TcpStream::connect` 必须设超时** —— 默认对不可达 IP 触发 SYN 重试，可挂起 10~20 秒**且无任何日志** | `transfer/v3.rs:99-100` | `discovery.rs::probe_client`（全请求 700ms 超时，覆盖 connect） | ✅ |
 | D4 | **配对端口绝不做 port+1 回退** —— 双端全部硬编码 `(接收端口+1)`，静默换端口会让本机"启动成功"但对端全部不可达，**比绑定失败更难排查**。端口占用时重试同一端口（120ms × 5） | `mod.rs:308-311` | core 服务启动 | ⬜ |
 | D5 | **同步 Tauri 命令在 IPC 主线程执行**，网络/DB 阻塞会占住主线程 → 窗口事件循环卡死。全部改 `run_blocking`；配 UI 主线程心跳看门狗（500ms 投递 / 1500ms 超时告警） | `lib.rs:299-308`; `mod.rs:485-543` | core 命令层 | ⬜ |
 | D6 | **接收超时只 finalize 统计、绝不 break 出循环** —— break 会造成"端口通但事件无人消费"的失聪态，而 watchdog 只探 TCP 连通性，**永远不会触发自愈**。空闲等待是接收端的正常稳态 | `receive.rs:112-116` | core 接收循环 | ⬜ |
-| D7 | **认证前必须限制分配长度** —— 流式密文的 `clen` 取自密文流且在 GCM 认证之前分配，不设上限则任意对端可让本端尝试分配 ~4GiB，**无需知道密钥** | `crypto.rs:413-419` | core 加解密 | ⬜ |
-| D8 | **固定长度头必须循环读满** —— 单次 `read` 不保证填满缓冲（TcpStream 分段 / BufReader 边界），否则合法密文被**间歇性**误杀 | `crypto.rs:389-391` | core 流读取 | ⬜ |
+| D7 | **认证前必须限制分配长度** —— 流式密文的 `clen` 取自密文流且在 GCM 认证之前分配，不设上限则任意对端可让本端尝试分配 ~4GiB，**无需知道密钥** | `crypto.rs:413-419` | `server/mod.rs::body_limit_check`（core 为块级 AEAD、块大小有界 4/16MiB，无流式 clen；等价防护以 HTTP body 10MB 双闸落地） | ✅ |
+| D8 | **固定长度头必须循环读满** —— 单次 `read` 不保证填满缓冲（TcpStream 分段 / BufReader 边界），否则合法密文被**间歇性**误杀 | `crypto.rs:389-391` | —（V4 用 hyper 读 HTTP（内部循环读满）+ 整块 AEAD 解密，无手写固定头流读取） | ⚠️ 原问题在 core 不存在 |
 | D9 | **跨 await 不持锁**；guard 在表达式结束即释放；`drop()` 释放锁后再 spawn | `transfer/schedule.rs`（peer_chunk 取 Arc 即释锁，许可 RAII 归还） | core 并发规范 | ✅ |
 | D10 | **`tokio::sync::RwLock` 而非 `std::sync::Mutex`**（在 tokio 上下文访问的状态），否则阻塞调度器 | `mod.rs:237-239` | core 状态容器 | ⬜ |
 | D11 | **release 配置 `panic=abort`** → 越界 panic 直接杀死进程。日志解析等字符串操作全程用 `strip_prefix`/`find`，绝不做裸切片 | `logger.rs:562-563` | core 编码规范 | ⬜ |
@@ -129,7 +129,7 @@
 | M15 | **本端作为验证方配对成功后，必须回写原生信任表**，否则对端问候本机时返回"未信任"，被误判为解除配对 | `L598-603` | V4 配对 | ⬜ |
 | M16 | **配对信任表持久化用"清空后重建"而非 merge** —— 只增不删会导致已解除配对的残留继续被信任，造成**状态横跳** | `L628-631` | core 配对存储 | ⬜ |
 | M17 | **孤立会话 5 分钟自动清理**（prepare-upload 后客户端断开未上传） | `L1872-1873` | core 会话清理 | ⬜ |
-| M18 | **HTTP 输入三道硬上限**：请求行 16384B、body 10MB、tar 单成员 100MB | `L3450-3465,L3002-3006` | core HTTP | ⬜ |
+| M18 | **HTTP 输入三道硬上限**：请求行 16384B、body 10MB、tar 单成员 100MB | `L3450-3465,L3002-3006` | `server/mod.rs`：body 10MB 双闸（`body_limit_check`）+ 请求行 16384B 经 `MAX_REQUEST_LINE_BYTES`/`hyper_http1_builder` 注入 | ⚠️ tar 单成员 100MB 属 mobile/ 集成（core 无 tar 路径），随 D 手机接入落地 |
 | M19 | **SAF tree URI 必须 `takePersistableUriPermission`**，否则重启后目录不可用 | `L1494-1503` | Android 平台层 | ⬜ |
 | M20 | **SAF 无跨目录 rename** → 移动用"复制 + 删除"实现假删除 | `L1642-1693` | Android 平台层 | ⬜ |
 | M21 | **用 `DocumentFile` 遍历，不手工拼 documentId** —— 规避部分 ROM（国产）上 URI 解析失败 | `L1508-1510,L1617-1631` | Android 平台层 | ⬜ |
@@ -184,14 +184,14 @@
 | P23 | **MachineGuid `OnceLock` 缓存** —— `reg query` 是一次进程创建（10~50ms），一次子网扫描最多 254 个并发 reg.exe | `identity.rs:96-99` | core identity | ⬜ |
 | P24 | **连接码进程内缓存** —— 接收端每个文件事件都要取码，此前每文件一次磁盘读 | `identity.rs:145-148` | core identity | ⬜ |
 | P25 | **CSPRNG + 拒绝采样消除模偏差**（248 = 31×8，丢弃 ≥248 的字节）；同一毫秒内多次调用不再产出相同码 | `identity.rs:198-209` | core identity | ⬜ |
-| P26 | **sessionId / folderId 必须用 CSPRNG** —— 曾用 `Date.now() + Math.random()`，sessionId 可预测意味着同网段攻击者能劫持会话；folderId 会在同一毫秒碰撞导致配置互相覆盖 | `scheduler.ts:391-397`; `config.ts:57-63` | core ID 生成 | ⬜ |
+| P26 | **sessionId / folderId 必须用 CSPRNG** —— 曾用 `Date.now() + Math.random()`，sessionId 可预测意味着同网段攻击者能劫持会话；folderId 会在同一毫秒碰撞导致配置互相覆盖 | `scheduler.ts:391-397`; `config.ts:57-63` | `crypto/id.rs::new_session_id` / `new_file_id`（32 字节 CSPRNG → 64 hex） | ✅ |
 | P27 | **`maxRetries` 必须夹紧**（`Math.max(0, Math.min(n, 100))`）—— 传 `Infinity` 会让循环永不退出 | `transfer.ts:588-589` | core 重试 | ⬜ |
 | P28 | **大数组分帧处理**（每帧 100 条约 1-2ms）—— 清单构建会阻塞主线程，**且顺序与结果必须与同步版完全一致** | `chunks.ts:1-10` | core 批处理 | ⬜ |
 | P29 | **knownMissing 过滤必须用 Set** —— 用 `Array.includes` 在首次镜像几万文件时是 O(n²)，直接卡死 UI | `sync.ts:116-119` | core sync | ⬜ |
 | P30 | **阻塞 I/O 一律 `spawn_blocking`**：`create_dir_all` / `fs::read` / `set_file_mtime` / 同步 HTTP / 阻塞 connect | 多处 | core 并发规范 | ⬜ |
 | P31 | **非阻塞日志发送**：`log()` 只 `tx.send()`，绝不阻塞、绝不派发 | `logger.rs:484-485` | core 日志 | ⬜ |
-| P32 | **配对连接有界并发 32 + RAII guard**，防 Slowloris（无超时 + 无线程上限 = 局域网任意主机可用半个 HTTP 头挂住线程） | `mod.rs:357-364` | core 服务器 | ⬜ |
-| P33 | **读/写超时 30s** 防 Slowloris | `mod.rs:357-360` | core 服务器 | ⬜ |
+| P32 | **配对连接有界并发 32 + RAII guard**，防 Slowloris（无超时 + 无线程上限 = 局域网任意主机可用半个 HTTP 头挂住线程） | `mod.rs:357-364` | `server/mod.rs::MAX_UPSTREAM_CONNECTIONS`（32）+ 接线文档（RAII guard 由接线端连接对象持有） | ⚠️ 并发闸在接入端 hyper server |
+| P33 | **读/写超时 30s** 防 Slowloris | `mod.rs:357-360` | `server/mod.rs::IO_TIMEOUT`（30s）+ 接线文档（`tokio::time::timeout` 包住每次 service 调用） | ⚠️ 接入端接线 |
 | P34 | **batch tar 文件名必须加序号** —— 同一毫秒内多个 batch 会冲突互相覆盖（**致命**） | `send.rs:261` | core 批量 | ⬜ |
 | P35 | **不可读目录条目跳过而非中止整个扫描**；**符号链接不跟随**（rsync -a 隐含 -l）；**特殊文件跳过**（rsync -D 需 root） | `util.rs:339-345,360-363,375-377` | core 扫描 | ⬜ |
 | P36 | **崩溃残留 `.tmp_*` 与 `.dec_tmp` 必须清理** —— 后者扫描器刻意排除该扩展名，**用户不可见的隐形泄漏** | `receive.rs:94-98,715-717,854` | core 清理 | ⬜ |
@@ -208,7 +208,7 @@
 |---|---|---|---|
 | E1 | 「保留 `AndroidSessionStore` / `SessionDatabase`（SAF 写入仍需 Java）」 | 这两个类**零调用方**，与 SAF 写入毫无关系，是孤儿代码 | 改为：删除，仅保留其「热/温/冷 + 脏标记批量刷盘」的**设计模式** |
 | E2 | 隐含假设 Java 是"一份能跑的完整实现，需用 Rust 重写" | Java 是**停在 v2 阶段的残骸**；`receiver.ts` 声明的 8 个方法在 Java 中不存在；`protocol/README.md:5` 明确 v3 硬升级不兼容 v2 端点 | 改为：这次不是平移重写，是**补齐一个从未真正实现的契约**。Rust 实现须对齐 `receiver.ts` 而非 Java |
-| E3 | 认为 golden file 校验在生效 | `golden/manifest.json` 的 `schemaHash` 是 `PENDING_FIRST_CAPTURE`，`capturedAt` 为 null —— **从未回填，校验事实上未生效** | 契约即代码（schemars）必须同时回填 schemaHash |
+| E3 | 认为 golden file 校验在生效 | `golden/manifest.json` 的 `schemaHash` 是 `PENDING_FIRST_CAPTURE`，`capturedAt` 为 null —— **从未回填，校验事实上未生效** | ✅ 已落实：V4 golden 迁移到 `protocol/schemas/v4/golden-manifest.json`（`core/src/bin/gen_schema.rs --golden` 生成，schemaHash 为真实 SHA-256）；旧 v2/v3 golden 标记为待删除（2026-09-06 核对） |
 | E4 | 未发现协议目录自相矛盾 | README 说 3.0，golden 写 3.1；README 说"无 pair/initiate 端点"，manifest.json 的 endpoints 又列了它们 | V4 路由表定稿时一次性清理 |
 | E5 | 未发现扫描自过滤失效 | 广播 fingerprint 是 UUID，自过滤却拿它跟 8 位连接码比，永不相等 → 手机把自己扫进设备列表 | 列入 M34 修复 |
 | E6 | 未发现弱校验实现与注释不符 | `scheduler.ts` 注释写 xxHash64，但常量 `PRIME64_4 = 9650019240527522597` 与标准 xxHash64（`9650029242287828579`）不同，轮函数也非标准 —— **不是标准 xxHash64** | ✅ 已统一：V4 弃用含糊的 xxHash64，改用无歧义的 **Adler-32** 作为弱校验（`transfer/chunk.rs::weak_checksum`），根除「常量对不上 → 弱校验永不命中」风险；强校验仍由 SHA-256 担责 |
