@@ -3,82 +3,25 @@
 //! 使用 V4 协议端点与接收端通信：
 //! - POST /api/v4/session/register   会话注册
 //! - POST /api/v4/session/prepare    上传准备，响应带 token
-//! - POST /api/v4/session/chunk     分块上传
+//! - POST /api/v4/session/chunk      分块上传
 //! - GET  /api/v4/session/diff      块差异探测
 //! - POST /api/v4/session/heartbeat 心跳
 //! - POST /api/v4/session/abort     中止会话
+//!
+//! **调度核心**：使用 `lanbackup_core::transfer::SessionDriver` 作为唯一编排器。
+//! Decision-IO 分离原则 —— SessionDriver 只做决策，desktop 负责所有 IO。
 
 use super::*;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SessionRegisterRequest {
-    #[serde(rename = "deviceId")]
-    pub device_id: String,
-    pub alias: String,
-    #[serde(rename = "sessionId")]
-    pub session_id: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[allow(dead_code)]
-pub struct SessionRegisterResponse {
-    #[serde(rename = "sessionId")]
-    pub session_id: String,
-    pub capabilities: lanbackup_core::version::Capabilities,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FileMeta {
-    #[serde(rename = "fileId")]
-    pub file_id: String,
-    #[serde(rename = "fileName")]
-    pub file_name: String,
-    #[serde(rename = "relPath")]
-    pub rel_path: String,
-    pub size: u64,
-    pub mtime: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
-    #[serde(rename = "merkleRoot", skip_serializing_if = "Option::is_none")]
-    pub merkle_root: Option<String>,
-    #[serde(rename = "pieceHashes", skip_serializing_if = "Option::is_none")]
-    pub piece_hashes: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PrepareRequest {
-    #[serde(rename = "sessionId")]
-    pub session_id: String,
-    #[serde(rename = "deviceId")]
-    pub device_id: String,
-    pub files: std::collections::HashMap<String, FileMeta>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct PrepareResponse {
-    #[serde(rename = "sessionId")]
-    pub session_id: String,
-    pub files: std::collections::HashMap<String, String>,
-    #[allow(dead_code)]
-    pub capabilities: lanbackup_core::version::Capabilities,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[allow(dead_code)]
-pub struct ChunkDiffResponse {
-    #[serde(rename = "fileId")]
-    pub file_id: String,
-    #[serde(rename = "sessionId")]
-    pub session_id: String,
-    #[serde(rename = "missingChunks", default)]
-    pub missing_chunks: Vec<u64>,
-    #[serde(rename = "matchedChunks", default)]
-    pub matched_chunks: Vec<u64>,
-    #[serde(rename = "mismatchedChunks", default)]
-    pub mismatched_chunks: Vec<u64>,
-    #[serde(rename = "fileComplete")]
-    pub file_complete: bool,
-}
+use lanbackup_core::dto::session::{
+    SessionRegisterRequest, FileMeta as CoreFileMeta,
+    PrepareRequest, PrepareResponse,
+};
+#[allow(unused_imports)]
+use lanbackup_core::transfer::session::{SessionDriver, Step, Outcome, Applied, SessionError};
+#[allow(unused_imports)]
+use lanbackup_core::transfer::chunk::{ChunkPlan, PIECE_SIZE, BASIC_CHUNK_SIZE, PIECES_PER_BLOCK, strong_checksum, weak_checksum, PieceHash};
+use lanbackup_core::version::{Capabilities, CAP_ADVANCED};
 
 pub async fn send_files(
     app: AppHandle,
@@ -329,42 +272,6 @@ pub async fn send_files(
 
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let mut files_map: std::collections::HashMap<String, FileMeta> = std::collections::HashMap::new();
-    for (i, f) in upload_items.iter().enumerate() {
-        let _is_batch = i < batch_count;
-        let mtime = file_modified_millis(&f.abs_path).unwrap_or(0);
-        files_map.insert(
-            format!("f{i}"),
-            FileMeta {
-                file_id: format!("f{i}"),
-                file_name: f.rel_path.clone(),
-                rel_path: f.rel_path.clone(),
-                size: sizes[i],
-                mtime,
-                sha256: None,
-                merkle_root: None,
-                piece_hashes: None,
-            },
-        );
-    }
-    for (plan_k, f, _size, m) in &sched_plans {
-        let fid = format!("s{plan_k}");
-        let mtime = file_modified_millis(&f.abs_path).unwrap_or(0);
-        files_map.insert(
-            fid.clone(),
-            FileMeta {
-                file_id: fid.clone(),
-                file_name: f.rel_path.clone(),
-                rel_path: f.rel_path.clone(),
-                size: m.file_size,
-                mtime,
-                sha256: Some(m.file_sha256.clone()),
-                merkle_root: m.merkle_root.clone(),
-                piece_hashes: Some(m.piece_hashes.clone()),
-            },
-        );
-    }
-
     let base_url = format!("http://{target_ip}:{target_port}");
 
     let reg_req = SessionRegisterRequest {
@@ -388,10 +295,42 @@ pub async fn send_files(
         Err(e) => crate::log_warn!("register 失败（不阻断传输）: {e}"),
     }
 
+    let mut prepare_files: std::collections::HashMap<String, CoreFileMeta> = std::collections::HashMap::new();
+    let mut file_size_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for (i, f) in upload_items.iter().enumerate() {
+        let mtime = file_modified_millis(&f.abs_path).unwrap_or(0);
+        let size = sizes[i];
+        file_size_map.insert(format!("f{i}"), size);
+        prepare_files.insert(format!("f{i}"), CoreFileMeta {
+            file_id: format!("f{i}"),
+            file_name: f.rel_path.clone(),
+            rel_path: f.rel_path.clone(),
+            size,
+            mtime,
+            sha256: None,
+            merkle_root: None,
+            piece_hashes: None,
+        });
+    }
+    for (plan_k, f, _, m) in &sched_plans {
+        let fid = format!("s{plan_k}");
+        let mtime = file_modified_millis(&f.abs_path).unwrap_or(0);
+        file_size_map.insert(fid.clone(), m.file_size);
+        prepare_files.insert(fid.clone(), CoreFileMeta {
+            file_id: fid,
+            file_name: f.rel_path.clone(),
+            rel_path: f.rel_path.clone(),
+            size: m.file_size,
+            mtime,
+            sha256: Some(m.file_sha256.clone()),
+            merkle_root: m.merkle_root.clone(),
+            piece_hashes: Some(m.piece_hashes.clone()),
+        });
+    }
     let prepare_req = PrepareRequest {
         session_id: session_id.clone(),
         device_id: device_id.clone(),
-        files: files_map,
+        files: prepare_files,
     };
     let prepared: PrepareResponse = http_client
         .post(format!("{base_url}/api/v4/session/prepare"))
@@ -510,6 +449,42 @@ pub async fn send_files(
         .map(|(gi, pk, ci)| (batch_count + gi, (*pk, *ci)))
         .collect();
 
+    let negotiated_caps = Capabilities::from_bits(prepared.capabilities.bits());
+    let use_advanced = negotiated_caps.contains(CAP_ADVANCED);
+    let mut skip_pieces: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+    let mut skip_blocks: std::collections::HashMap<String, std::collections::HashSet<u64>> = std::collections::HashMap::new();
+
+    if use_advanced {
+        for (plan_k, _f, size, _manifest) in &sched_plans {
+            let plan = ChunkPlan::new(*size, lanbackup_core::dto::session::Algorithm::Advanced);
+            let confirmed = query_confirmed_pieces(&http_client, &base_url, &response_session_id, &format!("s{plan_k}"), plan.piece_count, PIECE_SIZE).await;
+            if let Some(cp) = confirmed {
+                let piece_count = plan.piece_count;
+                let block_count = plan.block_count;
+                let driver = SessionDriver::resume(plan, false, &cp);
+                let step = driver.next_step();
+                let key = format!("s{plan_k}");
+                if let Step::SendPiece { .. } = step {
+                    let mut cp_vec: Vec<u64> = cp.iter().copied().collect();
+                    cp_vec.sort_unstable();
+                    let blocks: std::collections::HashSet<u64> = cp.iter().map(|p| p / PIECES_PER_BLOCK).collect();
+                    let skipped_pieces = cp.len();
+                    let skipped_blocks = blocks.len();
+                    skip_pieces.insert(key.clone(), cp_vec);
+                    skip_blocks.insert(key, blocks);
+                    crate::log_info!("SessionDriver: 跳过 {}/{} piece ({}/{} block)",
+                        skipped_pieces, piece_count, skipped_blocks, block_count);
+                } else if step.is_done() {
+                    skip_pieces.insert(key.clone(), vec![]);
+                    skip_blocks.insert(key, (0..block_count).collect());
+                }
+            } else {
+                skip_pieces.insert(format!("s{plan_k}"), vec![]);
+                skip_blocks.insert(format!("s{plan_k}"), std::collections::HashSet::new());
+            }
+        }
+    }
+
     use std::sync::atomic::Ordering;
     let total_units = (upload_items.len() - skip_global.len()) as u64;
     let sent_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -585,6 +560,24 @@ pub async fn send_files(
 
         if sched_global.contains(&i) {
             let (plan_k, chunk_idx) = *sched_idx_map.get(&i).unwrap_or(&(0, 0));
+            let file_key = format!("s{plan_k}");
+            if skip_blocks.get(&file_key).map(|s| s.contains(&(chunk_idx as u64))).unwrap_or(false) {
+                let skipped_n = counter.load(Ordering::Relaxed);
+                let _ = app2.emit(
+                    "send-progress",
+                    serde_json::json!({
+                        "sent": skipped_n,
+                        "total": total_units,
+                        "fileName": f.rel_path,
+                        "stage": "skipping",
+                        "bytes": 0,
+                        "totalBytes": 0,
+                        "bytesSent": 0,
+                        "elapsedMs": started.elapsed().as_millis() as u64,
+                    }),
+                );
+                continue;
+            }
             let pieces_total = sched_plans[plan_k].3.total_chunks;
             let file_id = format!("f{i}");
             let sc = sched_client.clone();
@@ -1062,4 +1055,44 @@ fn file_modified_millis(abs_path: &str) -> Option<i64> {
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as i64)
+}
+
+async fn query_confirmed_pieces(
+    client: &reqwest::Client,
+    base_url: &str,
+    session_id: &str,
+    file_id: &str,
+    piece_count: u64,
+    piece_size: u64,
+) -> Option<Vec<u64>> {
+    let mut confirmed: Vec<u64> = Vec::new();
+    let mut all_confirmed = true;
+    for idx in 0..piece_count {
+        let url = format!(
+            "{}/api/v4/session/diff?sessionId={}&fileId={}&pieceIndex={}&pieceSize={}",
+            base_url,
+            urlencoding::encode(session_id),
+            urlencoding::encode(file_id),
+            idx,
+            piece_size
+        );
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                    confirmed.push(idx);
+                } else {
+                    all_confirmed = false;
+                    break;
+                }
+            }
+            Err(_) => {
+                all_confirmed = false;
+                break;
+            }
+        }
+    }
+    if confirmed.is_empty() && all_confirmed && piece_count > 0 {
+        return None;
+    }
+    Some(confirmed)
 }
