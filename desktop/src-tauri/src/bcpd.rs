@@ -261,6 +261,7 @@ fn open_receiver() -> Option<std::net::UdpSocket> {
 
 /// 启动常驻加密存在广播（发送器 + 接收器 + 离线扫描）。
 /// 仅受防御性总闸（defensive_hidden）约束；与发现/收件开关无关。
+#[allow(unused_assignments)]
 pub fn start_bcpd(app: AppHandle) {
     // —— 发送器：周期组播加密存在；F3: socket 失效后指数退避重建 ——
     {
@@ -337,7 +338,7 @@ pub fn start_bcpd(app: AppHandle) {
                         }
                     }
                     None => {
-                        let e = std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "receiver socket");
+                        let _e = std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "receiver socket");
                         attempt += 1;
                         let backoff = std::cmp::min(3_000u64.wrapping_shl(attempt.min(10)), 30_000u64);
                         crate::log_warn!(

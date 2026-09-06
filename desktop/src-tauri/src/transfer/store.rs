@@ -432,6 +432,7 @@ pub fn send_sync_dir(
 }
 
 /// 读取对方同步过来的目录名
+#[allow(dead_code)]
 pub fn get_synced_dir(app: AppHandle, direction: String) -> Option<serde_json::Value> {
     let st = app.state::<PairingState>();
     let name = st.synced_dirs.lock().ok()?.get(&direction).cloned()?;

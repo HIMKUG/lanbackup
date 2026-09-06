@@ -35,6 +35,15 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 #   ① 换机器 clone 后 cargo build 直接失败 ② 上游无版本控制，本地修改不可追溯
 # V4 阶段 2 将吸收其 HTTP 管道并删除 V2 协议层，届时本依赖项可能整体移除。
 localsend = { path = "../../third_party/localsend", features = ["http", "multicast"] }
+# V4 核心：协议与算法只此一份实现，桌面端直接依赖
+lanbackup-core = { path = "../../core" }
+# V4 HTTP 服务（桌面端接收服务器，基于 core SessionStore）
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 tokio = { version = "1", features = ["full"] }
 # 大文件流式上传（ReaderStream）
 tokio-util = { version = "0.7", features = ["io"] }
@@ -76,8 +85,6 @@ tauri-plugin-single-instance = "2"
 mouse_position = "0.1"
 
 [dev-dependencies]
-# 协议 conformance：用 jsonschema 校验双端共享 Schema + Golden File（方案.txt §3.8/H.2，锁版本避免升级漂移）
-jsonschema = "0.18"
 
 # 发布构建优化：全程序 LTO + 去除符号
 [profile.release]
@@ -92,6 +99,8 @@ strip = true
 # 框架类重型依赖（UI 壳 / HTTP 栈 / TLS / 运行时 / SQLite 等）降到 "s"——
 # 它们不是性能热点，体积可省 ~20%，运行速度几乎无感知。
 [profile.release.package.backup-desktop]
+opt-level = 3
+[profile.release.package.lanbackup-core]
 opt-level = 3
 [profile.release.package.localsend]
 opt-level = 3

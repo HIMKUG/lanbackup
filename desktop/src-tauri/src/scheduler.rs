@@ -653,7 +653,7 @@ pub fn parse_etag(etag: &str) -> Option<String> {
 // HTTP 客户端（scheduler v1 扩展协议）
 // ============================================================
 
-use localsend::reqwest::Client;
+use reqwest::Client;
 
 /// Scheduler HTTP 客户端：用于发送 scheduler v1 扩展协议请求
 #[allow(dead_code)]
@@ -673,234 +673,12 @@ impl SchedulerHttpClient {
         Ok(Self { client })
     }
 
-    /// 构建 scheduler v1 扩展 prepare-upload JSON（allow(dead_code)：scheduler 差异同步引擎用）
-    #[allow(dead_code)]
-    pub fn build_extended_prepare_upload_json(
-        info: &localsend::http::dto_v2::RegisterDtoV2,
-        files: &std::collections::HashMap<String, localsend::model::transfer::FileDto>,
-        manifest: Option<&FileManifest>,
-    ) -> Result<serde_json::Value, AppError> {
-        use serde_json::json;
 
-        // 转换 FileDto 为 JSON 值
-        let files_json = serde_json::to_value(files)
-            .map_err(|e| AppError(format!("序列化文件元数据失败: {e}")))?;
 
-        // 如果有 manifest，添加 scheduler 扩展字段
-        let files_with_ext = if let Some(m) = manifest {
-            let mut files_ext = files_json;
-            if let Some(obj) = files_ext.as_object_mut() {
-                for (_file_id, file_val) in obj.iter_mut() {
-                    if let Some(map) = file_val.as_object_mut() {
-                        map.insert("protocolExtensions".to_string(), json!(["scheduler-v1"]));
-                        map.insert("merkleRoot".to_string(), json!(m.merkle_root));
-                        map.insert("pieceHashes".to_string(), json!(m.piece_hashes));
-                        map.insert("chunkSize".to_string(), json!(m.chunk_size));
-                    }
-                }
-            }
-            files_ext
-        } else {
-            files_json
-        };
-
-        let info_json = serde_json::to_value(info)
-            .map_err(|e| AppError(format!("序列化设备信息失败: {e}")))?;
-
-        Ok(json!({
-            "info": info_json,
-            "files": files_with_ext,
-        }))
-    }
-
-    /// 发送 scheduler v1 prepare-upload 请求（allow(dead_code)：scheduler 差异同步引擎用）
-    #[allow(dead_code)]
-    pub async fn prepare_upload_extended(
-        &self,
-        protocol: localsend::model::discovery::ProtocolType,
-        ip: &str,
-        port: u16,
-        body: serde_json::Value,
-    ) -> Result<SchedulerPrepareResponse, AppError> {
-        let scheme = match protocol {
-            localsend::model::discovery::ProtocolType::Http => "http",
-            localsend::model::discovery::ProtocolType::Https => "https",
-        };
-        let url = format!("{}://{}:{}/api/localsend/v2/prepare-upload", scheme, ip, port);
-        let file_count = body.get("files").and_then(|v| v.as_object()).map(|o| o.len()).unwrap_or(0);
-        crate::log_info!("prepare_upload_extended 发送 对端={}:{} 文件数={}", ip, port, file_count);
-
-        let resp = self.client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AppError(format!("prepare-upload 请求失败: {e}")))?;
-
-        let status = resp.status().as_u16();
-        crate::log_info!("prepare_upload_extended 响应 status={} 对端={}:{}", status, ip, port);
-
-        // 非 2xx：拒绝/冲突等，直接报错（与 LsHttpClientV2.prepare_upload 语义一致）
-        if status >= 300 {
-            return Err(AppError(format!("prepare-upload 被接收端拒绝: status={status}")));
-        }
-
-        // 204：无文件需要传输
-        if status == 204 {
-            crate::log_info!("prepare_upload_extended: 204 无文件需传输 对端={}:{}", ip, port);
-            return Ok(SchedulerPrepareResponse {
-                status_code: status,
-                session_id: String::new(),
-                files: std::collections::HashMap::new(),
-                chunk_diff: None,
-                ecdh_pub_key: None,
-            });
-        }
-
-        let body: serde_json::Value = resp.json().await
-            .map_err(|e| AppError(format!("解析 prepare-upload 响应失败: {e}")))?;
-
-        let session_id = body.get("sessionId")
-            .or_else(|| body.get("session_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if session_id.is_empty() && status != 204 {
-            // 空会话 id 会让后续 upload 全部失败且根因丢失——显式告警而非静默
-            crate::log_warn!("prepare_upload_extended 响应缺少 sessionId（status={status}），后续上传将失败");
-        }
-
-        // 解析 files 字段（标准 LocalSend v2 格式）
-        let files: std::collections::HashMap<String, String> = match body.get("files") {
-            Some(v) => match serde_json::from_value(v.clone()) {
-                Ok(m) => m,
-                Err(e) => {
-                    // 接收端明明拒绝了所有文件，静默变空 map 会伪装成"接受了 0 个"照常推进
-                    crate::log_warn!("prepare_upload_extended files 字段解析失败: {e}");
-                    std::collections::HashMap::new()
-                }
-            },
-            None => {
-                crate::log_warn!("prepare_upload_extended 响应缺少 files 字段");
-                std::collections::HashMap::new()
-            }
-        };
-        crate::log_info!("prepare_upload_extended 完成 session={} 接受文件数={} 对端={}:{}",
-            crate::logger::mask(&session_id), files.len(), ip, port);
-
-        // 解析 scheduler v1 扩展的 chunkDiff（可选）
-        let chunk_diff = body.get("chunkDiff")
-            .or_else(|| body.get("chunk_diff"))
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
-
-        // 加密 v2 扩展：接收端 ECDH 公钥（复杂加密协商）
-        let ecdh_pub_key = body.get("ecdhPubKey")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        Ok(SchedulerPrepareResponse {
-            status_code: status,
-            session_id,
-            files,
-            chunk_diff,
-            ecdh_pub_key,
-        })
-    }
-
-    /// GET /diff 端点（allow(dead_code)：scheduler 差异同步引擎用）
-    #[allow(dead_code)]
-    pub async fn get_diff(
-        &self,
-        protocol: localsend::model::discovery::ProtocolType,
-        ip: &str,
-        port: u16,
-        session_id: &str,
-        file_id: &str,
-        chunk_index: u32,
-        chunk_size: u64,
-        etag: &str, // 必须是带双引号的 ETag 字符串
-    ) -> Result<DiffResponse, AppError> {
-        if chunk_size == 0 {
-            return Err(AppError("get_diff: chunk_size 不能为 0".to_string()));
-        }
-        // scheme 与 prepare_upload_extended 一致按对端协议选择——此前硬编码 http://
-        // 会对 HTTPS 对端明文降级或直连失败
-        let scheme = match protocol {
-            localsend::model::discovery::ProtocolType::Http => "http",
-            localsend::model::discovery::ProtocolType::Https => "https",
-        };
-        let range_start = chunk_index as u64 * chunk_size;
-        let range_end = range_start + chunk_size - 1;
-        let url = format!(
-            "{}://{}:{}/api/localsend/v2/file/{}/diff",
-            scheme, ip, port, file_id
-        );
-
-        let resp = self.client
-            .get(&url)
-            .header("X-Session-Id", session_id)
-            .header("Range", format!("bytes={}-{}", range_start, range_end))
-            .header("If-Range", etag) // 协议契约：带双引号的 SHA-256
-            .send()
-            .await
-            .map_err(|e| AppError(format!("GET /diff 请求失败: {e}")))?;
-
-        let status = resp.status().as_u16();
-        let headers = resp.headers();
-
-        // 提取 Content-Range 头（用于计算实际文件大小）
-        let content_range = headers.get("content-range")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        // 416: Range 不满足，需要获取文件总大小
-        if status == 416 {
-            // 解析 Content-Range: bytes */{total} 获取 actualTotalSize
-            let total_size = content_range
-                .as_ref()
-                .and_then(|cr| cr.strip_prefix("bytes */"))
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-            return Ok(DiffResponse::RangeNotSatisfiable { actual_total_size: total_size });
-        }
-
-        // 412: 强校验不匹配（NACK）
-        if status == 412 {
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            let expected = body.get("expected")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let actual = body.get("actual")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            return Ok(DiffResponse::ChecksumMismatch { expected, actual });
-        }
-
-        // 200: ETag 不匹配，文件已变，需全量重传
-        if status == 200 {
-            return Ok(DiffResponse::FileChanged);
-        }
-
-        // 206: 块存在且 ETag 匹配
-        if status == 206 {
-            return Ok(DiffResponse::ChunkMatched {
-                data: resp.bytes().await.map_err(|e| AppError(format!("读取块数据失败: {e}")))?.to_vec(),
-            });
-        }
-
-        Err(AppError(format!("GET /diff 未知响应: {status}")))
-    }
-
-    /// 上传单个块（POST /upload 片段）
-    /// 注意：这是 scheduler v1 的扩展接口，接收端必须实现
-    /// POST /upload 块上传（allow(dead_code)：scheduler 差异同步引擎用）
+    /// 上传单个块（V4 协议）
     #[allow(dead_code)]
     pub async fn upload_chunk(
         &self,
-        protocol: localsend::model::discovery::ProtocolType,
         ip: &str,
         port: u16,
         session_id: &str,
@@ -909,13 +687,8 @@ impl SchedulerHttpClient {
         chunk_index: u32,
         data: Vec<u8>,
     ) -> Result<UploadChunkResponse, AppError> {
-        let scheme = match protocol {
-            localsend::model::discovery::ProtocolType::Http => "http",
-            localsend::model::discovery::ProtocolType::Https => "https",
-        };
         let url = format!(
-            "{}://{}:{}/api/localsend/v2/upload?sessionId={}&fileId={}&token={}&chunkIndex={}",
-            scheme,
+            "http://{}:{}/api/v4/session/chunk?sessionId={}&fileId={}&token={}&chunkIndex={}",
             ip, port,
             urlencoding::encode(session_id),
             urlencoding::encode(file_id),

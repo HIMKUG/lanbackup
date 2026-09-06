@@ -10,17 +10,13 @@ use super::*;
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScannedEntry {
-    /// 相对路径（含目录层级）
     rel_path: String,
-    /// 文件大小（字节）
     size: u64,
-    /// 修改时间（Unix 毫秒，与 shared-core mtime 单位一致）
     mtime: u64,
 }
 
-/// URL 百分号编码（分片文件名内嵌正式相对路径用；保留字母数字及 `-_.`）
+/// URL 百分号编码
 pub(crate) fn pct_encode(s: &str) -> String {
-    // 预分配 + hex 查表：原先每个非安全字节一次 format! 堆分配
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
@@ -36,6 +32,7 @@ pub(crate) fn pct_encode(s: &str) -> String {
     out
 }
 
+#[allow(dead_code)]
 pub(crate) fn pct_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -54,9 +51,7 @@ pub(crate) fn pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// 路径安全过滤：去掉空段/`.`/`..`，防穿越。
-/// 同时按反斜杠切分（Windows 下 `a\..\..\evil` 整体作为单组件可绕过纯 '/' 切分）；
-/// 过滤含 `:` 的组件（盘符 `C:` 与 NTFS 备用数据流）——join 遇盘符会整体替换前缀。
+#[allow(dead_code)]
 pub(crate) fn sanitize_rel_path(name: &str) -> String {
     let mut parts = Vec::new();
     for comp in name.split(['/', '\\']) {
@@ -69,16 +64,8 @@ pub(crate) fn sanitize_rel_path(name: &str) -> String {
     parts.join("/")
 }
 
-/// 计算接收文件的保存路径：目录层级重建 + 冲突自动重命名（永不覆盖）
-///
-/// 规则与 shared-core `conflict.ts` 一致：
-/// - 目标不存在 → 直接用相对路径
-/// - 目标存在且内容一致（大小相同、mtime 相同或未知）→ 视为已备份，覆盖无副作用
-/// - 目标存在且内容不同 → 重命名为 `原名_MMDDhhmmss.扩展名`，仍冲突则追加序号
-///
-/// 安全：过滤掉路径穿越组件（`..`、`.`），防止恶意文件名写入备份目录之外。
+#[allow(dead_code)]
 pub(crate) fn resolve_target_path(receive_dir: &Path, file: &FileDto) -> PathBuf {
-    // 防路径穿越：过滤掉 `..` 和 `.` 组件
     let rel = Path::new(&file.file_name);
     let mut safe = PathBuf::new();
     for comp in rel.components() {
@@ -87,26 +74,20 @@ pub(crate) fn resolve_target_path(receive_dir: &Path, file: &FileDto) -> PathBuf
             other => safe.push(other.as_os_str()),
         }
     }
-    // 全部被过滤（极端情况）→ 用原始文件名以不丢失文件
     let rel = if safe.as_os_str().is_empty() {
         rel.file_name().map(PathBuf::from).unwrap_or_default()
     } else {
         safe
     };
-    // 绝对路径 → 只保留文件名
     let rel = if rel.is_absolute() {
         rel.file_name().map(PathBuf::from).unwrap_or_default()
     } else {
         rel
     };
     let target = receive_dir.join(&rel);
-
     if !target.exists() {
         return target;
     }
-
-    // 大小写冲突检测（Windows 大小写不敏感）：同目录存在仅大小写不同的路径 → 视为冲突，
-    // 否则 "Photo.jpg" 与 "photo.JPG" 会互相覆盖（ext4/NTFS 语义差异）
     #[cfg(windows)]
     {
         if let Some(parent) = target.parent() {
@@ -118,8 +99,6 @@ pub(crate) fn resolve_target_path(receive_dir: &Path, file: &FileDto) -> PathBuf
                     if p == target {
                         continue;
                     }
-                    // ASCII 忽略大小写比较，免掉逐项 to_lowercase 分配
-                    //（Windows 路径的大小写冲突段实际都是 ASCII）
                     if p.to_string_lossy().eq_ignore_ascii_case(&target_lower) {
                         conflict = true;
                         break;
@@ -147,29 +126,22 @@ pub(crate) fn resolve_target_path(receive_dir: &Path, file: &FileDto) -> PathBuf
             }
         }
     }
-
-    // 已存在：判断是否与即将上传的文件内容一致
     let identical = std::fs::metadata(&target)
         .map(|m| {
             let same_size = m.len() == file.size;
             let same_mtime = match file.metadata.as_ref() {
                 Some(md) => match md.modified.as_deref() {
                     Some(ts) => parse_timestamp_secs(ts) == modified_secs(&m),
-                    // 发送方未提供 mtime → 仅按大小判断
                     None => true,
                 },
-                // 无 metadata（手机端）→ 仅按大小判断
                 None => true,
             };
             same_size && same_mtime
         })
         .unwrap_or(false);
-
     if identical {
         return target;
     }
-
-    // 冲突 → 重命名 _MMDDhhmmss
     let ts_secs = file
         .metadata
         .as_ref()
@@ -190,7 +162,7 @@ pub(crate) fn resolve_target_path(receive_dir: &Path, file: &FileDto) -> PathBuf
     receive_dir.join(candidate)
 }
 
-/// `原名_MMDDhhmmss.扩展名`（与 shared-core `conflictRename` 同规则）
+#[allow(dead_code)]
 pub(crate) fn rename_with_suffix(rel: &Path, suffix: &str) -> PathBuf {
     let parent = rel.parent().unwrap_or_else(|| Path::new(""));
     let name = rel
@@ -204,7 +176,7 @@ pub(crate) fn rename_with_suffix(rel: &Path, suffix: &str) -> PathBuf {
     parent.join(format!("{base}_{suffix}{ext}"))
 }
 
-/// 重命名后仍冲突 → 追加序号 `_N`（与 shared-core `resolveFileName` 一致）
+#[allow(dead_code)]
 pub(crate) fn rename_with_counter(candidate: &Path, counter: u32) -> PathBuf {
     let parent = candidate.parent().unwrap_or_else(|| Path::new(""));
     let name = candidate
@@ -218,7 +190,7 @@ pub(crate) fn rename_with_counter(candidate: &Path, counter: u32) -> PathBuf {
     parent.join(format!("{base}_{counter}{ext}"))
 }
 
-/// 文件 mtime 的 Unix 秒
+#[allow(dead_code)]
 fn modified_secs(m: &std::fs::Metadata) -> Option<i64> {
     m.modified()
         .ok()
@@ -226,7 +198,7 @@ fn modified_secs(m: &std::fs::Metadata) -> Option<i64> {
         .map(|d| d.as_secs() as i64)
 }
 
-/// 解析 LocalSend 时间戳（RFC3339，如 "2025-08-15T08:23:45Z"）为 Unix 秒
+#[allow(dead_code)]
 pub(crate) fn parse_timestamp_secs(ts: &str) -> Option<i64> {
     let Ok(dt) = time::OffsetDateTime::parse(
         ts,
@@ -237,7 +209,7 @@ pub(crate) fn parse_timestamp_secs(ts: &str) -> Option<i64> {
     Some(dt.unix_timestamp())
 }
 
-/// 文件 mtime → RFC3339 字符串（发送端填 FileDto.metadata）
+#[allow(dead_code)]
 pub(crate) fn file_modified_rfc3339(abs_path: &str) -> Option<String> {
     let meta = std::fs::metadata(abs_path).ok()?;
     let modified = meta.modified().ok()?;
@@ -250,14 +222,14 @@ pub(crate) fn file_modified_rfc3339(abs_path: &str) -> Option<String> {
     dt.format(&time::format_description::well_known::Rfc3339).ok()
 }
 
-/// 设置文件 mtime（接收端保留发送方时间戳）
+#[allow(dead_code)]
 pub(crate) fn set_file_mtime(path: &Path, secs: i64) -> std::io::Result<()> {
     let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs.max(0) as u64);
     let f = std::fs::File::options().write(true).open(path)?;
     f.set_modified(t)
 }
 
-/// 当前 UTC Unix 秒
+#[allow(dead_code)]
 pub(crate) fn now_utc_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -265,7 +237,7 @@ pub(crate) fn now_utc_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Unix 秒 → `MMDDhhmmss`（UTC，用于重命名后缀；仅需唯一性，无需本地时区）
+#[allow(dead_code)]
 pub(crate) fn format_mmddhhmmss(secs: i64) -> String {
     let Ok(dt) = time::OffsetDateTime::from_unix_timestamp(secs) else {
         return "0000000000".to_string();
@@ -278,7 +250,7 @@ pub(crate) fn format_mmddhhmmss(secs: i64) -> String {
     dt.format(&fmt).unwrap_or_else(|_| "0000000000".to_string())
 }
 
-/// 根据文件名推断 LocalSend 文件类型（与 shared-core `inferFileType` 一致）
+#[allow(dead_code)]
 pub(crate) fn infer_file_type(name: &str) -> String {
     let lower = name.to_lowercase();
     if lower.ends_with(".jpg")
@@ -308,9 +280,7 @@ pub(crate) fn infer_file_type(name: &str) -> String {
     }
 }
 
-/// 递归扫描目录，返回文件清单（纯逻辑，由 lib.rs 包装层注册为 Tauri 命令）
-///
-/// 重 IO 操作：spawn_blocking 异步执行，避免阻塞 Tauri 命令线程池导致窗口冻结。
+/// 递归扫描目录
 pub async fn scan_directory(dir: String) -> Result<Vec<ScannedEntry>, AppError> {
     crate::log_debug!("扫描目录: {dir}");
     let dir_for_task = dir.clone();
@@ -336,7 +306,6 @@ fn scan_dir_recursive(
         base.join(rel)
     };
     for entry in std::fs::read_dir(&cur).map_err(AppError::from_display)? {
-        // 跳过不可读条目（损坏符号链接、权限不足等），而非中止整个目录扫描
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -357,13 +326,10 @@ fn scan_dir_recursive(
                 continue;
             }
         };
-        // 符号链接：归档备份不跟随链接（rsync -a 隐含 -l 语义），跳过并记录
         if ftype.is_symlink() {
             crate::log_warn!("跳过符号链接（不跟随，归档语义）: {child_rel}");
             continue;
         }
-        // 内部文件/目录（分片、解密临时、聚合批次）不进入清单，避免污染 B 端三路对比。
-        // __chunked__ 同为分片残留名（旧版发送端/异构端落盘命名），一并排除
         if name == ".chunks"
             || name == "__chunked__"
             || name.ends_with(".dec_tmp")
@@ -372,7 +338,6 @@ fn scan_dir_recursive(
             crate::log_debug!("跳过内部文件: {child_rel}");
             continue;
         }
-        // 特殊文件（设备/管道/套接字）：本项目场景极少，跳过并记录（rsync -D 需 root）
         if !ftype.is_file() && !ftype.is_dir() {
             crate::log_warn!("跳过特殊文件（设备/管道/套接字）: {child_rel}");
             continue;

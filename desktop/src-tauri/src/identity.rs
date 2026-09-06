@@ -216,16 +216,6 @@ pub fn get_device_id(app: &AppHandle) -> String {
     get_device_id_no_ctx()
 }
 
-/// 本机公开指纹码（`v3-` + deviceId 前 8 位）。
-/// 手机端在无配对 secret 时用 `SHA-256(targetCode)` 回退加密，
-/// 其中 targetCode 即对端的指纹码（如 `v3-8eeea519`）。
-/// 本函数用于接收端回退解密时用同一口径派生候选密钥，消除"密钥不匹配"全灭问题。
-pub fn get_self_fingerprint_code(app: &AppHandle) -> String {
-    let id = get_device_id(app);
-    let prefix: String = id.chars().take(8).collect();
-    format!("v3-{prefix}")
-}
-
 /// 无句柄变体：deviceId 仅由 MachineGuid 派生，与 Tauri 句柄无关。
 /// 供 http_json_request 等没有 AppHandle 的底层网络上下文注入身份头。
 pub fn get_device_id_no_ctx() -> String {

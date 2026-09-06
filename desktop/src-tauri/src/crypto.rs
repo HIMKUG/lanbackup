@@ -356,6 +356,7 @@ fn seal_block(
 
 /// 流式解密：自动识别多块（版本 0x00000001）与单块（手机端 CipherOutputStream 格式）两种格式。
 /// 非 LSBK 开头 → 返回 Ok(false)（调用方按明文原样保留，不误伤外部文件）。
+#[cfg(test)]
 pub fn decrypt_stream<R: std::io::Read, W: std::io::Write>(
     key: &[u8; 32],
     reader: &mut R,

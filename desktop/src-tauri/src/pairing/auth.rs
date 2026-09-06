@@ -77,14 +77,6 @@ pub fn handle_pairing_conn(
     const FORBIDDEN: &str = r#"{"ok":false,"reason":"untrusted"}"#;
 
     let (status, json) = match (method.as_str(), path.as_str()) {
-        // P2 硬升级：v2 配对/问候/探测端点（/info、/verify）已删除，全面切换 v3 控制面。
-        // 探测走 /api/v3/probe；配对走 /api/v3/handshake/verify（首次）/challenge+verify（重连）。
-        ("POST", "/api/localsend/v2/file-receipt") => {
-            if !request_trusted() { (403, FORBIDDEN.to_string()) } else { handle_file_receipt(&app, &body) }
-        }
-        ("POST", "/api/localsend/v2/unpair") => {
-            if !request_trusted() { (403, FORBIDDEN.to_string()) } else { handle_unpair(&app, &body) }
-        }
         ("POST", "/api/backup/v1/disconnect") => {
             if !request_trusted() { (403, FORBIDDEN.to_string()) } else { handle_disconnect(&app, &body) }
         }
@@ -92,8 +84,6 @@ pub fn handle_pairing_conn(
             if !request_trusted() { (403, FORBIDDEN.to_string()) } else { handle_move_to_delete(&app, &body) }
         }
         ("POST", "/api/backup/v1/cancel") => {
-            // 取消已由 handle_cancel 内部做「可信设备 or 活跃会话」判定，外层不再 403，
-            // 否则手机端取消（仅携带 sessionId）会被无条件拒绝 → 取消不生效（BUG-6）
             handle_cancel(&app, &body)
         }
         ("GET", "/api/backup/v1/chunk-status") => {
@@ -102,10 +92,6 @@ pub fn handle_pairing_conn(
         ("GET", "/api/backup/v1/manifest") => {
             if !request_trusted() { (403, FORBIDDEN.to_string()) } else { handle_manifest(&app) }
         }
-        ("POST", "/api/localsend/v2/sync-dir") => {
-            if !request_trusted() { (403, FORBIDDEN.to_string()) } else { handle_sync_dir(&app, &body) }
-        }
-        // —— v3 控制面（方案.txt §三）：probe / handshake/challenge / handshake/verify ——
         (m, p) if p.starts_with("/api/v3/") => {
             crate::pairing::v3::route_v3(&app, m, p, &body, &client_ip, &headers)
                 .unwrap_or_else(|e| (500, format!(r#"{{"error":{{"code":"INVALID_REQUEST","message":"{e}","requestId":""}}}}"#)))
@@ -242,9 +228,11 @@ fn parse_request(req: &str) -> (String, String, String, String, std::collections
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// 路由分支：file-receipt / unpair / disconnect / move-to-delete / cancel / sync-dir
+// 路由分支：disconnect / move-to-delete / cancel / chunk-status / manifest
+// （handle_file_receipt / handle_unpair / handle_sync_dir 已移除：旧版 v2 端点）
 // ═══════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 fn handle_file_receipt(app: &AppHandle, body: &str) -> (i32, String) {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         let file_name = v.get("fileName").and_then(|x| x.as_str()).unwrap_or("");
@@ -254,6 +242,7 @@ fn handle_file_receipt(app: &AppHandle, body: &str) -> (i32, String) {
     (200, r#"{"ok":true}"#.to_string())
 }
 
+#[allow(dead_code)]
 fn handle_unpair(app: &AppHandle, body: &str) -> (i32, String) {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         if let Some(device_id) = v.get("deviceId").and_then(|d| d.as_str()) {
@@ -344,6 +333,7 @@ fn handle_cancel(app: &AppHandle, body: &str) -> (i32, String) {
     (200, r#"{"ok":true}"#.to_string())
 }
 
+#[allow(dead_code)]
 fn handle_sync_dir(app: &AppHandle, body: &str) -> (i32, String) {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         if let (Some(dir), Some(name)) = (

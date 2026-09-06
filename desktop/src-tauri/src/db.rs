@@ -724,8 +724,8 @@ mod tests {
         assert!(db.load_static_key().unwrap().is_none());
 
         // 首次保存 → 加载一致（B1 回归：此前 zeroblob 占位 + 条件 UPDATE 导致永不写入）
-        let priv_b64 = BASE64_STD.encode([7u8; 32]);
-        let pub_b64 = BASE64_STD.encode([9u8; 33]);
+        let priv_b64 = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let pub_b64 = URL_SAFE_NO_PAD.encode([9u8; 33]);
         db.save_static_key(&priv_b64, &pub_b64).unwrap();
         let loaded = db.load_static_key().unwrap().unwrap();
         assert_eq!(loaded.0, priv_b64);
@@ -737,7 +737,7 @@ mod tests {
         assert_eq!(again.0, priv_b64);
 
         // 覆盖保存 → 读到新值
-        let priv_b64b = BASE64_STD.encode([8u8; 32]);
+        let priv_b64b = URL_SAFE_NO_PAD.encode([8u8; 32]);
         db.save_static_key(&priv_b64b, &pub_b64).unwrap();
         assert_eq!(db.load_static_key().unwrap().unwrap().0, priv_b64b);
     }
@@ -749,12 +749,12 @@ mod tests {
 
         // 先落 ECDH static key，再保存签名 key → static key 必须原样保留
         // （回归：save_sig_key 的 UPSERT 冲突分支曾可能触碰 static_priv/static_pub）
-        let s_priv = BASE64_STD.encode([1u8; 32]);
-        let s_pub = BASE64_STD.encode([2u8; 33]);
+        let s_priv = URL_SAFE_NO_PAD.encode([1u8; 32]);
+        let s_pub = URL_SAFE_NO_PAD.encode([2u8; 33]);
         db.save_static_key(&s_priv, &s_pub).unwrap();
 
-        let sig_priv = BASE64_STD.encode([3u8; 32]);
-        let sig_pub = BASE64_STD.encode([4u8; 33]);
+        let sig_priv = URL_SAFE_NO_PAD.encode([3u8; 32]);
+        let sig_pub = URL_SAFE_NO_PAD.encode([4u8; 33]);
         db.save_sig_key(&sig_priv, &sig_pub).unwrap();
 
         let loaded_static = db.load_static_key().unwrap().unwrap();
