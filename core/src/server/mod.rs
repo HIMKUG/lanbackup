@@ -204,6 +204,11 @@ impl SessionStore {
         *self.piece_cache.write().unwrap() = cache;
     }
 
+    /// 合并对端记录到 PeerStore（桌面端从 PairingState 同步已配对设备）。
+    pub async fn merge_peer(&self, record: control::PeerRecord) {
+        self.peers.merge(record).await;
+    }
+
     /// 设置用户线下输入的连接码（路径 A 首配用）。绝不经过网络。
     /// 入口统一做 E8 规范化（[`crate::identity::normalize_connection_code`]，
     /// 严格版：只保留 `[A-Z0-9]` 并统一大写）。

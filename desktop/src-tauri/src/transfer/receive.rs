@@ -15,6 +15,88 @@ use super::*;
 use base64::Engine;
 use lanbackup_core::server::{serve_request, SessionStore, hyper_http1_builder};
 use lanbackup_core::dto::DeviceType;
+use lanbackup_core::pairing::trust::TrustRecord;
+use lanbackup_core::dto::handshake::PairingState as TrustPairingState;
+use std::sync::Arc;
+
+async fn sync_paired_peers_to_store(store: &Arc<SessionStore>, app: &AppHandle) {
+    let pairing_state = app.state::<PairingState>();
+    let paired = match pairing_state.paired.lock() {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            crate::log_warn!("sync_paired_peers_to_store: paired lock 获取失败");
+            return;
+        }
+    };
+    let secrets = pairing_state.secrets.blocking_read();
+
+    for (device_id, record) in paired.iter() {
+        let status = record
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let trust_state = match status {
+            "ACTIVE" => TrustPairingState::Active,
+            "PENDING" | "REVOKE_PENDING" => TrustPairingState::Pending,
+            "REVOKED" | "DELETED" => TrustPairingState::Revoked,
+            _ => {
+                crate::log_debug!("sync_paired_peers_to_store: 跳过非活跃状态 deviceId={} status={}", device_id, status);
+                continue;
+            }
+        };
+
+        let alias = record
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let peer_public_key = record
+            .get("peerPublicKey")
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(s)
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+
+        let pairing_secret = secrets
+            .get(device_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let trust = {
+            let mut t = TrustRecord::new();
+            if let Ok(_) = t.apply(lanbackup_core::pairing::machine::PairingEvent::PeerConfirmed) {
+            }
+            t.state = trust_state;
+            t
+        };
+
+        let peer_record = lanbackup_core::server::control::PeerRecord::new(
+            device_id,
+            &alias,
+            peer_public_key,
+            pairing_secret,
+            trust,
+        );
+
+        store.merge_peer(peer_record).await;
+
+        crate::log_debug!(
+            "sync_paired_peers_to_store: 同步 deviceId={} alias={} state={:?}",
+            device_id,
+            alias,
+            trust_state
+        );
+    }
+    crate::log_info!(
+        "配对状态已同步进 core PeerStore: {} 条（含非活跃）",
+        paired.len()
+    );
+}
 
 pub async fn start_receiver(
     app: AppHandle,
@@ -56,6 +138,11 @@ pub async fn start_receiver(
     let store = SessionStore::open(identity, &alias, DeviceType::Desktop, Some(&persist_dir));
     store.with_base_dir(receive_dir.clone().into());
     let store = Arc::new(store);
+
+    // Step2 收尾：将 PairingState.paired 中已配对的记录同步进 core PeerStore，
+    // 使 v4 控制面（unpair-request / sync-status / revoke-ack）能够查询对端信息。
+    // 已在 load_paired_from_db 中从 SQLite 恢复数据，此处仅作合并写入。
+    sync_paired_peers_to_store(&store, &app).await;
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
     let listener = match tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await {

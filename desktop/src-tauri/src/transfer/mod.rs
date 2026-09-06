@@ -422,16 +422,17 @@ pub fn handle_pairing_conn(
 }
 
 #[allow(dead_code)]
-pub fn send_unpair(ip: String, port: u16, device_id: String) -> Result<bool, AppError> {
-    let body = serde_json::json!({"deviceId": device_id}).to_string();
-    let v = http_json_request(&ip, port + 1, "POST", "/api/localsend/v2/unpair", &body)?;
-    Ok(v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
+pub fn send_unpair(_ip: String, _port: u16, _device_id: String) -> Result<bool, AppError> {
+    Err(AppError("send_unpair 已废弃，请使用 unpair_peer（store.rs）".to_string()))
 }
 
 pub async fn move_to_delete(ip: String, port: u16, files: Vec<String>) -> Result<usize, AppError> {
-    let body = serde_json::json!({"files": files}).to_string();
+    let body = serde_json::json!({
+        "deviceId": crate::identity::get_device_id_no_ctx(),
+        "relPaths": files,
+    }).to_string();
     tauri::async_runtime::spawn_blocking(move || {
-        let v = http_json_request(&ip, port + 1, "POST", "/api/backup/v1/move-to-delete", &body)?;
+        let v = http_json_request(&ip, port, "POST", "/api/v4/move-to-delete", &body)?;
         Ok(v.get("moved").and_then(|x| x.as_u64()).unwrap_or(0) as usize)
     })
     .await
@@ -440,7 +441,7 @@ pub async fn move_to_delete(ip: String, port: u16, files: Vec<String>) -> Result
 
 pub fn send_disconnect(ip: String, port: u16, device_id: String) -> Result<bool, AppError> {
     let body = serde_json::json!({"deviceId": device_id}).to_string();
-    let v = http_json_request(&ip, port + 1, "POST", "/api/backup/v1/disconnect", &body)?;
+    let v = http_json_request(&ip, port, "POST", "/api/v4/disconnect", &body)?;
     Ok(v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
 }
 
@@ -553,7 +554,9 @@ pub fn spawn_receiver_watchdog(app: AppHandle) {
 }
 
 pub fn get_peer_manifest(ip: String, port: u16) -> Result<serde_json::Value, AppError> {
-    http_json_request(&ip, port + 1, "GET", "/api/backup/v1/manifest", "")
+    let self_id = crate::identity::get_device_id_no_ctx();
+    let path = format!("/api/v4/manifest?deviceId={}", self_id);
+    http_json_request(&ip, port, "GET", &path, "")
 }
 
 #[cfg(test)]

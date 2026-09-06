@@ -419,15 +419,20 @@ pub fn load_paired_from_db(app: &AppHandle) {
     }
 }
 
-/// 通知目标设备本机选择的备份目录名（POST /sync-dir 于配对服务端口+1）
+/// 通知目标设备本机选择的备份目录名（POST /api/v4/sync-dir，直连对端 receive port）
 pub fn send_sync_dir(
     ip: String,
     port: u16,
     direction: String,
     name: String,
 ) -> Result<bool, AppError> {
-    let body = serde_json::json!({"direction": direction, "name": name}).to_string();
-    let v = http_json_request(&ip, port + 1, "POST", "/api/localsend/v2/sync-dir", &body)?;
+    let body = serde_json::json!({
+        "deviceId": crate::identity::get_device_id_no_ctx(),
+        "rootId": "default",
+        "targetDir": name,
+        "strategy": direction,
+    }).to_string();
+    let v = http_json_request(&ip, port, "POST", "/api/v4/sync-dir", &body)?;
     Ok(v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
 }
 
@@ -476,58 +481,50 @@ fn sig_rand_nonce() -> String {
     hex::encode(b)
 }
 
-/// 在线解配对：主动通知对方解除（POST /api/v3/unpair-request，带本机 ECDSA 签名）。
+/// 在线解配对：POST /api/v4/unpair-request（直连对端 receive port）。
+/// 签名：frame(DOMAIN_UNPAIR, [deviceId, requestId])，由 core pairing::transcript::unpair_payload 构造。
 pub fn unpair_request_remote(app: &AppHandle, ip: String, port: u16, target_device_id: String) -> Result<serde_json::Value, AppError> {
     let my_id = crate::identity::get_device_id_no_ctx();
-    let ts = sig_now_ts();
+    let request_id = hex::encode(rand::random::<[u8; 16]>());
     let (sig_priv, _pub) = crate::transfer::get_or_create_sig_key(app);
-    let msg = sig_buf(b"localsend-v3/unpair-request", &[&my_id, &target_device_id, &ts]);
-    let signature = crate::crypto::sig_sign(&sig_priv, &msg).map_err(AppError::from_display)?;
+    let payload = lanbackup_core::pairing::transcript::unpair_payload(&my_id, &request_id)
+        .ok_or_else(|| AppError("unpair_payload 构造失败".to_string()))?;
+    let signature = crate::crypto::sig_sign(&sig_priv, &payload).map_err(AppError::from_display)?;
     let body = serde_json::json!({
-        "issuerDeviceId": my_id,
-        "targetDeviceId": target_device_id,
-        "timestamp": ts,
+        "deviceId": my_id,
         "signature": signature,
+        "requestId": request_id,
     })
     .to_string();
-    crate::transfer::http_json_request(&ip, port + 1, "POST", "/api/v3/unpair-request", &body)
+    crate::transfer::http_json_request(&ip, port, "POST", "/api/v4/unpair-request", &body)
 }
 
-/// A 上线状态同步：主动告知对端本机上线（POST /api/v3/sync-status，带签名）。
-/// 返回对端响应（含可能携带的吊销令牌 revokeToken）。
+/// A 上线状态同步：GET /api/v4/sync-status?deviceId=...（直连对端 receive port）。
+/// 返回对端视角下"你还认我吗"的回答。
 pub fn sync_peer_status(app: &AppHandle, ip: String, port: u16, target_device_id: String) -> Result<serde_json::Value, AppError> {
     let my_id = crate::identity::get_device_id_no_ctx();
-    let ts = sig_now_ts();
-    let (sig_priv, _pub) = crate::transfer::get_or_create_sig_key(app);
-    let msg = sig_buf(b"localsend-v3/sync-status", &[&my_id, &target_device_id, &ts]);
-    let signature = crate::crypto::sig_sign(&sig_priv, &msg).map_err(AppError::from_display)?;
-    let body = serde_json::json!({
-        "issuerDeviceId": my_id,
-        "targetDeviceId": target_device_id,
-        "timestamp": ts,
-        "signature": signature,
-    })
-    .to_string();
-    crate::transfer::http_json_request(&ip, port + 1, "POST", "/api/v3/sync-status", &body)
+    let path = format!("/api/v4/sync-status?deviceId={}", my_id);
+    crate::transfer::http_json_request(&ip, port, "GET", &path, "")
 }
 
-/// A 收到吊销令牌后确认（POST /api/v3/revoke-ack，带签名，§5.2 步骤 5）。
+/// A 收到吊销通知后确认：POST /api/v4/revoke-ack（直连对端 receive port）。
 pub fn send_revoke_ack(app: &AppHandle, ip: String, port: u16, target_device_id: String, token: &serde_json::Value) -> Result<serde_json::Value, AppError> {
-    let issued_at = token.get("issuedAt").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let nonce = token.get("nonce").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let my_id = crate::identity::get_device_id_no_ctx();
+    let revoke_token = token.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
+    let request_id = hex::encode(rand::random::<[u8; 16]>());
     let (sig_priv, _pub) = crate::transfer::get_or_create_sig_key(app);
-    let msg = sig_buf(b"localsend-v3/revoke-ack", &[&my_id, &target_device_id, &issued_at, &nonce]);
-    let signature = crate::crypto::sig_sign(&sig_priv, &msg).map_err(AppError::from_display)?;
+    let payload = lanbackup_core::pairing::transcript::revoke_payload(&my_id, revoke_token)
+        .ok_or_else(|| AppError("revoke_payload 构造失败".to_string()))?;
+    let signature = crate::crypto::sig_sign(&sig_priv, &payload).map_err(AppError::from_display)?;
     let body = serde_json::json!({
-        "issuerDeviceId": my_id,
-        "targetDeviceId": target_device_id,
-        "issuedAt": issued_at,
-        "nonce": nonce,
+        "deviceId": my_id,
+        "revokeToken": revoke_token,
+        "pairingRevoked": true,
         "signature": signature,
+        "requestId": request_id,
     })
     .to_string();
-    crate::transfer::http_json_request(&ip, port + 1, "POST", "/api/v3/revoke-ack", &body)
+    crate::transfer::http_json_request(&ip, port, "POST", "/api/v4/revoke-ack", &body)
 }
 
 /// 生成吊销令牌（本机为 issuer，target 为要解除的对方）

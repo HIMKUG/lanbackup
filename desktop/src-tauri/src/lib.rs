@@ -239,7 +239,6 @@ pub fn run() {
             commands::v3_pair,
             commands::v4_probe,
             commands::v4_pair,
-            commands::send_unpair,
             commands::unpair_peer,
             commands::sync_all_peers,
             commands::reset_all_pairings,
@@ -642,17 +641,6 @@ mod commands {
             Ok(())
         })
         .await?
-    }
-
-    #[tauri::command]
-    pub async fn send_unpair(ip: String, port: u16, device_id: String) -> Result<bool, AppError> {
-        cmd_log!(
-            logger::LogLevel::Info,
-            "send_unpair",
-            "入口 目标={ip}:{port} deviceId={}",
-            logger::mask(&device_id)
-        );
-        run_blocking(move || transfer::send_unpair(ip, port, device_id)).await?
     }
 
     /// v5：解除配对统一入口（在线直连 / 离线 REVOKE_PENDING + 吊销令牌）
