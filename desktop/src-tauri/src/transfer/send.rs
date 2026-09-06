@@ -12,6 +12,7 @@
 //! Decision-IO 分离原则 —— SessionDriver 只做决策，desktop 负责所有 IO。
 
 use super::*;
+use hex;
 
 use lanbackup_core::dto::session::{
     SessionRegisterRequest, FileMeta as CoreFileMeta,
@@ -21,6 +22,7 @@ use lanbackup_core::dto::session::{
 use lanbackup_core::transfer::session::{SessionDriver, Step, Outcome, Applied, SessionError};
 #[allow(unused_imports)]
 use lanbackup_core::transfer::chunk::{ChunkPlan, PIECE_SIZE, BASIC_CHUNK_SIZE, PIECES_PER_BLOCK, strong_checksum, weak_checksum, PieceHash};
+use lanbackup_core::transfer::{PieceHashCache, PieceCacheKey, piece_count};
 use lanbackup_core::version::{Capabilities, CAP_ADVANCED};
 
 pub async fn send_files(
@@ -254,6 +256,7 @@ pub async fn send_files(
             size: None,
         });
     }
+    let chunked_count = chunked_items.len();
     upload_items.extend(chunked_items);
     upload_items.extend(normal.iter().cloned());
     let batch_count = batch_tmp.len();
@@ -380,6 +383,14 @@ pub async fn send_files(
 
     let sched = app.state::<crate::scheduler::SendScheduler>();
     let store = app.state::<session_store::DesktopSessionStore>();
+    let cache = std::sync::Arc::new(PieceHashCache::new());
+    let mut piece_hex_cache: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for (i, f) in normal.iter().enumerate() {
+        let file_id = format!("f{}", batch_count + chunked_count + i);
+        if let Some(hexes) = compute_piece_hexes(&cache, &f.abs_path, sizes[batch_count + chunked_count + i]) {
+            piece_hex_cache.insert(file_id, hexes);
+        }
+    }
     let _peer_session_id = sched.add_peer(target_ip.clone(), target_port).await;
     sched.set_peer_state(&target_ip, target_port, crate::scheduler::SessionState::Sending).await;
     let session_files: Vec<session_store::FileManifest> = sched_plans
@@ -1095,4 +1106,33 @@ async fn query_confirmed_pieces(
         return None;
     }
     Some(confirmed)
+}
+
+fn compute_piece_hexes(
+    cache: &std::sync::Arc<PieceHashCache>,
+    abs_path: &str,
+    file_size: u64,
+) -> Option<Vec<String>> {
+    let path = std::path::Path::new(abs_path);
+    let key = PieceCacheKey::from_path(path, file_size)?;
+    let piece_cnt = piece_count(file_size);
+    let hexes = cache.build_piece_hashes(key, piece_cnt, |piece_idx| {
+        let offset = piece_idx * PIECE_SIZE;
+        let remain = file_size.saturating_sub(offset);
+        let this_size = remain.min(PIECE_SIZE) as usize;
+        if this_size == 0 {
+            return vec![];
+        }
+        let mut read_buf = vec![0u8; this_size];
+        if let Ok(mut f) = std::fs::File::open(path) {
+            use std::io::{Read, Seek, SeekFrom};
+            if f.seek(SeekFrom::Start(offset)).is_ok() {
+                if f.read_exact(&mut read_buf).is_ok() {
+                    return read_buf;
+                }
+            }
+        }
+        vec![]
+    });
+    Some(hexes.into_iter().map(|p| hex::encode(p.strong)).collect())
 }

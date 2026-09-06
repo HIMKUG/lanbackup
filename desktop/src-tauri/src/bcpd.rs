@@ -30,7 +30,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::identity;
 
-/// 加密存在广播使用的组播组 / 端口（本协议专用，与 LocalSend v2 发现(224.0.0.167:53317) 隔离）
+/// 加密存在广播使用的组播组 / 端口（与 LocalSend 无关）
 const BCPD_GROUP: &str = "239.255.42.42";
 const BCPD_PORT: u16 = 53319;
 /// 发送周期；离线判定超时 = 周期 × 4（约 12s），留 1 个周期余量防抖动误判

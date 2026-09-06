@@ -31,8 +31,10 @@ use crate::identity::DeviceIdentity;
 use crate::routes;
 use crate::server::control::{HandshakeStore, PeerStore};
 use crate::state::transfer::{TransferEvent, TransferState};
+use crate::transfer::atomic_file::{self, ConflictOutcome};
 use crate::transfer::chunk::piece_count;
 use crate::transfer::cleanup::{CleanupPlan, CleanupTrigger};
+use crate::transfer::piece_cache::PieceHashCache;
 
 pub mod control;
 pub mod sync_api;
@@ -130,6 +132,9 @@ pub struct SessionStore {
     pub(crate) sync: sync_api::SyncStore,
     /// 可选持久化后端。`None` = 纯内存（测试 / 尚未接 db）。
     pub(crate) persist: Option<Arc<persist::SessionPersister>>,
+    pub(crate) base_dir: std::sync::RwLock<std::path::PathBuf>,
+    pub(crate) piece_cache: std::sync::RwLock<PieceHashCache>,
+    pending_parts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>>>,
 }
 
 impl SessionStore {
@@ -151,15 +156,6 @@ impl SessionStore {
         Self::open(identity, alias, device_type, None)
     }
 
-    /// 构造 store，可选接持久化。
-    ///
-    /// - `persist_dir: Some(dir)`：打开（建）该目录下的 `meta/` + `pieces/`，
-    ///   并把磁盘上**未终态**的会话整组捞回内存。持久化打不开时**降级为纯内存**
-    ///   （打日志，不让整个服务起不来）。
-    /// - `persist_dir: None`：纯内存，与原 MVP 行为一致（也用于单元测试）。
-    ///
-    /// 平台层应传入 App 私有数据目录；该目录支持同盘 rename，与 M20「SAF 无
-    /// 跨目录 rename」无涉（那条约束针对的是把收到的备份文件搬进用户自选位置）。
     pub fn open(
         identity: DeviceIdentity,
         alias: &str,
@@ -177,7 +173,6 @@ impl SessionStore {
             None => None,
         };
 
-        // 冷启动重载：把磁盘上的未终态会话恢复进内存热表
         let mut inner = HashMap::new();
         if let Some(p) = &persist {
             match p.load_all() {
@@ -195,7 +190,18 @@ impl SessionStore {
             handshake: HandshakeStore::new(),
             sync: sync_api::SyncStore::new(),
             persist,
+            base_dir: std::sync::RwLock::new(std::path::PathBuf::new()),
+            piece_cache: std::sync::RwLock::new(PieceHashCache::new()),
+            pending_parts: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    pub fn with_base_dir(self: &Arc<Self>, base_dir: std::path::PathBuf) {
+        *self.base_dir.write().unwrap() = base_dir;
+    }
+
+    pub fn with_piece_cache(self: &Arc<Self>, cache: PieceHashCache) {
+        *self.piece_cache.write().unwrap() = cache;
     }
 
     /// 设置用户线下输入的连接码（路径 A 首配用）。绝不经过网络。
@@ -372,7 +378,7 @@ pub async fn route(
         (Method::GET, routes::SESSION_PHASE) => handle_phase(store, path).await,
         (Method::POST, routes::SESSION_HEARTBEAT) => handle_heartbeat(store, body).await,
         (Method::POST, routes::SESSION_ABORT) => handle_abort(store, body).await,
-        (Method::POST, routes::SESSION_CHUNK) => handle_chunk(store, body).await,
+        (Method::POST, routes::SESSION_CHUNK) => handle_chunk(store, path, body).await,
         (Method::GET, routes::SESSION_DIFF) => handle_diff(store, path).await,
         (Method::GET, routes::SESSION_VERIFY) => handle_verify(store, path).await,
         (Method::POST, routes::SESSION_RECEIPT) => handle_receipt(store, body).await,
@@ -682,37 +688,32 @@ async fn handle_abort(store: &Arc<SessionStore>, body: &[u8]) -> Response<Full<b
     }))
 }
 
-async fn handle_chunk(store: &Arc<SessionStore>, body: &[u8]) -> Response<Full<bytes::Bytes>> {
-    #[derive(serde::Deserialize)]
-    struct Chunk {
-        #[serde(rename = "sessionId")]
-        session_id: String,
-        #[serde(rename = "fileId")]
-        file_id: String,
-        #[serde(rename = "pieceIndex")]
-        piece_index: u64,
-        /// 本端落盘后自算的该 piece SHA-256（hex）。可选：
-        /// 基础算法降级路径不逐块算哈希，此时缺失是正常的。
-        #[serde(default)]
-        sha256: Option<String>,
-    }
-    let c: Chunk = match parse_body(body) {
-        Ok(r) => r,
-        Err(e) => return err_response(ErrorCode::BadRequest, &e),
+async fn handle_chunk(store: &Arc<SessionStore>, path: &str, body: &[u8]) -> Response<Full<bytes::Bytes>> {
+    let session_id = match extract_query(path, "sessionId") {
+        Some(s) if !s.is_empty() => s,
+        _ => return err_response(ErrorCode::BadRequest, "缺少 sessionId 参数"),
     };
+    let file_id = match extract_query(path, "fileId") {
+        Some(s) if !s.is_empty() => s,
+        _ => return err_response(ErrorCode::BadRequest, "缺少 fileId 参数"),
+    };
+    let piece_index: u64 = match extract_query(path, "pieceIndex") {
+        Some(s) => s.parse().map_err(|_| "pieceIndex 必须是整数").unwrap_or(0),
+        None => 0,
+    };
+    let client_sha256 = extract_query(path, "sha256").map(|s| s.to_lowercase());
+
     let mut guard = store.inner.lock().await;
-    let rec = match guard.get_mut(&c.session_id) {
+    let rec = match guard.get_mut(&session_id) {
         Some(r) => r,
         None => return err_response(ErrorCode::NotFound, "会话不存在"),
     };
-    if !rec.files.contains_key(&c.file_id) {
+    if !rec.files.contains_key(&file_id) {
         return err_response(ErrorCode::NotFound, "文件未登记");
     }
-    // 首次分块：Preparing/Reconciling → Transferring（NegotiateBasic 路径的 MVP）
-    if matches!(
-        rec.phase,
-        TransferState::Preparing | TransferState::Reconciling
-    ) {
+    let file_meta = rec.files.get(&file_id).unwrap();
+
+    if matches!(rec.phase, TransferState::Preparing | TransferState::Reconciling) {
         let ev = if rec.algorithm == Algorithm::Advanced {
             TransferEvent::NegotiateAdvanced
         } else {
@@ -722,46 +723,97 @@ async fn handle_chunk(store: &Arc<SessionStore>, body: &[u8]) -> Response<Full<b
             Ok(next) => rec.phase = next,
             Err(il) => return err_response(ErrorCode::IllegalState, il.reason),
         }
-        // Advanced 需先 Reconciled 才到 Transferring；MVP 直接走 NegotiateBasic 演示
         if rec.phase == TransferState::Reconciling {
             if let Ok(next) = rec.phase.transition(TransferEvent::Reconciled) {
                 rec.phase = next;
             }
         }
     }
-    rec.confirmed
-        .entry(c.file_id.clone())
-        .or_default()
-        .insert(c.piece_index);
-    // S3：FileUpload 续期 —— 活跃长传输在这里持续续期，不会被闲置巡检误杀。
+
     rec.last_activity = std::time::Instant::now();
-    if let Some(sha) = c.sha256.as_deref() {
-        rec.piece_sha
-            .entry(c.file_id.clone())
-            .or_default()
-            .insert(c.piece_index, sha.to_ascii_lowercase());
+
+    let base_dir = store.base_dir.read().unwrap().clone();
+    let rel_path = &file_meta.rel_path;
+    let final_path = if base_dir.as_os_str().is_empty() {
+        std::path::PathBuf::from(rel_path)
+    } else {
+        base_dir.join(rel_path)
+    };
+    let part_path = atomic_file::part_path(&final_path, &session_id, &file_id);
+
+    if let Some(parent) = final_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    match atomic_file::resolve_conflict(&final_path, file_meta.size, file_meta.mtime) {
+        Ok(ConflictOutcome::Identical) => {
+            rec.confirmed.entry(file_id.clone()).or_default().insert(piece_index);
+            if let Some(sha) = &client_sha256 {
+                rec.piece_sha.entry(file_id.clone()).or_default().insert(piece_index, sha.clone());
+            }
+            rec.bitmap_version += 1;
+            if let Some(p) = &store.persist {
+                p.update_session(&session_id, rec.phase, rec.algorithm, rec.degrade_reason, rec.bitmap_version);
+                p.set_piece(&session_id, &file_id, piece_index, client_sha256.as_deref());
+            }
+            return ok_json(json!({
+                "sessionId": session_id,
+                "fileId": file_id,
+                "pieceIndex": piece_index,
+                "phase": to_phase(rec.phase),
+                "bitmapVersion": rec.bitmap_version,
+            }));
+        }
+        Ok(ConflictOutcome::Renamed(_)) | Ok(ConflictOutcome::None) => {}
+        Err(e) => return err_response(ErrorCode::Internal, &format!("冲突检查失败: {e}")),
+    }
+
+    let _ = std::fs::OpenOptions::new()
+         .create(true)
+         .append(true)
+         .open(&part_path)
+         .map_err(|e| err_response(ErrorCode::Internal, &format!("打开临时文件失败: {e}")))
+         .and_then(|mut f| {
+             std::io::Write::write_all(&mut f, body)
+                 .map_err(|e| err_response(ErrorCode::Internal, &format!("写入分块失败: {e}")))
+         });
+
+    {
+        let mut pending = store.pending_parts.lock().unwrap();
+        pending.entry(file_id.clone()).or_insert_with(|| part_path.clone());
+    }
+
+    rec.confirmed.entry(file_id.clone()).or_default().insert(piece_index);
+    if let Some(ref sha) = client_sha256 {
+        rec.piece_sha.entry(file_id.clone()).or_default().insert(piece_index, sha.clone());
     }
     rec.bitmap_version += 1;
-    // 写穿持久化：会话状态 + 这一块（保证重启后能续传，而非全量重传）
-    if let Some(p) = &store.persist {
-        p.update_session(
-            &c.session_id,
-            rec.phase,
-            rec.algorithm,
-            rec.degrade_reason,
-            rec.bitmap_version,
-        );
-        p.set_piece(
-            &c.session_id,
-            &c.file_id,
-            c.piece_index,
-            c.sha256.as_deref(),
-        );
+
+    let piece_count = piece_count(file_meta.size);
+    let all_confirmed = rec.confirmed.get(&file_id).map(|s| s.len() as u64 == piece_count).unwrap_or(false);
+    if all_confirmed {
+        if let Err(e) = atomic_file::commit(&part_path, &final_path) {
+            return err_response(ErrorCode::Internal, &format!("原子提交失败: {e}"));
+        }
+        if let Err(e) = atomic_file::restore_mtime(&final_path, file_meta.mtime) {
+            log::warn!("恢复 mtime 失败: {e}");
+        }
+        {
+            let mut pending = store.pending_parts.lock().unwrap();
+            pending.remove(&file_id);
+        }
+        log::info!("文件落盘完成: {}", rel_path);
     }
+
+    if let Some(p) = &store.persist {
+        p.update_session(&session_id, rec.phase, rec.algorithm, rec.degrade_reason, rec.bitmap_version);
+        p.set_piece(&session_id, &file_id, piece_index, client_sha256.as_deref());
+    }
+
     ok_json(json!({
-        "sessionId": c.session_id,
-        "fileId": c.file_id,
-        "pieceIndex": c.piece_index,
+        "sessionId": session_id,
+        "fileId": file_id,
+        "pieceIndex": piece_index,
         "phase": to_phase(rec.phase),
         "bitmapVersion": rec.bitmap_version,
     }))

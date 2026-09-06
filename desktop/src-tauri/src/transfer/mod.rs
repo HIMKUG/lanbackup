@@ -1,18 +1,15 @@
 //! 传输模块
 //!
-//! 基于 LocalSend v2 HTTP 协议，核心接入 lanbackup-core V4：
-//! - DTO 类型使用 core dto::session 定义（FileDto 本地重导出以兼容现存结构）
-//! - 发送端使用 reqwest 直接调用 v4 端点（替代 LsHttpClientV2）
-//! - 接收端使用 core::server::SessionStore 启动 HTTP 服务（替代 start_with_port）
-//! - crypto、identity、scheduler 保留本地实现（待后续合并到 core）
+//! 基于 V4 HTTP 协议，核心接入 lanbackup-core：
+//! - DTO 类型使用 core dto::session 定义
+//! - 发送端使用 SessionDriver + V4 端点
+//! - 接收端使用 core::server::SessionStore 启动 HTTP 服务
 //!
 //! 模块拆分：
 //! - `util`：路径/时间戳/文件类型等通用工具函数
-//! - `v3`：v3 控制面客户端（probe / handshake）与 HTTP 请求工具（独立协议，保留）
 //! - `store`：配对记录持久化（SQLite）与同步
-//! - `send`：发送端流程（send_files / 上传 / 分片）
+//! - `send`：发送端流程（SessionDriver 驱动）
 //! - `receive`：接收端流程（服务器启动 / 事件循环 / 解密合并）
-//! 子模块通过 `pub use ...::*` 重导出，外部 `crate::transfer::xxx` 引用保持不变。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -28,11 +25,12 @@ use crate::db::AppError;
 use crate::identity;
 use crate::session_store;
 
+pub mod v3;
+
 mod send;
 mod receive;
 mod store;
 mod util;
-mod v3;
 
 pub use send::*;
 pub use receive::*;

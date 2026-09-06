@@ -40,6 +40,7 @@ pub async fn start_receiver(
 
     let identity = lanbackup_core::identity::DeviceIdentity::generate();
     let store = SessionStore::open(identity, &alias, DeviceType::Desktop, Some(&persist_dir));
+    store.with_base_dir(receive_dir.clone().into());
     let store = Arc::new(store);
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(());

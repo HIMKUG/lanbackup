@@ -92,8 +92,8 @@ pub fn handle_pairing_conn(
         ("GET", "/api/backup/v1/manifest") => {
             if !request_trusted() { (403, FORBIDDEN.to_string()) } else { handle_manifest(&app) }
         }
-        (m, p) if p.starts_with("/api/v3/") => {
-            crate::pairing::v3::route_v3(&app, m, p, &body, &client_ip, &headers)
+        (m, p) if p.starts_with("/api/v4/") => {
+            crate::pairing::v4::route_v4(&app, m, p, &body, &client_ip, &headers)
                 .unwrap_or_else(|e| (500, format!(r#"{{"error":{{"code":"INVALID_REQUEST","message":"{e}","requestId":""}}}}"#)))
         }
         _ => (404, r#"{"error":"not_found"}"#.to_string()),

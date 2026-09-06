@@ -27,14 +27,6 @@ serde_json = "1"
 # 使用 bundled 编译 SQLite 从源码（开发阶段暂不启用 SQLCipher，需 OpenSSL 环境）
 # 要启用加密：将 features 改为 ["bundled", "sqlcipher"] 并确保 OPENSSL_DIR 环境变量指向 OpenSSL 安装目录
 rusqlite = { version = "0.31", features = ["bundled"] }
-# LocalSend 核心：HTTP 传输（v2 协议客户端 + 服务端）+ 设备发现
-# http feature 自动包含 crypto（mTLS 证书等），这里用纯 HTTP 时 tls_config 传 None 即可
-#
-# 2026-08-29：改为指向仓库内的 vendored 副本，详见 third_party/localsend/VENDOR.md。
-# 原路径 ../../../docs/localsend-main/packages/core 位于仓库之外，导致
-#   ① 换机器 clone 后 cargo build 直接失败 ② 上游无版本控制，本地修改不可追溯
-# V4 阶段 2 将吸收其 HTTP 管道并删除 V2 协议层，届时本依赖项可能整体移除。
-localsend = { path = "../../third_party/localsend", features = ["http", "multicast"] }
 # V4 核心：协议与算法只此一份实现，桌面端直接依赖
 lanbackup-core = { path = "../../core" }
 # V4 HTTP 服务（桌面端接收服务器，基于 core SessionStore）
@@ -95,19 +87,13 @@ opt-level = 3
 strip = true
 
 # 分级优化（体积与速度兼得）：
-# 全局 opt-level 3 保证速度；热点 crate（本程序 + localsend 传输核心）保持 3，
+# 全局 opt-level 3 保证速度；热点 crate（桌面端 + lanbackup-core）保持 3，
 # 框架类重型依赖（UI 壳 / HTTP 栈 / TLS / 运行时 / SQLite 等）降到 "s"——
 # 它们不是性能热点，体积可省 ~20%，运行速度几乎无感知。
 [profile.release.package.backup-desktop]
 opt-level = 3
 [profile.release.package.lanbackup-core]
 opt-level = 3
-[profile.release.package.localsend]
-opt-level = 3
-# 2026-08-29：删除 `[profile.release.package.localsend-core]` —— 该包不存在
-# （上游 crate 名是 `localsend`），cargo 每次构建都告警
-# "profile package spec did not match any packages"。
-# V4 阶段 2 接入 lanbackup-core 后，在此为其补 opt-level = 3。
 
 [profile.release.package.tauri]
 opt-level = "s"
