@@ -12,6 +12,7 @@
 //! 对端可正确识别本机并续传已有会话。
 
 use super::*;
+use base64::Engine;
 use lanbackup_core::server::{serve_request, SessionStore, hyper_http1_builder};
 use lanbackup_core::dto::DeviceType;
 
@@ -34,11 +35,24 @@ pub async fn start_receiver(
     std::fs::create_dir_all(&dir).map_err(AppError::from_display)?;
 
     let alias = identity::get_device_name(&app);
-    let _device_id_hex = identity::get_device_id(&app);
+    let device_id_hex = identity::get_device_id(&app);
     let app_data = app.path().app_data_dir().map_err(|e| AppError(format!("获取应用数据目录失败: {e}")))?;
     let persist_dir = app_data.join("sessions");
 
-    let identity = lanbackup_core::identity::DeviceIdentity::generate();
+    // P0-1/P1-1 联动：使用 desktop 稳定 identity（FNV-1a deviceId + 持久化 P-256 签名密钥），
+    // 确保每次重启 deviceId 不变，对端能正确识别本机并续传已有会话。
+    // pairing_secret 派生于连接码（v4 路径 A），不依赖静态 ECDH 密钥。
+    // desktop sig_pub 是 base64 编码（p256 crate 的 SEC1 压缩公钥，33 字节），
+    // core DeviceIdentity 需要原始字节用于 KeyPair::from_signing_bytes。
+    let (_sig_priv, sig_pub_b64) = crate::transfer::get_or_create_sig_key(&app);
+    let sig_pub_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&sig_pub_b64)
+        .map_err(|e| AppError(format!("签名公钥Base64解码失败: {e}")))?;
+    let identity = lanbackup_core::identity::DeviceIdentity::restore(&device_id_hex, &sig_pub_bytes)
+        .unwrap_or_else(|| {
+            crate::log_warn!("签名密钥格式非法，重建身份（deviceId 将变化）");
+            lanbackup_core::identity::DeviceIdentity::generate()
+        });
     let store = SessionStore::open(identity, &alias, DeviceType::Desktop, Some(&persist_dir));
     store.with_base_dir(receive_dir.clone().into());
     let store = Arc::new(store);

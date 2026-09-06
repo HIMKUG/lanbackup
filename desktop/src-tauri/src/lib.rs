@@ -237,6 +237,8 @@ pub fn run() {
             commands::v3_handshake_challenge,
             commands::v3_handshake_verify,
             commands::v3_pair,
+            commands::v4_probe,
+            commands::v4_pair,
             commands::send_unpair,
             commands::unpair_peer,
             commands::sync_all_peers,
@@ -524,6 +526,57 @@ mod commands {
                     }
                 }
                 cmd_log!(logger::LogLevel::Info, "v3_pair", "已持久化 pairing_secret deviceId={}", crate::logger::mask(device_id));
+            }
+        }
+        Ok(r)
+    }
+
+    /// v4 控制面：GET /api/v4/probe（直连对端 receive port，不走 port+1）
+    #[tauri::command]
+    pub async fn v4_probe(ip: String, port: u16) -> Result<serde_json::Value, AppError> {
+        cmd_log!(logger::LogLevel::Info, "v4_probe", "入口 目标={ip}:{port}");
+        tauri::async_runtime::spawn_blocking(move || transfer::v4_probe(ip, port))
+            .await
+            .map_err(|e| AppError(format!("v4_probe 任务执行失败: {e}")))?
+    }
+
+    /// v4 路径 A 配对（完整流程）：probe → HMAC 认证 → verify。
+    /// 与 v3 的 ECDH 密钥派生完全不同：v4 用连接码 + 双 nonce 派生出 HMAC 密钥。
+    /// 直连对端 receive port（port 参数），60s 长读超时（服务端弹窗确认最长 45s）。
+    #[tauri::command]
+    pub async fn v4_pair(
+        app: AppHandle,
+        ip: String,
+        port: u16,
+        code: String,
+        name: String,
+    ) -> Result<serde_json::Value, AppError> {
+        cmd_log!(
+            logger::LogLevel::Info,
+            "v4_pair",
+            "入口 目标={ip}:{port} name={name}"
+        );
+        let r = tauri::async_runtime::spawn_blocking({
+            let app = app.clone();
+            move || transfer::v4_pair(app, ip, port, code, name)
+        })
+            .await
+            .map_err(|e| AppError(format!("v4_pair 任务执行失败: {e}")))??;
+        if r.get("status").and_then(|s| s.as_str()) == Some("active") {
+            if let Some(device_id) = r.get("deviceId").and_then(|d| d.as_str()) {
+                if let Ok(mut m) = app.state::<crate::transfer::PairingState>().paired.lock() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    let rec = m.entry(device_id.to_string()).or_insert_with(|| serde_json::json!({}));
+                    if let Some(o) = rec.as_object_mut() {
+                        o.entry("status".to_string()).or_insert_with(|| serde_json::json!("ACTIVE"));
+                        o.entry("pairingTimestamp".to_string()).or_insert_with(|| serde_json::json!(now));
+                    }
+                }
+                crate::transfer::persist_paired(&app);
+                cmd_log!(logger::LogLevel::Info, "v4_pair", "已持久化配对记录 deviceId={}", crate::logger::mask(device_id));
             }
         }
         Ok(r)

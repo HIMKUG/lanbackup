@@ -324,3 +324,205 @@ pub fn per_file_enc_key(
         fallback
     }
 }
+
+// ────────────────────────────────────────────────────────────────
+// v4 控制面客户端（V4-ARCHITECTURE §4.2 路径 A：HMAC 认证）
+// ────────────────────────────────────────────────────────────────
+// 与 v3 的 ECDH 密钥派生完全不同：v4 用连接码 + 双 nonce 派生出 HMAC 密钥，
+// transcript 用长度前缀帧防歧义。直连对端 receive port（53317），不用 port+1。
+
+const DOMAIN_PATH_A_KEY: &[u8] = b"lanbackup/v4/handshake/path-a/key";
+const DOMAIN_PATH_A: &[u8] = b"lanbackup/v4/handshake/path-a";
+
+fn v4_frame(domain: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+    let total = 2 + domain.len() + parts.iter().map(|p| 2 + p.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    for part in std::iter::once(domain).chain(parts.iter().copied()) {
+        out.extend_from_slice(&(part.len() as u16).to_be_bytes());
+        out.extend_from_slice(part);
+    }
+    out
+}
+
+fn v4_path_a_key(connection_code: &str, client_nonce: &[u8], server_nonce: &[u8]) -> [u8; 32] {
+    let mut salt = Vec::with_capacity(
+        DOMAIN_PATH_A_KEY.len() + client_nonce.len() + server_nonce.len(),
+    );
+    salt.extend_from_slice(DOMAIN_PATH_A_KEY);
+    salt.extend_from_slice(client_nonce);
+    salt.extend_from_slice(server_nonce);
+    let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &salt);
+    let tag = ring::hmac::sign(&k, connection_code.as_bytes());
+    let mut result = [0u8; 32];
+    result.copy_from_slice(tag.as_ref());
+    result
+}
+
+fn v4_path_a_transcript(
+    device_id: &str,
+    client_eph_pub: &[u8],
+    client_nonce: &[u8],
+    server_nonce: &[u8],
+    server_static_pub: &[u8],
+) -> Vec<u8> {
+    v4_frame(DOMAIN_PATH_A, &[
+        device_id.as_bytes(),
+        client_eph_pub,
+        client_nonce,
+        server_nonce,
+        server_static_pub,
+    ])
+}
+
+fn v4_nonce_hex() -> String {
+    let b: [u8; 32] = rand::random();
+    hex::encode(b)
+}
+
+fn v4_request_id() -> String {
+    let b: [u8; 16] = rand::random();
+    hex::encode(b)
+}
+
+/// v4 HTTP 辅助（直接复用 v3_http_long 的实现，不同超时参数）
+fn v4_http_long(
+    ip: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+    read_ms: u64,
+) -> Result<serde_json::Value, AppError> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let addr = (ip, port)
+        .to_socket_addrs()
+        .map_err(|e| AppError(format!("解析地址 {ip}:{port} 失败: {e}")))?
+        .next()
+        .ok_or_else(|| AppError(format!("无可用地址: {ip}:{port}")))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1500))
+        .map_err(|e| AppError(format!("连接 {ip}:{port} 失败: {e}")))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(read_ms)))
+        .map_err(AppError::from_display)?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(5000)))
+        .map_err(AppError::from_display)?;
+    let self_device_id = crate::identity::get_device_id_no_ctx();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {ip}:{port}\r\nX-Device-Id: {self_device_id}\r\nX-Protocol-Version: 4.0\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).map_err(AppError::from_display)?;
+    let mut resp_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut tmp = [0u8; 16 * 1024];
+    loop {
+        let n = stream.read(&mut tmp).map_err(AppError::from_display)?;
+        if n == 0 {
+            break;
+        }
+        resp_buf.extend_from_slice(&tmp[..n]);
+        if resp_buf.len() > 64 * 1024 * 1024 {
+            return Err(AppError("HTTP 响应超过 64MB 上限".to_string()));
+        }
+    }
+    let text = String::from_utf8_lossy(&resp_buf);
+    let json_part = text.splitn(2, "\r\n\r\n").nth(1)
+        .ok_or_else(|| AppError("HTTP 响应缺少 body 分隔符".to_string()))?;
+    if json_part.trim().is_empty() {
+        return Err(AppError("HTTP 响应 body 为空".to_string()));
+    }
+    serde_json::from_str(json_part).map_err(|e| AppError(format!("解析响应失败: {e}")))
+}
+
+/// GET /api/v4/probe（直连对端 receive port，不走 port+1）
+pub fn v4_probe(ip: String, port: u16) -> Result<serde_json::Value, AppError> {
+    v4_http_long(&ip, port, "GET", "/api/v4/probe", "", 3000)
+}
+
+/// v4 路径 A 配对（完整流程）：probe → 生成临时 ECDH 密钥 → HMAC 认证 → verify
+///
+/// 密钥派生：HMAC-SHA256(salt=DOMAIN_PATH_A_KEY || clientNonce || serverNonce, msg=connection_code)
+/// Transcript：frame(DOMAIN_PATH_A, [deviceId, clientEphPub, clientNonce, serverNonce, serverStaticPub])
+/// Tag：HMAC-SHA256(key, transcript) → hex
+///
+/// 直连对端 receive port（port 参数），60s 长读超时（服务端弹窗确认最长 45s）。
+pub fn v4_pair(
+    _app: AppHandle,
+    ip: String,
+    port: u16,
+    code: String,
+    name: String,
+) -> Result<serde_json::Value, AppError> {
+    // 1. probe：取对端 staticPub（base64）+ serverNonce（hex）+ deviceId
+    let info = v4_probe(ip.clone(), port)?;
+    let static_pub = info
+        .get("staticPub")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let server_nonce = info
+        .get("serverNonce")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let device_id = info
+        .get("deviceId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if static_pub.is_empty() || server_nonce.is_empty() || device_id.is_empty() {
+        return Err(AppError(
+            "probe 响应缺少 staticPub/serverNonce/deviceId（对端可能未升级 v4）".to_string(),
+        ));
+    }
+
+    // 2. 客户端临时 P-256 ECDH 密钥对（用于 transcript 中的 clientEphPub）
+    let (eph_priv, eph_pub) = crate::crypto::ecdh_generate_keypair()
+        .map_err(AppError::from_display)?;
+    let eph_pub_bytes = v3_b64url_decode(&eph_pub)?;
+    let static_pub_bytes = v3_b64url_decode(static_pub)?;
+    let client_nonce_bytes = v4_nonce_hex();
+    let client_nonce_bytes_raw = hex::decode(&client_nonce_bytes)
+        .map_err(|e| AppError(format!("clientNonce hex 解码失败: {e}")))?;
+    let server_nonce_bytes_raw = hex::decode(server_nonce)
+        .map_err(|e| AppError(format!("serverNonce hex 解码失败: {e}")))?;
+
+    // 3. path_a_key = HMAC-SHA256(salt, connection_code)
+    let key = v4_path_a_key(&code, &client_nonce_bytes_raw, &server_nonce_bytes_raw);
+
+    // 4. path_a_transcript = frame(domain, [deviceId, clientEphPub, clientNonce, serverNonce, serverStaticPub])
+    let transcript = v4_path_a_transcript(
+        device_id,
+        &eph_pub_bytes,
+        &client_nonce_bytes_raw,
+        &server_nonce_bytes_raw,
+        &static_pub_bytes,
+    );
+
+    // 5. tag = HMAC-SHA256(key, transcript) → hex
+    let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key);
+    let tag = ring::hmac::sign(&k, &transcript);
+    let tag_hex = hex::encode(tag.as_ref());
+
+    // 6. verify：POST /api/v4/handshake/verify（60s 长读超时，等对端弹窗确认）
+    let request_id = v4_request_id();
+    let body = serde_json::json!({
+        "deviceId": crate::identity::get_device_id_no_ctx(),
+        "clientEphPub": eph_pub,
+        "clientNonce": client_nonce_bytes,
+        "serverNonce": server_nonce,
+        "hmac": tag_hex,
+        "requestId": request_id,
+    });
+    let resp = v4_http_long(&ip, port, "POST", "/api/v4/handshake/verify", &body.to_string(), 60_000)?;
+
+    // 7. 解析 VerifyResponse 状态
+    let status = resp
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none");
+    if status != "active" {
+        return Err(AppError(format!("配对失败，状态: {status}")));
+    }
+    Ok(resp)
+}

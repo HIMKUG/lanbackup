@@ -1803,7 +1803,7 @@ async function greetAll(force = false) {
         let ok = false;
         for (const ip of ips) {
           try {
-            await invoke('v3_probe', { ip, port: rec.port });
+            await invoke('v4_probe', { ip, port: rec.port });
             // 已配对设备（deviceId 非空）：online 态由 bcpd 全权驱动，greetAll 只更新 IP；
             // 未配对设备：online 态仍由 greetAll 维护（扫描发现的临时设备）。
             if (!rec.deviceId) {
@@ -1832,13 +1832,13 @@ async function greetAll(force = false) {
 }
 
 // 连接（显式）：探测对端可达后置为已连接（P2 硬升级：v2 问候 /verify 已删除，
-// 改用 v3 probe 探测配对服务；对方已解除配对检测暂缺）
+// 改用 v4 probe 探测配对服务；对方已解除配对检测暂缺）
 async function connectPeer(p: PairRecord) {
   const ips = p.ips?.length ? p.ips : [p.ip];
   let ok = false;
   for (const ip of ips) {
     try {
-      await invoke('v3_probe', { ip, port: p.port });
+      await invoke('v4_probe', { ip, port: p.port });
       pairMgr.markOnline(p.fingerprint, ip, p.port);
       pairMgr.rememberIp(p.fingerprint, ip);
       pairMgr.markConnected(p.fingerprint, true);
@@ -1998,14 +1998,14 @@ async function confirmPair() {
   verifying.value = true;
   errorMsg.value = '';
   try {
-    // v3 首次配对（路径A）：加密全在 Rust 层（v3_pair）；服务端弹窗确认最长 45s → 客户端长读超时 60s
-    const r = await invoke<{ status?: string; deviceId?: string; error?: { code?: string; message?: string } }>('v3_pair', {
+    // v4 路径 A 配对：HMAC 认证；服务端弹窗确认最长 45s → 客户端长读超时 60s
+    const r = await invoke<{ status?: string; deviceId?: string; error?: { code?: string; message?: string } }>('v4_pair', {
       ip: t.ip,
       port: t.port,
       code: codeInput.value.trim(),
       name: selfInfo.value.name,
     });
-    if (r?.status !== 'approved') {
+    if (r?.status !== 'active') {
       errorMsg.value = r?.error?.code === 'INVALID_CODE' ? '连接码不正确，配对失败' : (r?.error?.message || '配对失败');
       return;
     }
@@ -2053,29 +2053,29 @@ async function manualPair() {
   verifying.value = true;
   errorMsg.value = '';
   try {
-    // v3 首次配对（路径A）：加密全在 Rust 层（v3_pair）
-    const r = await invoke<{ status?: string; deviceId?: string; error?: { code?: string; message?: string } }>('v3_pair', {
+    // v4 路径 A 配对：HMAC 认证
+    const r = await invoke<{ status?: string; deviceId?: string; error?: { code?: string; message?: string } }>('v4_pair', {
       ip: manualIp.value.trim(),
       port: manualPort.value,
       code: manualCode.value.trim(),
       name: selfInfo.value.name,
     });
-    if (r?.status !== 'approved') {
+    if (r?.status !== 'active') {
       errorMsg.value = r?.error?.code === 'INVALID_CODE' ? '连接码不正确，配对失败' : (r?.error?.message || '配对失败');
       return;
     }
-    // P2 硬升级：ping_device（v2 /info）已删除，改用 v3_probe 取对端别名（deviceId 用 v3_pair 返回值）
+    // P2 硬升级：ping_device（v2 /info）已删除，改用 v4_probe 取对端别名（deviceId 用 v4_pair 返回值）
     let peerAlias = manualIp.value.trim();
     let peerDeviceId = r.deviceId || '';
     try {
-      const probe = await invoke<{ deviceId?: string; alias?: string }>('v3_probe', {
+      const probe = await invoke<{ deviceId?: string; alias?: string }>('v4_probe', {
         ip: manualIp.value.trim(),
         port: manualPort.value,
       });
       peerAlias = probe.alias || peerAlias;
       peerDeviceId = probe.deviceId || peerDeviceId;
     } catch {
-      // probe 失败不阻断配对（v3_pair 已成功）
+      // probe 失败不阻断配对（v4_pair 已成功）
     }
     const fp = normalizeCode(manualCode.value);
     pairMgr.upsert({
