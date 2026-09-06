@@ -168,7 +168,7 @@ fn subnet_scan_inner(
         }
     }
 
-    crate::log_info!("子网探测: {} 个主机 (端口 {})", targets.len(), port + 1);
+    crate::log_info!("子网探测: {} 个主机 (端口 {})", targets.len(), port);
 
     use std::collections::VecDeque;
     let n_workers = targets.len().min(64);
@@ -188,7 +188,7 @@ fn subnet_scan_inner(
 
             let Ok(v) = crate::transfer::http_json_request(
                 &ip,
-                port + 1,
+                port,
                 "GET",
                 "/api/v4/probe",
                 "",

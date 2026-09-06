@@ -298,12 +298,27 @@ pub async fn send_files(
         Err(e) => crate::log_warn!("register 失败（不阻断传输）: {e}"),
     }
 
+    let cache = std::sync::Arc::new(PieceHashCache::new());
+    let mut piece_hex_cache: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let normal_start = batch_count + chunked_count;
+    for (i, f) in normal.iter().enumerate() {
+        let file_id = format!("f{}", normal_start + i);
+        if let Some(hexes) = compute_piece_hexes(&cache, &f.abs_path, sizes[normal_start + i]) {
+            piece_hex_cache.insert(file_id, hexes);
+        }
+    }
+
     let mut prepare_files: std::collections::HashMap<String, CoreFileMeta> = std::collections::HashMap::new();
     let mut file_size_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for (i, f) in upload_items.iter().enumerate() {
         let mtime = file_modified_millis(&f.abs_path).unwrap_or(0);
         let size = sizes[i];
         file_size_map.insert(format!("f{i}"), size);
+        let piece_hashes = if i >= normal_start {
+            piece_hex_cache.get(&format!("f{i}")).cloned()
+        } else {
+            None
+        };
         prepare_files.insert(format!("f{i}"), CoreFileMeta {
             file_id: format!("f{i}"),
             file_name: f.rel_path.clone(),
@@ -312,7 +327,7 @@ pub async fn send_files(
             mtime,
             sha256: None,
             merkle_root: None,
-            piece_hashes: None,
+            piece_hashes,
         });
     }
     for (plan_k, f, _, m) in &sched_plans {
@@ -383,14 +398,6 @@ pub async fn send_files(
 
     let sched = app.state::<crate::scheduler::SendScheduler>();
     let store = app.state::<session_store::DesktopSessionStore>();
-    let cache = std::sync::Arc::new(PieceHashCache::new());
-    let mut piece_hex_cache: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    for (i, f) in normal.iter().enumerate() {
-        let file_id = format!("f{}", batch_count + chunked_count + i);
-        if let Some(hexes) = compute_piece_hexes(&cache, &f.abs_path, sizes[batch_count + chunked_count + i]) {
-            piece_hex_cache.insert(file_id, hexes);
-        }
-    }
     let _peer_session_id = sched.add_peer(target_ip.clone(), target_port).await;
     sched.set_peer_state(&target_ip, target_port, crate::scheduler::SessionState::Sending).await;
     let session_files: Vec<session_store::FileManifest> = sched_plans
