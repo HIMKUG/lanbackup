@@ -14,6 +14,7 @@ import android.util.Log;
 import androidx.activity.result.ActivityResult;
 import androidx.documentfile.provider.DocumentFile;
 
+import com.backup.mobile.receiver.LanBackupCore;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
@@ -156,6 +157,8 @@ public class LocalReceiverPlugin extends Plugin {
     private ExecutorService scanExecutor;
     private volatile boolean scanning = false;
     private WifiManager.MulticastLock multicastLock;
+    /** Rust 核心侧组播锁守卫句柄（M22）：0 = 未持有。仅当核心 .so 打包进 APK 时非零 */
+    private long coreGuardHandle;
     private MulticastSocket scanMulticastSocket;
 
     /** 对方通过 /sync-dir 同步过来的目录映射（direction → 目录名） */
@@ -1205,6 +1208,7 @@ public class LocalReceiverPlugin extends Plugin {
                 multicastLock.release();
             }
             multicastLock = null;
+            releaseCoreGuard();
             Log.i(TAG, "startScan: 检测到重复调用，已清理旧扫描资源");
             // fall-through 继续初始化新扫描
         }
@@ -1241,6 +1245,7 @@ public class LocalReceiverPlugin extends Plugin {
             multicastLock.release();
         }
         multicastLock = null;
+        releaseCoreGuard();
         Log.i(TAG, "stopScan: 已停止扫描");
         call.resolve();
     }
@@ -1267,11 +1272,27 @@ public class LocalReceiverPlugin extends Plugin {
         call.resolve(new JSObject().put("devices", arr));
     }
 
+    /** 释放 Rust 侧组播锁守卫句柄（幂等）。仅释放 Rust 句柄；真实锁由 Android 进程退出时回收 */
+    private void releaseCoreGuard() {
+        if (coreGuardHandle != 0) {
+            if (LanBackupCore.isAvailable()) {
+                LanBackupCore.releaseMulticastGuard(coreGuardHandle);
+            }
+            coreGuardHandle = 0;
+        }
+    }
+
     /** 组播监听线程：加入 224.0.0.167:53317，收到 announce 后解析上报 */
     private void listenMulticast(String code) {
         WifiManager wm = (WifiManager) getContext().getApplicationContext()
                 .getSystemService(Context.WIFI_SERVICE);
         if (wm != null) {
+            // M22：核心 .so 已打包时，把 WifiManager 交给 Rust 侧守卫（进程级单例，
+            // 供核心 PresenceSocket 绑定时持锁）；本线程自己的组播套接字仍走内置锁——
+            // 核心当前不在应用内运行，守卫不会主动 acquire，Java 锁才是收包路径的实际持锁者
+            if (LanBackupCore.isAvailable() && coreGuardHandle == 0) {
+                coreGuardHandle = LanBackupCore.createMulticastGuard(wm, "lanbackup-scan");
+            }
             multicastLock = wm.createMulticastLock("lanbackup-scan");
             multicastLock.setReferenceCounted(false);
             multicastLock.acquire();
@@ -1306,6 +1327,7 @@ public class LocalReceiverPlugin extends Plugin {
                 multicastLock.release();
             }
             multicastLock = null;
+            releaseCoreGuard();
         }
         Log.i(TAG, "listenMulticast: 退出");
     }
