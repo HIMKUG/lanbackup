@@ -1613,7 +1613,7 @@ mod tests {
                 Step::Verify => Outcome::VerifyRejected,
                 Step::Prepare { .. } => Outcome::PrepareFailed,
                 Step::InitAdvanced => Outcome::AdvancedInitFailed(InitFailure::MerkleBuild),
-                Step::Cleanup(_) | Step::Done { .. } => break,
+                Step::Cleanup(_) | Step::Done { .. } | Step::Waiting => break,
             };
             d.feed(o, NOW).unwrap();
         }
