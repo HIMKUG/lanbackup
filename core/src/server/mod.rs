@@ -1233,6 +1233,7 @@ fn to_phase(p: TransferState) -> TransferPhase {
         TransferState::Paused => TransferPhase::Paused,
         TransferState::Degrading => TransferPhase::Degrading,
         TransferState::Verifying => TransferPhase::Verifying,
+        TransferState::Processing => TransferPhase::Processing,
         TransferState::Completed => TransferPhase::Completed,
         TransferState::Failed => TransferPhase::Failed,
         TransferState::Aborted => TransferPhase::Aborted,

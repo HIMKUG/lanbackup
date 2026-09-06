@@ -65,6 +65,8 @@ pub enum Step {
     SendBlock { index: u64, attempt: u32 },
     /// 整体校验
     Verify,
+    /// 等待下一个文件（调度层使用）
+    Waiting,
     /// 执行清理（§六）。调用方执行完须调 [`SessionDriver::cleanup_finished`]
     Cleanup(CleanupPlan),
     /// 会话结束，无事可做
@@ -142,6 +144,8 @@ pub enum Outcome {
     PeerLost,
     /// 用户中止
     UserAbort,
+    /// 文件级：一个文件上传成功（desktop 调度层使用）
+    FileDone { file_id: String },
 }
 
 impl Outcome {
@@ -162,6 +166,7 @@ impl Outcome {
             Outcome::HeartbeatTimedOut => "HeartbeatTimedOut",
             Outcome::PeerLost => "PeerLost",
             Outcome::UserAbort => "UserAbort",
+            Outcome::FileDone { .. } => "FileDone",
         }
     }
 }
@@ -379,6 +384,7 @@ impl SessionDriver {
                 }
             }
             S::Verifying => Step::Verify,
+            S::Processing => Step::Waiting,
             // Degrading 是瞬态：execute_degrade 会在同一次 feed 内走完
             // Degrade → DegradeComplete。若外部看到它，说明有人手工转了状态机。
             S::Degrading => Step::Done { state: self.state },
@@ -539,6 +545,11 @@ impl SessionDriver {
                     }
                     DegradeDecision::Ignored { .. } => {}
                 }
+            }
+
+            // ---------- Processing（文件级调度层） ----------
+            (S::Processing, O::FileDone { file_id: _ }) => {
+                self.apply(TransferEvent::Progress, &mut ctx)?;
             }
 
             // ---------- 其余组合非法 ----------
@@ -852,6 +863,7 @@ fn state_text(s: TransferState) -> &'static str {
         TransferState::Paused => "已暂停",
         TransferState::Degrading => "降级中",
         TransferState::Verifying => "校验中",
+        TransferState::Processing => "处理中",
         TransferState::Completed => "已完成",
         TransferState::Failed => "已失败",
         TransferState::Aborted => "已中止",

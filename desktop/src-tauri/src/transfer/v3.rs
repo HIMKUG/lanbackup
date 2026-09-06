@@ -454,7 +454,7 @@ pub fn v4_pair(
     ip: String,
     port: u16,
     code: String,
-    name: String,
+    _name: String,
 ) -> Result<serde_json::Value, AppError> {
     // 1. probe：取对端 staticPub（base64）+ serverNonce（hex）+ deviceId
     let info = v4_probe(ip.clone(), port)?;
@@ -477,7 +477,7 @@ pub fn v4_pair(
     }
 
     // 2. 客户端临时 P-256 ECDH 密钥对（用于 transcript 中的 clientEphPub）
-    let (eph_priv, eph_pub) = crate::crypto::ecdh_generate_keypair()
+    let (_eph_priv, eph_pub) = crate::crypto::ecdh_generate_keypair()
         .map_err(AppError::from_display)?;
     let eph_pub_bytes = v3_b64url_decode(&eph_pub)?;
     let static_pub_bytes = v3_b64url_decode(static_pub)?;

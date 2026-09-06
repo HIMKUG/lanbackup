@@ -23,6 +23,8 @@ pub enum TransferState {
     Paused,
     Degrading,
     Verifying,
+    /// 文件级传输中（调度器序列化管理多文件时使用）
+    Processing,
     Completed,
     Failed,
     Aborted,
@@ -146,6 +148,11 @@ impl TransferState {
             (Verifying, TransferEvent::Abort) => Aborted,
             (Verifying, TransferEvent::PeerLost) => Aborted,
             (Verifying, TransferEvent::ForceReset) => Idle,
+            // Processing：处理文件级传输
+            (Processing, TransferEvent::Progress) => Processing,
+            (Processing, TransferEvent::PeerLost) => Aborted,
+            (Processing, TransferEvent::Abort) => Aborted,
+            (Processing, TransferEvent::ForceReset) => Idle,
             // 终态：Completed / Failed / Aborted 只接受 ForceReset
             (Completed, TransferEvent::ForceReset) => Idle,
             (Failed, TransferEvent::Retry) => Preparing, // 显式重试开启新尝试
@@ -179,6 +186,7 @@ impl TransferState {
                 | TransferState::Paused
                 | TransferState::Degrading
                 | TransferState::Verifying
+                | TransferState::Processing
         )
     }
 

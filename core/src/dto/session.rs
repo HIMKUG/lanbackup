@@ -42,6 +42,8 @@ pub enum TransferPhase {
     Degrading,
     /// 整体校验
     Verifying,
+    /// 文件级传输中（调度层）
+    Processing,
     /// 已完成（终态）
     Completed,
     /// 失败（终态）

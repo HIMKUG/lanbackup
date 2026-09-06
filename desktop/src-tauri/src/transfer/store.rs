@@ -483,7 +483,7 @@ fn sig_rand_nonce() -> String {
 
 /// 在线解配对：POST /api/v4/unpair-request（直连对端 receive port）。
 /// 签名：frame(DOMAIN_UNPAIR, [deviceId, requestId])，由 core pairing::transcript::unpair_payload 构造。
-pub fn unpair_request_remote(app: &AppHandle, ip: String, port: u16, target_device_id: String) -> Result<serde_json::Value, AppError> {
+pub fn unpair_request_remote(app: &AppHandle, ip: String, port: u16, _target_device_id: String) -> Result<serde_json::Value, AppError> {
     let my_id = crate::identity::get_device_id_no_ctx();
     let request_id = hex::encode(rand::random::<[u8; 16]>());
     let (sig_priv, _pub) = crate::transfer::get_or_create_sig_key(app);
@@ -501,14 +501,14 @@ pub fn unpair_request_remote(app: &AppHandle, ip: String, port: u16, target_devi
 
 /// A 上线状态同步：GET /api/v4/sync-status?deviceId=...（直连对端 receive port）。
 /// 返回对端视角下"你还认我吗"的回答。
-pub fn sync_peer_status(app: &AppHandle, ip: String, port: u16, target_device_id: String) -> Result<serde_json::Value, AppError> {
+pub fn sync_peer_status(_app: &AppHandle, ip: String, port: u16, _target_device_id: String) -> Result<serde_json::Value, AppError> {
     let my_id = crate::identity::get_device_id_no_ctx();
     let path = format!("/api/v4/sync-status?deviceId={}", my_id);
     crate::transfer::http_json_request(&ip, port, "GET", &path, "")
 }
 
 /// A 收到吊销通知后确认：POST /api/v4/revoke-ack（直连对端 receive port）。
-pub fn send_revoke_ack(app: &AppHandle, ip: String, port: u16, target_device_id: String, token: &serde_json::Value) -> Result<serde_json::Value, AppError> {
+pub fn send_revoke_ack(app: &AppHandle, ip: String, port: u16, _target_device_id: String, token: &serde_json::Value) -> Result<serde_json::Value, AppError> {
     let my_id = crate::identity::get_device_id_no_ctx();
     let revoke_token = token.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
     let request_id = hex::encode(rand::random::<[u8; 16]>());

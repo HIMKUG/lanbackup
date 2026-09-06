@@ -225,8 +225,8 @@ fn events_for(reason: DegradeReason, from: TransferState) -> Option<&'static [Tr
         // 校验失败，状态机事件也只能用它 —— 真实原因保存在
         // [`DegradeRecord::reason`] 里，日志与 UI 取那里，不会被这条边带偏。
         (_, S::Verifying) => &[TransferEvent::VerifyFailed, TransferEvent::DegradeComplete],
-        // Idle：还没会话；Degrading：正在降级中；终态：已定局
-        (_, S::Idle) | (_, S::Degrading) | (_, S::Completed) | (_, S::Failed) | (_, S::Aborted) => {
+        // Idle：还没会话；Degrading：正在降级中；Processing：调度层状态不参与降级；终态：已定局
+        (_, S::Idle) | (_, S::Degrading) | (_, S::Processing) | (_, S::Completed) | (_, S::Failed) | (_, S::Aborted) => {
             return None
         }
     };
