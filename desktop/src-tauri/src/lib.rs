@@ -233,10 +233,6 @@ pub fn run() {
             commands::get_defensive,
             commands::remove_device,
             commands::probe_peer_port,
-            commands::v3_probe,
-            commands::v3_handshake_challenge,
-            commands::v3_handshake_verify,
-            commands::v3_pair,
             commands::v4_probe,
             commands::v4_pair,
             commands::unpair_peer,
@@ -420,114 +416,13 @@ mod commands {
 
     #[tauri::command]
     pub async fn probe_peer_port(ip: String, port: u16) -> Result<bool, AppError> {
-        // 直连探测对端接收端口（v3 probe 走配对服务端口+1，探不到接收服务）
+        // 直连探测对端接收端口
         let r = tauri::async_runtime::spawn_blocking(move || transfer::probe_peer_port(ip, port))
             .await
             .map_err(|e| AppError(format!("探测任务执行失败: {e}")))?;
         let ok = r.as_ref().copied().unwrap_or(false);
         cmd_log!(logger::LogLevel::Debug, "probe_peer_port", "出口 目标可达={}", ok);
         r
-    }
-
-    /// v3 控制面：GET /api/v3/probe（发现对端 v3 能力，路径A 配对材料）
-    #[tauri::command]
-    pub async fn v3_probe(ip: String, port: u16) -> Result<serde_json::Value, AppError> {
-        cmd_log!(logger::LogLevel::Info, "v3_probe", "入口 目标={ip}:{port}");
-        tauri::async_runtime::spawn_blocking(move || transfer::v3_probe(ip, port))
-            .await
-            .map_err(|e| AppError(format!("v3_probe 任务执行失败: {e}")))?
-    }
-
-    /// v3 控制面：POST /api/v3/handshake/challenge（重连路径B）
-    #[tauri::command]
-    pub async fn v3_handshake_challenge(
-        ip: String,
-        port: u16,
-        device_id: String,
-    ) -> Result<serde_json::Value, AppError> {
-        cmd_log!(
-            logger::LogLevel::Info,
-            "v3_handshake_challenge",
-            "入口 目标={ip}:{port}"
-        );
-        tauri::async_runtime::spawn_blocking(move || transfer::v3_handshake_challenge(ip, port, device_id))
-            .await
-            .map_err(|e| AppError(format!("v3_handshake_challenge 任务执行失败: {e}")))?
-    }
-
-    /// v3 控制面：POST /api/v3/handshake/verify（首次配对路径A / 重连路径B）。
-    /// 路径A 服务端弹窗确认最长 45s，客户端长读超时 60s（P0 修复）。
-    #[tauri::command]
-    pub async fn v3_handshake_verify(
-        ip: String,
-        port: u16,
-        body: serde_json::Value,
-    ) -> Result<serde_json::Value, AppError> {
-        cmd_log!(
-            logger::LogLevel::Info,
-            "v3_handshake_verify",
-            "入口 目标={ip}:{port} deviceId={}",
-            body.get("deviceId").and_then(|d| d.as_str()).unwrap_or("")
-        );
-        tauri::async_runtime::spawn_blocking(move || transfer::v3_handshake_verify(ip, port, body))
-            .await
-            .map_err(|e| AppError(format!("v3_handshake_verify 任务执行失败: {e}")))?
-    }
-
-    /// v3 首次配对（路径A，完整客户端流程）：probe → ECDH → 派生 → HMAC → verify。
-    /// 加密全部在 Rust 层完成（前端不做密码学）。服务端弹窗确认最长 45s → 长读超时 60s（P0 修复）。
-    /// approved 后持久化 pairing_secret 到 PairingState.secrets（供路径B重连）。
-    #[tauri::command]
-    pub async fn v3_pair(
-        app: AppHandle,
-        ip: String,
-        port: u16,
-        code: String,
-        name: String,
-    ) -> Result<serde_json::Value, AppError> {
-        cmd_log!(
-            logger::LogLevel::Info,
-            "v3_pair",
-            "入口 目标={ip}:{port} name={name}"
-        );
-        let (r, secret) = tauri::async_runtime::spawn_blocking({
-            let app = app.clone();
-            move || transfer::v3_pair(app, ip, port, code, name)
-        })
-            .await
-            .map_err(|e| AppError(format!("v3_pair 任务执行失败: {e}")))??;
-        // approved → 持久化 pairing_secret（路径B重连用）
-        if r.get("status").and_then(|s| s.as_str()) == Some("approved") {
-            if let Some(device_id) = r.get("deviceId").and_then(|d| d.as_str()) {
-                if let Ok(mut m) = app.state::<crate::transfer::PairingState>().secrets.try_write() {
-                    m.insert(device_id.to_string(), secret);
-                }
-                // P5b：approved 后落库 pairing_secret（路径B重连跨进程可用）
-                crate::transfer::persist_paired(&app);
-                // v5：发起方视角写入对端 ECDSA 签名公钥（信任锚）。
-                // 配对记录由前端 sync_paired 建立，此处 upsert 最小记录并补公钥，
-                // sync_paired 的 merge 语义会保留 peerPublicKey，门禁（check_trusted）才能放行。
-                if let Some(pub_key) = r.get("publicKey").and_then(|k| k.as_str()) {
-                    if !pub_key.is_empty() {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(0);
-                        if let Ok(mut m) = app.state::<crate::transfer::PairingState>().paired.lock() {
-                            let rec = m.entry(device_id.to_string()).or_insert_with(|| serde_json::json!({}));
-                            if let Some(o) = rec.as_object_mut() {
-                                o.insert("peerPublicKey".to_string(), serde_json::json!(pub_key));
-                                o.entry("status".to_string()).or_insert_with(|| serde_json::json!("ACTIVE"));
-                                o.entry("pairingTimestamp".to_string()).or_insert_with(|| serde_json::json!(now));
-                            }
-                        }
-                        crate::transfer::persist_paired(&app);
-                    }
-                }
-                cmd_log!(logger::LogLevel::Info, "v3_pair", "已持久化 pairing_secret deviceId={}", crate::logger::mask(device_id));
-            }
-        }
-        Ok(r)
     }
 
     /// v4 控制面：GET /api/v4/probe（直连对端 receive port，不走 port+1）
@@ -540,7 +435,7 @@ mod commands {
     }
 
     /// v4 路径 A 配对（完整流程）：probe → HMAC 认证 → verify。
-    /// 与 v3 的 ECDH 密钥派生完全不同：v4 用连接码 + 双 nonce 派生出 HMAC 密钥。
+    /// 用连接码 + 双 nonce 派生出 HMAC 密钥。
     /// 直连对端 receive port（port 参数），60s 长读超时（服务端弹窗确认最长 45s）。
     #[tauri::command]
     pub async fn v4_pair(

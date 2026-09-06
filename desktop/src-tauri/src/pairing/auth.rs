@@ -1,8 +1,7 @@
 //! pairing/auth.rs — 配对服务主路由 + 管理面/数据面辅助端点
 //!
-//! P2 硬升级：v2 配对/问候/探测端点（/info、/verify 及 3-Way 握手）已删除，
-//! 全面切换 v3 控制面（pairing/v3.rs）：探测走 /api/v3/probe，
-//! 配对走 /api/v3/handshake/verify（首次）/ challenge+verify（重连）。
+//! 配对服务在 pairing 端口（53318）接收 HTTP 请求，按路径代理到 core 的 v4 端点。
+//! 探测走 /api/v4/probe，配对走 /api/v4/handshake/verify（首次）/ challenge+verify（重连）。
 //! 本文件保留：接收回执 / 解除配对 / 断开 / 取消 / 目录同步 / 移动删除 / 清单 / 分片状态。
 
 use crate::db::AppError;

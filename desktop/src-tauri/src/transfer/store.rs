@@ -6,6 +6,80 @@
 use super::*;
 use base64::Engine as _;
 
+pub(crate) fn http_json_request(
+    ip: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<serde_json::Value, AppError> {
+    let start = std::time::Instant::now();
+    let r = http_json_request_inner(ip, port, method, path, body);
+    let ms = start.elapsed().as_millis();
+    if r.is_ok() {
+        if ms >= 800 {
+            crate::log_warn!("HTTP 请求耗时 {ms}ms: {method} {ip}:{port}{path}");
+        }
+    } else {
+        crate::log_debug!("HTTP 请求失败 {ms}ms: {method} {ip}:{port}{path}");
+    }
+    r
+}
+
+fn http_json_request_inner(
+    ip: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<serde_json::Value, AppError> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let addr = (ip, port)
+        .to_socket_addrs()
+        .map_err(|e| AppError(format!("解析地址 {ip}:{port} 失败: {e}")))?
+        .next()
+        .ok_or_else(|| AppError(format!("无可用地址: {ip}:{port}")))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1500))
+        .map_err(|e| AppError(format!("连接 {ip}:{port} 失败: {e}")))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(3000)))
+        .map_err(AppError::from_display)?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(3000)))
+        .map_err(AppError::from_display)?;
+    let self_device_id = crate::identity::get_device_id_no_ctx();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {ip}:{port}\r\nX-Device-Id: {self_device_id}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).map_err(AppError::from_display)?;
+    let mut resp_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    {
+        let mut tmp = [0u8; 16 * 1024];
+        loop {
+            let n = stream.read(&mut tmp).map_err(AppError::from_display)?;
+            if n == 0 {
+                break;
+            }
+            resp_buf.extend_from_slice(&tmp[..n]);
+            if resp_buf.len() > 64 * 1024 * 1024 {
+                return Err(AppError("HTTP 响应超过 64MB 上限".to_string()));
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&resp_buf);
+    let json_part = text.splitn(2, "\r\n\r\n").nth(1)
+        .ok_or_else(|| AppError("HTTP 响应缺少 body 分隔符".to_string()))?;
+    if json_part.trim().is_empty() {
+        return Err(AppError("HTTP 响应 body 为空".to_string()));
+    }
+    serde_json::from_str(json_part)
+        .map_err(|e| AppError(format!("解析响应失败: {e}")))
+}
+
 /// sync_all_peers 的「连续 unknown」保护计数（进程内，不落库）：
 /// 对端一次"unknown"可能是瞬时错乱/时钟偏差，直接吊销会把仍有效的配对 secret 清掉（数据面即刻失效）。
 /// 只有连续 3 次 unknown 才触发弱最终一致性吊销；对端明确回「revoked+令牌」则即时吊销。
@@ -562,8 +636,18 @@ pub fn unpair_peer(app: AppHandle, device_id: String) -> Result<serde_json::Valu
     if !ip.is_empty() {
         if let Ok(resp) = unpair_request_remote(&app, ip.clone(), port, device_id.clone()) {
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                crate::pairing::v3::set_peer_status(&app, &device_id, "REVOKED");
-                crate::pairing::v3::delete_peer_secret(&app, &device_id);
+                if let Ok(mut m) = app.state::<PairingState>().paired.lock() {
+                    if let Some(v) = m.get_mut(&device_id) {
+                        if let Some(o) = v.as_object_mut() {
+                            o.insert("status".to_string(), serde_json::json!("REVOKED"));
+                            o.remove("pendingRevokeToken");
+                        }
+                    }
+                }
+                if let Ok(mut s) = app.state::<PairingState>().secrets.try_write() {
+                    s.remove(&device_id);
+                }
+                crate::transfer::persist_paired(&app);
                 let _ = app.emit("pair-unpaired", serde_json::json!({ "deviceId": device_id }));
                 crate::log_info!("在线解配对成功: deviceId={}", crate::logger::mask(&device_id));
                 return Ok(serde_json::json!({ "status": "REVOKED", "mode": "online" }));
@@ -615,11 +699,20 @@ pub fn sync_all_peers(app: AppHandle) -> Result<serde_json::Value, AppError> {
         };
         let status = resp.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
         if status == "revoked" {
-            // 对端吊销了本机（明确信号）→ 本机转 REVOKED 并确认；无论连续几次都即时生效
             if let Some(token) = resp.get("revokeToken") {
                 if !token.is_null() {
-                    crate::pairing::v3::set_peer_status(&app, &device_id, "REVOKED");
-                    crate::pairing::v3::delete_peer_secret(&app, &device_id);
+                    if let Ok(mut m) = app.state::<PairingState>().paired.lock() {
+                        if let Some(v) = m.get_mut(&device_id) {
+                            if let Some(o) = v.as_object_mut() {
+                                o.insert("status".to_string(), serde_json::json!("REVOKED"));
+                                o.remove("pendingRevokeToken");
+                            }
+                        }
+                    }
+                    if let Ok(mut s) = app.state::<PairingState>().secrets.try_write() {
+                        s.remove(&device_id);
+                    }
+                    crate::transfer::persist_paired(&app);
                     let _ = send_revoke_ack(&app, ip.clone(), port, device_id.clone(), token);
                     if let Ok(mut m) = sync_unknown_strikes().lock() {
                         m.remove(&device_id);
@@ -642,8 +735,18 @@ pub fn sync_all_peers(app: AppHandle) -> Result<serde_json::Value, AppError> {
                     strikes,
                     crate::logger::mask(&device_id)
                 );
-                crate::pairing::v3::set_peer_status(&app, &device_id, "REVOKED");
-                crate::pairing::v3::delete_peer_secret(&app, &device_id);
+                if let Ok(mut m) = app.state::<PairingState>().paired.lock() {
+                    if let Some(v) = m.get_mut(&device_id) {
+                        if let Some(o) = v.as_object_mut() {
+                            o.insert("status".to_string(), serde_json::json!("REVOKED"));
+                            o.remove("pendingRevokeToken");
+                        }
+                    }
+                }
+                if let Ok(mut s) = app.state::<PairingState>().secrets.try_write() {
+                    s.remove(&device_id);
+                }
+                crate::transfer::persist_paired(&app);
                 if let Ok(mut m) = sync_unknown_strikes().lock() {
                     m.remove(&device_id);
                 }

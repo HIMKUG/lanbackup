@@ -13,7 +13,6 @@ pub mod auth;
 pub mod error;
 pub mod key_exchange;
 pub mod types;
-pub mod v3;
 pub mod v4;
 
 pub use auth::handle_pairing_conn;

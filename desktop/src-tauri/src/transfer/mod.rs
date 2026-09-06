@@ -25,18 +25,17 @@ use crate::db::AppError;
 use crate::identity;
 use crate::session_store;
 
-pub mod v3;
-
 mod send;
 mod receive;
 mod store;
 mod util;
+mod v4;
 
 pub use send::*;
+pub use v4::*;
 pub use receive::*;
 pub use store::*;
 pub use util::*;
-pub use v3::*;
 
 pub struct V4ServerHandle {
      pub port: u16,
