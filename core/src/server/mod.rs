@@ -757,6 +757,21 @@ async fn handle_chunk(store: &Arc<SessionStore>, path: &str, body: &[u8]) -> Res
                 rec.piece_sha.entry(file_id.clone()).or_default().insert(piece_index, sha.clone());
             }
             rec.bitmap_version += 1;
+            if matches!(rec.phase, TransferState::Preparing | TransferState::Reconciling) {
+                let ev = if rec.algorithm == Algorithm::Advanced {
+                    TransferEvent::NegotiateAdvanced
+                } else {
+                    TransferEvent::NegotiateBasic
+                };
+                if let Ok(next) = rec.phase.transition(ev) {
+                    rec.phase = next;
+                }
+                if rec.phase == TransferState::Reconciling {
+                    if let Ok(next) = rec.phase.transition(TransferEvent::Reconciled) {
+                        rec.phase = next;
+                    }
+                }
+            }
             if let Some(p) = &store.persist {
                 p.update_session(&session_id, rec.phase, rec.algorithm, rec.degrade_reason, rec.bitmap_version);
                 p.set_piece(&session_id, &file_id, piece_index, client_sha256.as_deref());
@@ -793,6 +808,21 @@ async fn handle_chunk(store: &Arc<SessionStore>, path: &str, body: &[u8]) -> Res
         rec.piece_sha.entry(file_id.clone()).or_default().insert(piece_index, sha.clone());
     }
     rec.bitmap_version += 1;
+    if matches!(rec.phase, TransferState::Preparing | TransferState::Reconciling) {
+        let ev = if rec.algorithm == Algorithm::Advanced {
+            TransferEvent::NegotiateAdvanced
+        } else {
+            TransferEvent::NegotiateBasic
+        };
+        if let Ok(next) = rec.phase.transition(ev) {
+            rec.phase = next;
+        }
+        if rec.phase == TransferState::Reconciling {
+            if let Ok(next) = rec.phase.transition(TransferEvent::Reconciled) {
+                rec.phase = next;
+            }
+        }
+    }
 
     let piece_count = piece_count(file_meta.size);
     let all_confirmed = rec.confirmed.get(&file_id).map(|s| s.len() as u64 == piece_count).unwrap_or(false);
@@ -1466,10 +1496,8 @@ mod tests {
         route(
             &store,
             Method::POST,
-            "/api/v4/session/chunk",
-            &body(serde_json::json!({
-                "sessionId": "live", "fileId": "f1", "pieceIndex": 0
-            })),
+            "/api/v4/session/chunk?sessionId=live&fileId=f1&pieceIndex=0",
+            &[],
         )
         .await;
         // 刚有 chunk 活动，即使巡检此刻到来也不该清
@@ -1582,8 +1610,8 @@ mod tests {
         route(
             &store,
             Method::POST,
-            "/api/v4/session/chunk",
-            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0})),
+            "/api/v4/session/chunk?sessionId=s1&fileId=f1&pieceIndex=0",
+            &[],
         )
         .await;
         route(
@@ -1798,8 +1826,8 @@ mod tests {
         let r = route(
             &store,
             Method::POST,
-            "/api/v4/session/chunk",
-            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0})),
+            "/api/v4/session/chunk?sessionId=s1&fileId=f1&pieceIndex=0",
+            &[],
         )
         .await;
         assert_eq!(r.status(), StatusCode::OK);
@@ -2010,8 +2038,8 @@ mod tests {
         route(
             &store,
             Method::POST,
-            "/api/v4/session/chunk",
-            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0,"sha256":SHA})),
+            &format!("/api/v4/session/chunk?sessionId=s1&fileId=f1&pieceIndex=0&sha256={SHA}"),
+            &[],
         )
         .await;
         // 对端声明 sha == 本端实测 sha → 206 + 双引号 ETag（A12）
@@ -2049,8 +2077,8 @@ mod tests {
         route(
             &store,
             Method::POST,
-            "/api/v4/session/chunk",
-            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0,"sha256":SHA})),
+            &format!("/api/v4/session/chunk?sessionId=s1&fileId=f1&pieceIndex=0&sha256={SHA}"),
+            &[],
         )
         .await;
         // 对端声明 sha 与本端实测不同 → 412 + DiffMismatch（A11 的"正确性"态）
@@ -2159,8 +2187,8 @@ mod tests {
         route(
             &store,
             Method::POST,
-            "/api/v4/session/chunk",
-            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0,"sha256":SHA})),
+            &format!("/api/v4/session/chunk?sessionId=s1&fileId=f1&pieceIndex=0&sha256={SHA}"),
+            &[],
         )
         .await;
         let r = route(
@@ -2291,8 +2319,8 @@ mod tests {
         route(
             &store,
             Method::POST,
-            "/api/v4/session/chunk",
-            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0})),
+            "/api/v4/session/chunk?sessionId=s1&fileId=f1&pieceIndex=0",
+            &[],
         )
         .await;
         let r = route(
@@ -2351,8 +2379,8 @@ mod tests {
                 route(
                     &store,
                     Method::POST,
-                    "/api/v4/session/chunk",
-                    &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":i,"sha256":sha})),
+                    &format!("/api/v4/session/chunk?sessionId=s1&fileId=f1&pieceIndex={i}&sha256={sha}"),
+                    &[],
                 )
                 .await;
             }
@@ -2465,11 +2493,10 @@ mod tests {
                         route(
                             &store,
                             Method::POST,
-                            "/api/v4/session/chunk",
-                            &body(serde_json::json!({
-                                "sessionId": sid, "fileId": "f1", "pieceIndex": j,
-                                "sha256": sha
-                            })),
+                            &format!(
+                                "/api/v4/session/chunk?sessionId={sid}&fileId=f1&pieceIndex={j}&sha256={sha}"
+                            ),
+                            &[],
                         )
                         .await;
                     }
@@ -2574,10 +2601,8 @@ mod tests {
             let r = route(
                 &store,
                 Method::POST,
-                "/api/v4/session/chunk",
-                &body(serde_json::json!({
-                    "sessionId":"e2e","fileId":"f1","pieceIndex":i,"sha256":sha
-                })),
+                &format!("/api/v4/session/chunk?sessionId=e2e&fileId=f1&pieceIndex={i}&sha256={sha}"),
+                &[],
             )
             .await;
             assert_eq!(r.status(), StatusCode::OK);
@@ -2685,8 +2710,8 @@ mod tests {
         route(
             &store,
             Method::POST,
-            "/api/v4/session/chunk",
-            &body(serde_json::json!({"sessionId":"ab","fileId":"f1","pieceIndex":0})),
+            "/api/v4/session/chunk?sessionId=ab&fileId=f1&pieceIndex=0",
+            &[],
         )
         .await;
         let r = route(

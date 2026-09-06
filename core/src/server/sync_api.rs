@@ -628,8 +628,8 @@ mod tests {
             route(
                 s,
                 Method::POST,
-                "/api/v4/session/chunk",
-                &bytes(json!({"sessionId":"s1","fileId":"f1","pieceIndex":i})),
+                &format!("/api/v4/session/chunk?sessionId=s1&fileId=f1&pieceIndex={i}"),
+                &[],
             )
             .await;
         }
