@@ -219,4 +219,93 @@ mod tests {
     fn _use_dummy() {
         let _ = dummy_read(8);
     }
+
+    // ============================================================
+    // P1-4：真实文件路径的缓存命中 / 失效（生产形态）
+    // ============================================================
+
+    /// 真实文件路径：`PieceCacheKey::from_path` 构造键 → 首次逐 piece 计算 →
+    /// 同路径再次构建命中缓存（read_piece 零调用）→ `invalidate` 后重算 →
+    /// 文件 mtime 变化（外部改写）→ 键变化 → 自动重算。
+    ///
+    /// 这是发送端对账重算的**生产调用形态**：区别于纯内存 stub 测试，
+    /// 它验证了「文件身份 + mtime + size」键在真实磁盘元数据下的行为。
+    #[test]
+    fn real_file_path_cache_hit_and_invalidate() {
+        use crate::transfer::chunk::{piece_count, PIECE_SIZE};
+
+        let dir = std::env::temp_dir().join(format!("lanbak-pc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.bin");
+        // 2 个 piece 的数据（PIECE_SIZE + 42 字节），确定性内容便于重复计算
+        let data: Vec<u8> = (0..PIECE_SIZE + 42).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+
+        let cache = PieceHashCache::new();
+        let key = PieceCacheKey::from_path(&path, data.len() as u64).expect("文件元数据可读");
+        let n = piece_count(data.len() as u64);
+        assert_eq!(n, 2, "测试前提：应恰好 2 个 piece");
+
+        // 读 piece 的公共实现：从内存 data 切片（等价于平台层 read 文件片段）
+        let reads = std::cell::Cell::new(0u64);
+        let read_piece = |i: u64| {
+            reads.set(reads.get() + 1);
+            let start = (i * PIECE_SIZE) as usize;
+            let end = (((i + 1) * PIECE_SIZE).min(data.len() as u64)) as usize;
+            data[start..end].to_vec()
+        };
+        let mut rp = read_piece;
+        let hashes = cache.build_piece_hashes(key.clone(), n, &mut rp);
+        assert_eq!(reads.get(), n, "首次必须逐 piece 计算（读 {n} 次）");
+        assert_eq!(hashes.len() as u64, n);
+
+        // 同路径、同 mtime、同 size → 键不变 → 命中缓存，read_piece 零调用
+        let reads2 = std::cell::Cell::new(0u64);
+        let read_piece2 = |i: u64| {
+            reads2.set(reads2.get() + 1);
+            let start = (i * PIECE_SIZE) as usize;
+            let end = (((i + 1) * PIECE_SIZE).min(data.len() as u64)) as usize;
+            data[start..end].to_vec()
+        };
+        let mut rp2 = read_piece2;
+        let cached = cache.build_piece_hashes(key.clone(), n, &mut rp2);
+        assert_eq!(reads2.get(), 0, "缓存命中后不得重读文件");
+        assert_eq!(cached, hashes, "命中缓存必须返回与首次计算一致的结果");
+
+        // 显式失效（外部改写但 mtime 未变的极端情况）→ 必须重算
+        cache.invalidate(&key);
+        let reads3 = std::cell::Cell::new(0u64);
+        let read_piece3 = |_i: u64| {
+            reads3.set(reads3.get() + 1);
+            vec![0u8; 1]
+        };
+        let mut rp3 = read_piece3;
+        let _ = cache.build_piece_hashes(key.clone(), n, &mut rp3);
+        assert_eq!(reads3.get(), n, "invalidate 后必须逐 piece 重算");
+
+        // 文件被外部改写（mtime 变化）→ 新键 ≠ 旧键 → 自动重算
+        std::fs::write(&path, &data).unwrap(); // 内容相同但 mtime 前进
+        let key2 = PieceCacheKey::from_path(&path, data.len() as u64).expect("改写后元数据可读");
+        assert_ne!(key2, key, "mtime 变化后键必须不同，否则缓存永不过期");
+        let reads4 = std::cell::Cell::new(0u64);
+        let read_piece4 = |_i: u64| {
+            reads4.set(reads4.get() + 1);
+            vec![1u8; 1]
+        };
+        let mut rp4 = read_piece4;
+        let _ = cache.build_piece_hashes(key2.clone(), n, &mut rp4);
+        assert_eq!(reads4.get(), n, "mtime 变化后必须重算，不能误命中旧缓存");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件不存在时 `from_path` 返回 `None`（拿不到元数据不该 panic）。
+    #[test]
+    fn from_path_missing_file_is_none() {
+        let ghost = std::env::temp_dir().join("lanbak-pc-ghost-never-exists.bin");
+        assert!(
+            PieceCacheKey::from_path(&ghost, 0).is_none(),
+            "文件不存在应返回 None 而非 panic"
+        );
+    }
 }

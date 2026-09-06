@@ -201,7 +201,7 @@ RustCrypto 世代必须自洽，版本号不是随便挑新的：
 cd D:/code/tools/6a7f5d5699c44b33268ede69/core
 export CARGO_TARGET_DIR="D:/code/tools/6a7f5d5699c44b33268ede69/cargo-target"
 
-cargo test --lib            # 473 passed, 0 failed（09-06 已验证；410→473 随 A3/M34 落地递增）
+cargo test --lib            # 482 passed, 0 failed（09-06 已验证；410→473 随 A3/M34 落地，473→482 随 P0 收尾批）
 cargo clippy --all-targets -- -D warnings   # 干净（09-06 已验证）
 cargo run --bin gen_schema -- --check        # 45 份 schema 与实现一致（09-06 已验证）
 cargo build --features android-jni          # 可选：M22 真实 AndroidMulticastGuard（jni 门控，默认构建不受影响）
@@ -242,18 +242,28 @@ cargo clippy --features android-jni -- -D warnings   # 干净（已验证）
 
 - T3（Stage 8 CI 加固）：`.github/workflows/local-receiver-android.yml` 第 67 行 `./gradlew testDebugUnitTest --no-daemon` **无** `|| true`，第 62 行注释明确要求"测试失败必须让 job 失败"，已确认修复 ✅。
 
-- T4（块哈希增量缓存）：`transfer/piece_cache.rs` 完整实现（`PieceHashCache`/`PieceCacheKey`/`build_piece_hashes`），但无生产调用方（与 `sweep_residue` 相同的纯策略模块模式），记录为已知缺口。
+- T4（块哈希增量缓存）：`transfer/piece_cache.rs` 完整实现（`PieceHashCache`/`PieceCacheKey`/`build_piece_hashes`）；09-06 已补真实文件路径测试（`real_file_path_cache_hit_and_invalidate` / `from_path_missing_file_is_none`）。desktop 侧接线（`send_files` 对账路径持有全局 cache）待桌面接入 core 后实施。
 
 - T5（平台层 `atomic_file` 接线）：`desktop/src-tauri/src/transfer/receive.rs` 第 538-543 行已实现 `set_file_mtime` 恢复 mtime（via `spawn_blocking`）；`.part` 原子提交模式（`atomic_file` crate）尚未接入桌面端，记录为已知缺口。
+
+- **P0 收尾批（NEXT-STEP-PLAN.md，09-06 落地，482 tests）**：
+
+  - P0-1（G1）：`sweep_idle` 持久化 IO 移出锁外 —— 锁内只迁移+收集快照，锁外 `update_session`+`remove_session`；顺手修复 3 条测试的 `Instant::now() - Duration` 溢出风险（uptime 不足时 panic）。
+  - P0-2（G2）：新增 `mark_unconfirmed_cancelled` —— `handle_abort` 把无终态回执的任务标记 `cancelled`（S1 终态单调保护已有终态），响应体带 `cancelled` 计数。
+  - P0-3（G3）：新增 `pub async fn execute_cleanup_plan(store, sid, plan, keep_in_memory)` —— `Step::Cleanup` 的 core 侧生产执行者（MarkUnconfirmedTasksCancelled + MarkSessionRecord + ClearMemoryState），`handle_abort`/`handle_verify` 终态路径复用；磁盘 IO 全部锁外。
+  - P2-7（G7）：`concurrent_persistence_reloads_without_loss` 并发压力测试（4 会话 × 6 块，重启后零丢失）。
+  - P2-8（G8）：`e2e_full_session_lifecycle` / `e2e_abort_path_marks_unconfirmed_cancelled` 端到端测试。
+  - P1-4（G4 core 侧）：piece_cache 真实文件路径命中/失效测试。
 
 待完成：
 
 ~~1.~~ **~~Stage 6：Android JNI~~** **~~`MulticastGuard`（M22）~~** —— core 侧完成，Android 侧需 SDK。\
 ~~2.~~ **~~Stage 7：TS 清理~~** —— 36 个 TS 文件审查完毕，0 残留，已完成。\
 ~~3.~~ **~~Stage 8：CI 加固~~** —— workflow 已修复，已完成。\
-~~4.~~ **~~块哈希增量缓存优化~~** —— 实现存在但未接线，记录为已知缺口。\
+~~4.~~ **~~块哈希增量缓存优化~~** —— core 侧已补生产形态测试，desktop 接线待桌面接入。\
 ~~5.~~ **~~平台层接入~~** **`transfer::atomic_file`** —— mtime 恢复已完成，.part 原子提交待接入。\
-6\. **未来工作**：`CleanupPlan` 生成但未执行（`handle_abort` 直接过渡状态，跳过清理动作序列）；`PieceHashCache` 生产接线（需在 `transfer/session.rs` 或 `transfer/schedule.rs` 中接入）。
+~~6.~~ **~~未来工作：CleanupPlan 未执行~~** —— 已落地 `execute_cleanup_plan`（P0-3），`handle_abort`/`handle_verify` 复用。\
+7\. **待办（需环境）**：desktop 接入 core（G5，`atomic_file` .part + `PieceHashCache` 接线）；Android JNI `LanBackupCore`（G6）。
 
 Git 状态：`mobile/screenshot-before.png`、`mobile/screenshot-sync.png` 两个未跟踪文件，**有意不暂存**（历史遗留截图，与代码无关）。
 

@@ -113,6 +113,23 @@
 - [x] E8/E9 连接码规范化、TINY_BATCH 统一
 - [x] 登记簿「每阶段回填」机制固化
 
+## P0 收尾批（NEXT-STEP-PLAN.md，09-06 落地）
+
+> 承接 A0–A4 之后的剩余 core 缺口（见 `NEXT-STEP-PLAN.md` G1–G8 表格）。
+
+| # | 条目 | 落点 | 测试 |
+|---|---|---|---|
+| P0-1 | G1 `sweep_idle` 锁内 IO 移出锁外 | `server/mod.rs::sweep_idle`（锁内迁移+快照，锁外写穿+删行） | ✅ 复用 4 条闲置巡检测试 + 修复 `Instant::now() - Duration` 溢出风险 |
+| P0-2 | G2 `handle_abort` 补 `MarkUnconfirmedTasksCancelled` | `server/mod.rs::mark_unconfirmed_cancelled`（S1 终态单调，响应带 `cancelled`） | ✅ `abort_marks_unconfirmed_tasks_cancelled` / `abort_without_unconfirmed_tasks_marks_none` |
+| P0-3 | G3 `Step::Cleanup` 生产执行者 | `server/mod.rs::execute_cleanup_plan`（core 侧动作 + 锁外 IO），`handle_abort`/`handle_verify` 复用 | ✅ 幂等 4 trigger / keep=false 移出内存 |
+| P2-7 | G7 JSON 持久化并发压力 | `concurrent_persistence_reloads_without_loss`（4 会话 × 6 块，重启零丢失） | ✅ |
+| P2-8 | G8 端到端集成 | `e2e_full_session_lifecycle` / `e2e_abort_path_marks_unconfirmed_cancelled` | ✅ |
+| P1-4 | G4 piece_cache 生产形态测试 | `transfer/piece_cache.rs`（真实文件路径命中/失效） | ✅ `real_file_path_cache_hit_and_invalidate` / `from_path_missing_file_is_none` |
+
+**验收**：`cargo test --lib` **482 passed**、`cargo clippy --all-targets -- -D warnings` 干净、`gen_schema --check` 45 份一致 —— **已达标**。
+
+- [x] 完成（2026-09-06）
+
 ## 后续方向（C/D 简纲，本次不执行）
 
 - **C 桌面接入 core**：desktop `Cargo.toml` 加 `lanbackup-core` → 删 `localsend` + V2 模块 → 命令层改调 core DTO/FFI → 移除 rusqlite 依赖。

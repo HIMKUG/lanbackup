@@ -220,43 +220,59 @@ impl SessionStore {
     /// 移除磁盘行与内存条目。`Abort` 对全部非终态均合法（状态机保证），
     /// 因此这里只对 `is_terminal` 做前置过滤，不需要再逐态匹配。
     pub async fn sweep_idle(&self, now: std::time::Instant) -> Vec<String> {
+        // 锁内只做状态迁移与内存热表操作，**磁盘 IO 全部移出锁外**——
+        // 对照模块顶部「锁粒度小、重活（IO/加密）在锁外进行」：sweep 会连清多台
+        // 孤儿，把 write_meta（含 sync_all）留在锁内会让并发请求在磁盘慢时集体排队。
         let mut swept = Vec::new();
-        let mut guard = self.inner.lock().await;
-        // 先收集待清会话（非终态 + 超过闲置阈值），再逐一遍历迁移与移除 ——
-        // 不能在 iter_mut 的同一遍里 remove（借用冲突），分两遍做。
-        let idle: Vec<String> = guard
-            .iter()
-            .filter(|(_, rec)| {
-                !rec.phase.is_terminal()
-                    && now.saturating_duration_since(rec.last_activity) > IDLE_TIMEOUT
-            })
-            .map(|(sid, _)| sid.clone())
-            .collect();
-        for sid in &idle {
-            let mut removable = false;
-            if let Some(rec) = guard.get_mut(sid) {
-                if let Ok(next) = rec.phase.transition(TransferEvent::Abort) {
-                    rec.phase = next;
-                    if let Some(p) = &self.persist {
-                        p.update_session(
-                            sid,
+        // 待写穿的终态快照（锁外逐条 update + remove）
+        let mut to_persist: Vec<(
+            String,
+            TransferState,
+            Algorithm,
+            Option<DegradeReason>,
+            u64,
+        )> = Vec::new();
+        {
+            let mut guard = self.inner.lock().await;
+            // 先收集待清会话（非终态 + 超过闲置阈值），再逐一遍历迁移与移除 ——
+            // 不能在 iter_mut 的同一遍里 remove（借用冲突），分两遍做。
+            let idle: Vec<String> = guard
+                .iter()
+                .filter(|(_, rec)| {
+                    !rec.phase.is_terminal()
+                        && now.saturating_duration_since(rec.last_activity) > IDLE_TIMEOUT
+                })
+                .map(|(sid, _)| sid.clone())
+                .collect();
+            for sid in &idle {
+                let mut removable = false;
+                if let Some(rec) = guard.get_mut(sid) {
+                    if let Ok(next) = rec.phase.transition(TransferEvent::Abort) {
+                        rec.phase = next;
+                        to_persist.push((
+                            sid.clone(),
                             rec.phase,
                             rec.algorithm,
                             rec.degrade_reason,
                             rec.bitmap_version,
-                        );
-                        p.remove_session(sid);
+                        ));
+                        removable = true;
                     }
-                    removable = true;
+                }
+                // 状态机迁到 Aborted 的会话同步移出内存热表，否则孤儿仍驻留
+                if removable {
+                    guard.remove(sid);
+                    swept.push(sid.clone());
                 }
             }
-            // 状态机迁到 Aborted 的会话同步移出内存热表，否则孤儿仍驻留
-            if removable {
-                guard.remove(sid);
-                swept.push(sid.clone());
+        }
+        // 锁外：写穿终态并清理磁盘行（孤儿不再有续传价值）
+        if let Some(p) = &self.persist {
+            for (sid, phase, algorithm, degrade_reason, bitmap_version) in &to_persist {
+                p.update_session(sid, *phase, *algorithm, *degrade_reason, *bitmap_version);
+                p.remove_session(sid);
             }
         }
-        drop(guard);
         swept.sort();
         swept
     }
@@ -526,6 +542,98 @@ async fn handle_heartbeat(store: &Arc<SessionStore>, body: &[u8]) -> Response<Fu
     ok_json(payload)
 }
 
+/// §六 `MarkUnconfirmedTasksCancelled`：把会话内**无终态回执**的任务标记为 `Cancelled`。
+///
+/// 不猜测成败：abort/断线/失败时，没收到接收端终态回执的文件一律视为 cancelled，
+/// 而不是悄悄当成 completed / failed。已有终态（Completed/Failed/Cancelled）的
+/// 任务**绝不被覆盖**（S1 终态单调）。
+///
+/// 返回本次标记的任务数。
+fn mark_unconfirmed_cancelled(rec: &mut SessionRecord, reason: &str) -> usize {
+    let mut cancelled = 0;
+    let ids: Vec<String> = rec.files.keys().cloned().collect();
+    for fid in ids {
+        let is_terminal = rec
+            .receipts
+            .get(&fid)
+            .map(|r| r.status.is_terminal())
+            .unwrap_or(false);
+        if is_terminal {
+            continue;
+        }
+        let rel_path = rec
+            .files
+            .get(&fid)
+            .map(|m| m.rel_path.clone())
+            .unwrap_or_default();
+        rec.receipts.insert(
+            fid.clone(),
+            TaskReceipt {
+                file_id: fid,
+                rel_path,
+                status: TaskStatus::Cancelled,
+                size: None,
+                mtime: None,
+                final_name: None,
+                reason: Some(reason.to_string()),
+            },
+        );
+        cancelled += 1;
+    }
+    cancelled
+}
+
+/// 执行 §六 清理计划中 **core server 侧**可执行的动作，按固定顺序：
+///
+/// 1. `MarkUnconfirmedTasksCancelled` —— 异常收场（abnormal trigger）时，把未确认
+///    任务标记为 `Cancelled`（不猜测成败；S1 终态单调保护已有终态）；
+/// 2. `MarkSessionRecord` —— 写穿终态并移除磁盘行；`keep_in_memory=false` 时才连
+///    内存热表一起移除（`handle_abort`/`handle_verify` 保留内存供历史展示）。
+///
+/// 资源类动作（`CancelInflightRequests` / `ReleaseSemaphorePermits` / `StopHeartbeat` /
+/// `DeletePartialChunkFiles` / `ClearUiProgress`）属于**发送端平台层**职责，
+/// 由平台层在收到 [`Step::Cleanup`] 后执行（`transfer/session.rs` 注释已写明）。
+///
+/// 磁盘 IO 全部在**锁外**执行（对照模块顶部「重活（IO/加密）在锁外进行」）。
+///
+/// 返回本次标记为 cancelled 的任务数（日志/统计用）。
+///
+/// 供三条路径复用：`handle_abort`（keep=true）、`handle_verify` 终态（keep=true）、
+/// 平台层处理 `Step::Cleanup`（keep 由平台层按历史展示需求决定）。
+pub async fn execute_cleanup_plan(
+    store: &Arc<SessionStore>,
+    sid: &str,
+    plan: &CleanupPlan,
+    keep_in_memory: bool,
+) -> usize {
+    let mut cancelled = 0;
+    let snapshot = {
+        let mut guard = store.inner.lock().await;
+        let Some(rec) = guard.get_mut(sid) else {
+            return 0; // 会话不存在（已被别的路径清理），无事可做
+        };
+        if plan.trigger.is_abnormal() {
+            cancelled = mark_unconfirmed_cancelled(rec, plan.trigger.record_reason());
+        }
+        let snap = (
+            rec.phase,
+            rec.algorithm,
+            rec.degrade_reason,
+            rec.bitmap_version,
+        );
+        if !keep_in_memory {
+            guard.remove(sid);
+        }
+        snap
+    };
+    // 锁外：写穿终态 + 移除磁盘行（终态不再有续传价值）
+    if let Some(p) = &store.persist {
+        p.update_session(sid, snapshot.0, snapshot.1, snapshot.2, snapshot.3);
+        p.remove_session(sid);
+    }
+    cancelled
+}
+
 async fn handle_abort(store: &Arc<SessionStore>, body: &[u8]) -> Response<Full<bytes::Bytes>> {
     #[derive(serde::Deserialize)]
     struct Abort {
@@ -536,37 +644,42 @@ async fn handle_abort(store: &Arc<SessionStore>, body: &[u8]) -> Response<Full<b
         Ok(r) => r,
         Err(e) => return err_response(ErrorCode::BadRequest, &e),
     };
-    let mut guard = store.inner.lock().await;
-    let rec = match guard.get_mut(&a.session_id) {
-        Some(r) => r,
-        None => return err_response(ErrorCode::NotFound, "会话不存在"),
-    };
-    match rec.phase.transition(TransferEvent::Abort) {
-        Ok(next) => {
-            rec.phase = next;
-            let plan = CleanupPlan::for_trigger(CleanupTrigger::UserAbort, rec.phase);
-            log::info!(
-                "handle_abort: sessionId={} cleanup_plan=[{}]",
-                a.session_id,
-                plan.actions()
-                    .map(|a| format!("{a:?}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            if let Some(p) = &store.persist {
-                p.update_session(
-                    &a.session_id,
-                    rec.phase,
-                    rec.algorithm,
-                    rec.degrade_reason,
-                    rec.bitmap_version,
-                );
-                p.remove_session(&a.session_id);
+    // 第一步：状态机迁移（锁内，只动内存）
+    let migrated = {
+        let mut guard = store.inner.lock().await;
+        let rec = match guard.get_mut(&a.session_id) {
+            Some(r) => r,
+            None => return err_response(ErrorCode::NotFound, "会话不存在"),
+        };
+        match rec.phase.transition(TransferEvent::Abort) {
+            Ok(next) => {
+                rec.phase = next;
+                Some(next)
             }
-            ok_json(json!({"sessionId": a.session_id, "phase": to_phase(next)}))
+            Err(il) => return err_response(ErrorCode::IllegalState, il.reason),
         }
-        Err(il) => err_response(ErrorCode::IllegalState, il.reason),
-    }
+    };
+    // 第二步：core server 侧清理（标记未确认任务 cancelled + 写穿终态 + 移除磁盘行）。
+    // 锁内 IO 已在 execute_cleanup_plan 中移出锁外。
+    let Some(phase) = migrated else {
+        unreachable!()
+    };
+    let plan = CleanupPlan::for_trigger(CleanupTrigger::UserAbort, phase);
+    let cancelled = execute_cleanup_plan(store, &a.session_id, &plan, true).await;
+    log::info!(
+        "handle_abort: sessionId={} cancelled_tasks={} cleanup_plan=[{}]",
+        a.session_id,
+        cancelled,
+        plan.actions()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    ok_json(json!({
+        "sessionId": a.session_id,
+        "phase": to_phase(phase),
+        "cancelled": cancelled
+    }))
 }
 
 async fn handle_chunk(store: &Arc<SessionStore>, body: &[u8]) -> Response<Full<bytes::Bytes>> {
@@ -828,57 +941,68 @@ async fn handle_verify(store: &Arc<SessionStore>, path: &str) -> Response<Full<b
         None => return err_response(ErrorCode::BadRequest, "缺少 fileId 参数"),
     };
 
-    let mut guard = store.inner.lock().await;
-    let rec = match guard.get_mut(&session_id) {
-        Some(r) => r,
-        None => return err_response(ErrorCode::NotFound, "会话不存在"),
-    };
-    if !rec.files.contains_key(&file_id) {
-        return err_response(ErrorCode::NotFound, "文件未登记");
-    }
+    // 锁内：校验 + 状态机推进，只动内存。磁盘 IO（写穿/清理）统一移到锁外。
+    let snapshot = {
+        let mut guard = store.inner.lock().await;
+        let rec = match guard.get_mut(&session_id) {
+            Some(r) => r,
+            None => return err_response(ErrorCode::NotFound, "会话不存在"),
+        };
+        if !rec.files.contains_key(&file_id) {
+            return err_response(ErrorCode::NotFound, "文件未登记");
+        }
 
-    if let Some(reason) = file_incomplete_reason(rec, &file_id) {
-        return json_response_with(
-            StatusCode::PRECONDITION_FAILED,
-            &serde_json::to_value(VerifyFileResponse {
-                file_id,
-                sha256: None,
-                reason: Some(reason),
-            })
-            .unwrap(),
-            &[],
-        );
-    }
+        if let Some(reason) = file_incomplete_reason(rec, &file_id) {
+            return json_response_with(
+                StatusCode::PRECONDITION_FAILED,
+                &serde_json::to_value(VerifyFileResponse {
+                    file_id,
+                    sha256: None,
+                    reason: Some(reason),
+                })
+                .unwrap(),
+                &[],
+            );
+        }
 
-    // 全会话到齐才推进状态机
-    let all_ids: Vec<String> = rec.files.keys().cloned().collect();
-    if all_ids
-        .iter()
-        .all(|id| file_incomplete_reason(rec, id).is_none())
-        && rec.phase == TransferState::Transferring
-    {
-        if let Ok(next) = rec.phase.transition(TransferEvent::BeginVerify) {
-            rec.phase = next;
-            if let Ok(done) = rec.phase.transition(TransferEvent::VerifyOk) {
-                rec.phase = done;
+        // 全会话到齐才推进状态机
+        let all_ids: Vec<String> = rec.files.keys().cloned().collect();
+        if all_ids
+            .iter()
+            .all(|id| file_incomplete_reason(rec, id).is_none())
+            && rec.phase == TransferState::Transferring
+        {
+            if let Ok(next) = rec.phase.transition(TransferEvent::BeginVerify) {
+                rec.phase = next;
+                if let Ok(done) = rec.phase.transition(TransferEvent::VerifyOk) {
+                    rec.phase = done;
+                }
             }
         }
-    }
-    // 写穿持久化（含终态）；终态会话不再有续传价值，清理磁盘行
-    if let Some(p) = &store.persist {
+        let sha = rec.files.get(&file_id).and_then(|m| m.sha256.clone());
+        let phase = rec.phase;
+        let algorithm = rec.algorithm;
+        let degrade_reason = rec.degrade_reason;
+        let bitmap_version = rec.bitmap_version;
+        (sha, phase, algorithm, degrade_reason, bitmap_version)
+    };
+    let (sha, phase, algorithm, degrade_reason, bitmap_version) = snapshot;
+
+    // 锁外：写穿持久化（含终态）；终态会话不再有续传价值，清理磁盘行。
+    // 终态路径复用 execute_cleanup_plan（§六 MarkSessionRecord + 保留内存供历史展示）。
+    if phase.is_terminal() {
+        let plan = CleanupPlan::for_trigger(CleanupTrigger::Completed, phase);
+        let _ = execute_cleanup_plan(store, &session_id, &plan, true).await;
+    } else if let Some(p) = &store.persist {
         p.update_session(
             &session_id,
-            rec.phase,
-            rec.algorithm,
-            rec.degrade_reason,
-            rec.bitmap_version,
+            phase,
+            algorithm,
+            degrade_reason,
+            bitmap_version,
         );
-        if rec.phase.is_terminal() {
-            p.remove_session(&session_id);
-        }
     }
 
-    let sha = rec.files.get(&file_id).and_then(|m| m.sha256.clone());
     ok_json(VerifyFileResponse {
         file_id,
         sha256: sha,
@@ -1258,16 +1382,10 @@ mod tests {
         .await;
         // 未到 300s：不清理
         assert!(store.sweep_idle(std::time::Instant::now()).await.is_empty());
-        // 拨回 301s 前：孤儿判定成立，必须清掉
-        {
-            let mut g = store.inner.lock().await;
-            g.get_mut("orphan").unwrap().last_activity =
-                std::time::Instant::now() - std::time::Duration::from_secs(301);
-        }
-        assert_eq!(
-            store.sweep_idle(std::time::Instant::now()).await,
-            vec!["orphan"]
-        );
+        // 用「未来 now」越过闲置阈值（now + 301s）→ 孤儿判定成立，必须清掉。
+        // 用传参而非 `Instant::now() - Duration`：后者在系统 uptime 不足时溢出。
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(301);
+        assert_eq!(store.sweep_idle(later).await, vec!["orphan"]);
         assert!(
             store.inner.lock().await.get("orphan").is_none(),
             "孤儿会话未被清掉 —— map 会随恶意 register 无界增长（S5）"
@@ -1313,11 +1431,13 @@ mod tests {
             })),
         )
         .await;
-        // 把活动时间拨回 301s 前，然后来一发心跳续期
+        // 把活动时间拨回 301s 前（checked_sub 兜底：系统 uptime 不足时退回 now，
+        // 避免 `Instant::now() - Duration` 在刚开机环境溢出），然后来一发心跳续期
         {
             let mut g = store.inner.lock().await;
-            g.get_mut("hb").unwrap().last_activity =
-                std::time::Instant::now() - std::time::Duration::from_secs(301);
+            g.get_mut("hb").unwrap().last_activity = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(301))
+                .unwrap_or_else(std::time::Instant::now);
         }
         route(
             &store,
@@ -1333,6 +1453,9 @@ mod tests {
     }
 
     /// 终态会话不参与闲置清理：它们是历史展示与 disconnect 的职责，不是泄漏源。
+    ///
+    /// 用「未来 now」驱动闲置判定（传 now + 7200s），避免 `Instant::now() - Duration`
+    /// 在系统 uptime 不足时溢出（刚开机环境稳定性）。
     #[tokio::test]
     async fn s3_sweep_keeps_terminal_sessions() {
         let store = SessionStore::new();
@@ -1352,13 +1475,10 @@ mod tests {
             &body(serde_json::json!({"sessionId": "done"})),
         )
         .await;
-        {
-            let mut g = store.inner.lock().await;
-            g.get_mut("done").unwrap().last_activity =
-                std::time::Instant::now() - std::time::Duration::from_secs(3600);
-        }
+        // 终态会话与 last_activity 无关：即使闲置远超阈值也不该被清
+        let far_future = std::time::Instant::now() + std::time::Duration::from_secs(7200);
         assert!(
-            store.sweep_idle(std::time::Instant::now()).await.is_empty(),
+            store.sweep_idle(far_future).await.is_empty(),
             "终态会话被闲置清理误删"
         );
         assert_eq!(
@@ -1382,6 +1502,201 @@ mod tests {
         assert_eq!(r.status(), StatusCode::OK);
         let g = store.inner.lock().await;
         assert_eq!(g.get("s1").unwrap().phase, TransferState::Preparing);
+    }
+
+    // ---- P0-2：abort 标记未确认任务为 cancelled（§六 MarkUnconfirmedTasksCancelled）----
+
+    /// abort 后，没有终态回执的任务必须显示 cancelled，而不是 queued/transferring；
+    /// 已有终态回执的任务保持原样（S1 终态单调）。
+    #[tokio::test]
+    async fn abort_marks_unconfirmed_tasks_cancelled() {
+        let store = SessionStore::new();
+        setup(
+            &store,
+            "s1",
+            serde_json::json!({
+                "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1},
+                "f2": {"fileId":"f2","fileName":"y","relPath":"y","size":100,"mtime":1}
+            }),
+        )
+        .await;
+        // f1 已确认一块（未终态）；f2 先给终态回执（模拟已完成的文件）
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/chunk",
+            &body(serde_json::json!({"sessionId":"s1","fileId":"f1","pieceIndex":0})),
+        )
+        .await;
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/receipt",
+            &body(serde_json::json!({"sessionId":"s1","tasks":[
+                {"fileId":"f2","relPath":"y","status":"completed"}
+            ]})),
+        )
+        .await;
+
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/abort",
+            &body(serde_json::json!({"sessionId":"s1"})),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+
+        // tasks：f1 应 cancelled（未确认），f2 保持 completed（终态单调）
+        let r = route(
+            &store,
+            Method::GET,
+            "/api/v4/session/tasks?sessionId=s1",
+            &[],
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
+        let tasks = v["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+        for t in tasks {
+            match t["fileId"].as_str().unwrap() {
+                "f1" => assert_eq!(
+                    t["status"].as_str(),
+                    Some("cancelled"),
+                    "未确认任务 abort 后必须 cancelled，而不是 {t:?}"
+                ),
+                "f2" => assert_eq!(
+                    t["status"].as_str(),
+                    Some("completed"),
+                    "已有终态的任务不得被 abort 回退：{t:?}"
+                ),
+                other => panic!("意外的 fileId {other}"),
+            }
+        }
+    }
+
+    /// 无文件（或全部有终态）时 abort 不产生虚假 cancelled。
+    #[tokio::test]
+    async fn abort_without_unconfirmed_tasks_marks_none() {
+        let store = SessionStore::new();
+        setup(
+            &store,
+            "s1",
+            serde_json::json!({
+                "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
+            }),
+        )
+        .await;
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/receipt",
+            &body(serde_json::json!({"sessionId":"s1","tasks":[
+                {"fileId":"f1","relPath":"x","status":"failed"}
+            ]})),
+        )
+        .await;
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/abort",
+            &body(serde_json::json!({"sessionId":"s1"})),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
+        assert_eq!(v["cancelled"], serde_json::json!(0));
+        // f1 保持 failed，不被改成 cancelled（终态单调）
+        let r = route(
+            &store,
+            Method::GET,
+            "/api/v4/session/tasks?sessionId=s1",
+            &[],
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
+        assert_eq!(v["tasks"][0]["status"].as_str(), Some("failed"));
+    }
+
+    // ---- P0-3：execute_cleanup_plan 生产执行者 ----
+
+    /// 执行器对四种 trigger 都可调用且幂等（重复调用不炸、不重复标记）。
+    #[tokio::test]
+    async fn execute_cleanup_plan_is_idempotent() {
+        let store = SessionStore::new();
+        for (sid, trigger) in [
+            ("u", CleanupTrigger::UserAbort),
+            ("p", CleanupTrigger::PeerLost),
+            ("f", CleanupTrigger::Failed),
+            ("c", CleanupTrigger::Completed),
+        ] {
+            setup(
+                &store,
+                sid,
+                serde_json::json!({
+                    "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
+                }),
+            )
+            .await;
+            // 直接迁移到对应终态（execute_cleanup_plan 假定调用方已迁移）
+            let plan = {
+                let mut guard = store.inner.lock().await;
+                let rec = guard.get_mut(sid).unwrap();
+                if sid == "c" {
+                    // Completed 需要完整路径：Preparing→…→Verifying→Completed
+                    let _ = rec.phase.transition(TransferEvent::NegotiateAdvanced);
+                    let _ = rec.phase.transition(TransferEvent::Reconciled);
+                    let _ = rec.phase.transition(TransferEvent::Progress);
+                    let _ = rec.phase.transition(TransferEvent::BeginVerify);
+                    let _ = rec.phase.transition(TransferEvent::VerifyOk);
+                } else {
+                    let _ = rec.phase.transition(TransferEvent::Abort);
+                }
+                CleanupPlan::for_trigger(trigger, rec.phase)
+            };
+            // 第一次执行：abnormal trigger 标记 1 个未确认任务；Completed 标记 0 个
+            let n1 = execute_cleanup_plan(&store, sid, &plan, true).await;
+            let expect_first = if sid == "c" { 0 } else { 1 };
+            assert_eq!(
+                n1, expect_first,
+                "{sid}: 首次执行应标记 {expect_first} 个任务，实际 {n1}"
+            );
+            // 第二次执行（幂等）：已标记的任务不会再标记
+            let n2 = execute_cleanup_plan(&store, sid, &plan, true).await;
+            assert_eq!(n2, 0, "{sid}: 执行器不幂等，重复标记了任务");
+            // 会话仍在内存（keep_in_memory=true）
+            assert!(
+                store.inner.lock().await.contains_key(sid),
+                "{sid}: keep_in_memory=true 却把会话移出了内存"
+            );
+        }
+    }
+
+    /// keep_in_memory=false 时执行器移除内存热表（sweep_idle 语义）。
+    #[tokio::test]
+    async fn execute_cleanup_plan_can_remove_from_memory() {
+        let store = SessionStore::new();
+        setup(
+            &store,
+            "s1",
+            serde_json::json!({
+                "f1": {"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}
+            }),
+        )
+        .await;
+        {
+            let mut guard = store.inner.lock().await;
+            let rec = guard.get_mut("s1").unwrap();
+            let _ = rec.phase.transition(TransferEvent::Abort);
+        }
+        let plan = {
+            let g = store.inner.lock().await;
+            CleanupPlan::for_trigger(CleanupTrigger::PeerLost, g.get("s1").unwrap().phase)
+        };
+        execute_cleanup_plan(&store, "s1", &plan, false).await;
+        assert!(
+            store.inner.lock().await.get("s1").is_none(),
+            "keep_in_memory=false 时应把会话移出内存热表"
+        );
     }
 
     #[tokio::test]
@@ -2032,6 +2347,313 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- P2-7：JSON 持久化并发压力测试 ----
+
+    /// 多任务并发对多个会话写 chunk + 状态变更后，重载必须完整无丢失、无脏读。
+    ///
+    /// 模拟真实多路并发：4 个会话各收 6 块（带 sha），全部并行写穿同一持久化目录。
+    /// 写完模拟进程重启（重新 open），断言每个会话的 phase/confirmed/piece_sha
+    /// 与写前完全一致 —— 任何一行丢失或串行写竞争导致的半截行都会在这里暴露。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_persistence_reloads_without_loss() {
+        let dir = std::env::temp_dir().join(format!("lanbak-cp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let persist_dir = dir.join("sessions");
+        // 6 块：size = PIECE_SIZE*6
+        let size = crate::transfer::chunk::PIECE_SIZE * 6;
+
+        // ── 进程 A：4 会话并发 register→prepare→收 6 块 ──
+        {
+            let store = SessionStore::open(
+                crate::identity::DeviceIdentity::generate(),
+                "srv",
+                crate::dto::DeviceType::Desktop,
+                Some(&persist_dir),
+            );
+            let mut tasks = tokio::task::JoinSet::new();
+            for i in 0..4u32 {
+                let store = store.clone();
+                tasks.spawn(async move {
+                    let sid = format!("s{i}");
+                    let dev = format!("dev{i}");
+                    let mut sha = String::from("abcdef000000000000000000000000000000000000000000000000000000000");
+                    // 每会话不同 sha 后缀，避免碰巧全相等掩盖丢行
+                    sha.push_str(&format!("{i:x}"));
+                    route(
+                        &store,
+                        Method::POST,
+                        "/api/v4/session/register",
+                        &body(serde_json::json!({
+                            "deviceId": dev, "alias": format!("A{i}"), "sessionId": sid
+                        })),
+                    )
+                    .await;
+                    route(
+                        &store,
+                        Method::POST,
+                        "/api/v4/session/prepare",
+                        &body(serde_json::json!({
+                            "sessionId": sid, "deviceId": dev,
+                            "files": {"f1": {"fileId":"f1","fileName":"x","relPath":"x",
+                                "size": size, "mtime": 1, "sha256": sha,
+                                "pieceHashes": [sha.clone(),sha.clone(),sha.clone(),
+                                                sha.clone(),sha.clone(),sha.clone()]}}
+                        })),
+                    )
+                    .await;
+                    for j in 0..6u64 {
+                        route(
+                            &store,
+                            Method::POST,
+                            "/api/v4/session/chunk",
+                            &body(serde_json::json!({
+                                "sessionId": sid, "fileId": "f1", "pieceIndex": j,
+                                "sha256": sha
+                            })),
+                        )
+                        .await;
+                    }
+                });
+            }
+            while tasks.join_next().await.is_some() {}
+        }
+
+        // ── 进程 B：重启，断言 4 个会话全部恢复、位图与哈希零丢失 ──
+        {
+            let store = SessionStore::open(
+                crate::identity::DeviceIdentity::generate(),
+                "srv",
+                crate::dto::DeviceType::Desktop,
+                Some(&persist_dir),
+            );
+            let g = store.inner.lock().await;
+            for i in 0..4u32 {
+                let sid = format!("s{i}");
+                let rec = g.get(&sid).unwrap_or_else(|| {
+                    panic!("会话 {sid} 重启后丢失 —— 持久化并发写穿漏了整会话")
+                });
+                assert_eq!(
+                    rec.phase,
+                    TransferState::Transferring,
+                    "{sid}: 重载后阶段丢失"
+                );
+                let confirmed = rec.confirmed.get("f1").unwrap();
+                assert_eq!(
+                    confirmed.len(),
+                    6,
+                    "{sid}: 并发写穿后确认位图只有 {} 块，丢了 {} 块",
+                    confirmed.len(),
+                    6 - confirmed.len()
+                );
+                for j in 0..6u64 {
+                    assert!(
+                        confirmed.contains(&j),
+                        "{sid}: 确认位图缺块 {j}"
+                    );
+                }
+                // 本端自算哈希 6 条全在（行半截写入会被 load_all 跳过，这里必须一条不少）
+                let sha_map = rec.piece_sha.get("f1").unwrap();
+                assert_eq!(
+                    sha_map.len(),
+                    6,
+                    "{sid}: piece_sha 只有 {} 条（半截行/竞争丢行）",
+                    sha_map.len()
+                );
+            }
+            drop(g);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- P2-8：端到端集成测试（完整会话生命周期）----
+
+    /// 完整会话生命周期：register → prepare → chunk×N → diff（四态）→ verify →
+    /// receipt → tasks，断言每步状态码、状态机推进与终态查询一致。
+    ///
+    /// 覆盖 G8 的结构性风险：各端点单测各自绿，但**串成一条链路**时状态机
+    /// 是否按序推进、终态是否可查询，只有端到端测试能证明。
+    #[tokio::test]
+    async fn e2e_full_session_lifecycle() {
+        let store = SessionStore::new();
+        // 2 块文件：size = PIECE_SIZE*2
+        let size = crate::transfer::chunk::PIECE_SIZE * 2;
+        let sha = "abcdef0000000000000000000000000000000000000000000000000000000001";
+
+        // 1. register → Preparing
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/register",
+            &body(serde_json::json!({"deviceId":"d","alias":"a","sessionId":"e2e"})),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let g = store.inner.lock().await;
+        assert_eq!(g.get("e2e").unwrap().phase, TransferState::Preparing);
+        drop(g);
+
+        // 2. prepare → 登记文件 + 返回 token
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/prepare",
+            &body(serde_json::json!({
+                "sessionId":"e2e","deviceId":"d",
+                "files":{"f1":{"fileId":"f1","fileName":"x","relPath":"x",
+                    "size":size,"mtime":1,"sha256":sha,"pieceHashes":[sha,sha]}}
+            })),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
+        assert_eq!(v["files"]["f1"].as_str().unwrap(), "tok:f1");
+
+        // 3. chunk×2 → Transferring，全块确认
+        for i in [0u64, 1] {
+            let r = route(
+                &store,
+                Method::POST,
+                "/api/v4/session/chunk",
+                &body(serde_json::json!({
+                    "sessionId":"e2e","fileId":"f1","pieceIndex":i,"sha256":sha
+                })),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+        let g = store.inner.lock().await;
+        assert_eq!(g.get("e2e").unwrap().phase, TransferState::Transferring);
+        drop(g);
+
+        // 4. diff 单块：对端声明 sha == 本端实测 → 206 + 双引号 ETag
+        let r = route(
+            &store,
+            Method::GET,
+            &format!("/api/v4/session/diff?sessionId=e2e&fileId=f1&pieceIndex=0&sha256={sha}"),
+            &[],
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            r.headers().get("etag").unwrap().to_str().unwrap().to_string(),
+            format!("\"{sha}\"")
+        );
+        // diff 整文件摘要：全部匹配 → fileComplete=true
+        let r = route(
+            &store,
+            Method::GET,
+            "/api/v4/session/diff?sessionId=e2e&fileId=f1",
+            &[],
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
+        assert_eq!(v["fileComplete"], serde_json::json!(true));
+        assert_eq!(v["missingChunks"].as_array().unwrap().len(), 0);
+
+        // 5. verify → Completed（全会话到齐）
+        let r = route(
+            &store,
+            Method::GET,
+            "/api/v4/session/verify?sessionId=e2e&fileId=f1",
+            &[],
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
+        assert_eq!(v["sha256"].as_str(), Some(sha));
+        let g = store.inner.lock().await;
+        assert_eq!(g.get("e2e").unwrap().phase, TransferState::Completed);
+        drop(g);
+
+        // 6. receipt：终态回执（completed）→ 不拒绝
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/receipt",
+            &body(serde_json::json!({"sessionId":"e2e","tasks":[
+                {"fileId":"f1","relPath":"x","status":"completed"}
+            ]})),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
+        let rejected = v["rejected"].as_array().unwrap();
+        assert!(rejected.is_empty(), "已完成的回执不应被拒：{rejected:?}");
+
+        // 7. tasks：f1 应 completed（回执优先）
+        let r = route(
+            &store,
+            Method::GET,
+            "/api/v4/session/tasks?sessionId=e2e",
+            &[],
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
+        assert_eq!(v["phase"].as_str(), Some("completed"));
+        assert_eq!(v["tasks"][0]["fileId"].as_str(), Some("f1"));
+        assert_eq!(v["tasks"][0]["status"].as_str(), Some("completed"));
+    }
+
+    /// 端到端中止路径：register → prepare → chunk → abort → tasks 显示 cancelled。
+    ///
+    /// 与 happy path 互补：中止后未确认任务必须收敛为 cancelled（P0-2），
+    /// 会话保持 Aborted 供历史展示。
+    #[tokio::test]
+    async fn e2e_abort_path_marks_unconfirmed_cancelled() {
+        let store = SessionStore::new();
+        let size = crate::transfer::chunk::PIECE_SIZE * 2;
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/register",
+            &body(serde_json::json!({"deviceId":"d","alias":"a","sessionId":"ab"})),
+        )
+        .await;
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/prepare",
+            &body(serde_json::json!({
+                "sessionId":"ab","deviceId":"d",
+                "files":{"f1":{"fileId":"f1","fileName":"x","relPath":"x",
+                    "size":size,"mtime":1}}
+            })),
+        )
+        .await;
+        // 只收 1 块（未到齐），然后 abort
+        route(
+            &store,
+            Method::POST,
+            "/api/v4/session/chunk",
+            &body(serde_json::json!({"sessionId":"ab","fileId":"f1","pieceIndex":0})),
+        )
+        .await;
+        let r = route(
+            &store,
+            Method::POST,
+            "/api/v4/session/abort",
+            &body(serde_json::json!({"sessionId":"ab"})),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
+        assert_eq!(v["phase"].as_str(), Some("aborted"));
+        assert_eq!(v["cancelled"], serde_json::json!(1));
+
+        // tasks：f1 显示 cancelled（未确认 → 不猜测成败）
+        let r = route(
+            &store,
+            Method::GET,
+            "/api/v4/session/tasks?sessionId=ab",
+            &[],
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&to_bytes(r).await).unwrap();
+        assert_eq!(v["phase"].as_str(), Some("aborted"));
+        assert_eq!(v["tasks"][0]["status"].as_str(), Some("cancelled"));
     }
 
     // 辅助：把 Response 的 body 读成 Vec<u8>
