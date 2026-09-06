@@ -229,6 +229,7 @@ pub struct PairingState {
     pub static_key: Mutex<Option<(String, String)>>,
     pub sig_key: Mutex<Option<(String, String)>>,
     pub secrets: tokio::sync::RwLock<HashMap<String, Vec<u8>>>,
+    #[allow(unused)]
     pub used_jtis: Mutex<HashSet<String>>,
 }
 

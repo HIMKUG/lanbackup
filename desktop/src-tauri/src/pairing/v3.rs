@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! pairing/v3.rs — v3 配对协议服务端实现（已废弃，仅保留用于 store.rs 辅助调用）
 //!
 //! v4 配对走 pairing/v4.rs（代理到 core server）；本文件保留部分 store.rs 的 v3 HTTP 调用

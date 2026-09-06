@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! 设备发现模块（Phase C：用 core presence + discovery 替换 LocalSend v2）
 //!
 //! 发现通路：
@@ -231,6 +232,7 @@ fn subnet_scan_inner(
 }
 
 /// /24 子网探测（保持原有 API 签名，内部委托 subnet_scan_inner）
+#[allow(dead_code)]
 pub fn subnet_scan(app: AppHandle, port: u16, stop_flag: Arc<AtomicBool>) {
     let devices = app.state::<DiscoveryState>().0.devices.clone();
     subnet_scan_inner(app, port, stop_flag, devices);

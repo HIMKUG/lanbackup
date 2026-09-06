@@ -1,3 +1,4 @@
+#![allow(unused)]
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -36,6 +37,7 @@ pub enum SessionState {
     Error(String),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PeerSession {
     pub peer_ip: String,
@@ -140,6 +142,7 @@ pub struct MerkleTree {
 }
 
 impl MerkleTree {
+    #[allow(dead_code)]
     pub fn new(piece_hashes: Vec<String>, piece_size: u64) -> Self {
         let piece_hashes: Vec<Vec<u8>> = piece_hashes
             .iter()
@@ -328,6 +331,7 @@ impl SendScheduler {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn touch_peer(&self, ip: &str, port: u16) {
         if let Some(session) = self.get_peer(ip, port).await {
             let mut s = session.write().await;
@@ -368,6 +372,7 @@ impl SendScheduler {
         self.max_concurrent_receivers
     }
 
+    #[allow(dead_code)]
     pub fn concurrent_chunks_per_peer(&self) -> usize {
         self.concurrent_chunks_per_peer
     }
