@@ -2,7 +2,7 @@
 
 > 阅读对象：**完全不了解本项目的新 AI**。
 > 本文档是自洽的，不需要你先看任何聊天记录。请按顺序读，不要跳。
-> 最后更新：2026-09-09（HTTP helper 合并 commit `be9223a` + G5 深度调研结论；此前测试基建修复 `5b06747`；flaky 根因消除 + chunk IO 错误吞没修复详见 §8 末尾）
+> 最后更新：2026-09-09（persist_pairing 模块 commit `23af09c` + G5 pairing persist core 侧完成；HTTP helper 合并 commit `be9223a`；此前测试基建修复 `5b06747`；flaky 根因消除 + chunk IO 错误吞没修复详见 §8 末尾）
 > 更新守则：改了 §3 模块 / §4 端点 / §8 遗留项后，必须同步刷新本文件头部版本号，防止交接文档再次过期。
 
 ***
@@ -264,7 +264,7 @@ cargo clippy --features android-jni -- -D warnings   # 干净（已验证）
 ~~5.~~ **~~平台层接入~~** **`transfer::atomic_file`** —— 已完整实现。\
 ~~6.~~ **~~未来工作：CleanupPlan 未执行~~** —— 已落地 `execute_cleanup_plan`（P0-3），`handle_abort`/`handle_verify` 复用。\
 ~~7.~~ **~~HTTP helper 重复（desktop store.rs + v4.rs）~~** —— 已合并到 `util::http_json_request_internal`，net -18 行（commit `be9223a`）。\
-8. **待办（需环境）**：desktop pairing persist 迁移到 core（G5，需 core::server 新增 persist_pairing 模块）；Android JNI `LanBackupCore`（G6，需 Android SDK）。
+~~8.~~ **~~desktop pairing persist 迁移到 core~~** —— 已完成（commit `23af09c`：新增 `core::server::persist_pairing`，PeerStore 每次写操作顺手原子写 JSON；冷启动自动恢复）。\n9. **待办（需环境）**：Android JNI `LanBackupCore` `.so` 打包（G6，需 Android SDK）；SAF atomic_file 接入（M20，G6 的 Android 存储面）。
 
 Git 状态：`mobile/screenshot-before.png`、`mobile/screenshot-sync.png` 两个未跟踪文件，**有意不暂存**（历史遗留截图，与代码无关）。
 

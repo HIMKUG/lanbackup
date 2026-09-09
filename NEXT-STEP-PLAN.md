@@ -14,7 +14,7 @@
 | G2 | `handle_abort` 只 log 不执行 `CleanupPlan` 的 `MarkUnconfirmedTasksCancelled` | core | P0 | ✅ 已修复（P0-2） |
 | G3 | `SessionDriver::next_step()` 产出 `Step::Cleanup(plan)`，但**无任何生产代码处理该变体** | core | P0 | ✅ 已修复（P0-3） |
 | G4 | `PieceHashCache` 完整实现但无生产调用方 | core→desktop | P1 | ✅ 已完成（send.rs 完整使用） |
-| G5 | desktop 未接入 core（自持 `DesktopSessionStore`、写盘路径未走 `atomic_file` .part） | desktop | P1 | ⚠️ 已大幅推进，剩余：HTTP helper 合并（✅）+ pairing persist 迁移（待 core 支持） |
+| G5 | desktop 未接入 core（自持 DesktopSessionStore、写盘路径未走 atomic_file .part） | desktop | P1 | ✅ core 侧完成（persist_pairing commit `23af09c`；desktop store.rs 切换后端待做） |
 | G6 | Android JNI `LanBackupCore` 类不存在（M33 契约方法 + MulticastGuard 落点缺失） | mobile | P1 | ⏳ 待 Android SDK |
 | G7 | JSON 持久化后端无并发压力测试 | core | P2 | ✅ 已补（P2-7） |
 | G8 | 无端到端集成测试（register→…→tasks 全链路） | core | P2 | ✅ 已补（P2-8） |
@@ -99,7 +99,9 @@ atomic_file (.part)：`core/src/server/mod.rs` 的 `handle_chunk` 已完整实�
 
 1. **HTTP helper 重复合并**（✅ 已完成，commit be9223a）：store.rs 和 v4.rs 各有 60+ 行重复 TcpStream HTTP 代码 → 提取到 `util::http_json_request_internal`，net -18 行。
 
-2. **配对持久化漂移**（⏳ 待 core 支持）：配对数据（paired + pairing_secret）仍以 rusqlite 存于 desktop。core `PeerStore` 只有内存态，`sync_paired_peers_to_store` 只在启动时单向合并一次；运行中 pairing 变更（unpair/sync/revoke）只写 SQLite、不写 core。需要在 `core::server` 新增 `persist_pairing` 模块（JSON 原子写），然后 store.rs 切换后端。
+2. **配对持久化漂移**（⚠️ core 侧已完成，desktop 切换待做）：
+   - ✅ core 侧（commit `23af09c`）：`core::server::persist_pairing` 模块新增，`PeerStore::put`/`merge` 每次写操作顺手原子写 JSON；冷启动从 `paired_peers.json` 自动恢复。
+   - ⏳ desktop 待做：store.rs 切换后端——`persist_paired()` 改写 core PeerStore（通过 `sync_paired_peers_to_store` 或直接 `store.peers.merge`），消除 SQLite↔core drift。
 
 3. **v4.rs（242行，手写 TcpStream HTTP 握手客户端）**：逻辑正确，无功能问题，非优先清理项。
 
