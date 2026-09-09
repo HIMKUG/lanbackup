@@ -788,15 +788,21 @@ async fn handle_chunk(store: &Arc<SessionStore>, path: &str, body: &[u8]) -> Res
         Err(e) => return err_response(ErrorCode::Internal, &format!("冲突检查失败: {e}")),
     }
 
-    let _ = std::fs::OpenOptions::new()
-         .create(true)
-         .append(true)
-         .open(&part_path)
-         .map_err(|e| err_response(ErrorCode::Internal, &format!("打开临时文件失败: {e}")))
-         .and_then(|mut f| {
-             std::io::Write::write_all(&mut f, body)
-                 .map_err(|e| err_response(ErrorCode::Internal, &format!("写入分块失败: {e}")))
-         });
+    // 打开 + 写入临时文件：任何 IO 失败必须立刻以 500 拒绝该块。
+    // 此前 map_err 产出的错误响应被 `let _ =` 整体吞掉，写失败的块仍会被
+    // 标记 confirmed 并可能被原子提交——静默数据损坏路径，已修复。
+    // （显式 early return 同时避免 clippy::result_large_err 的大 Err 闭包）
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&part_path);
+    let mut part = match opened {
+        Ok(f) => f,
+        Err(e) => return err_response(ErrorCode::Internal, &format!("打开临时文件失败: {e}")),
+    };
+    if let Err(e) = std::io::Write::write_all(&mut part, body) {
+        return err_response(ErrorCode::Internal, &format!("写入分块失败: {e}"));
+    }
 
     {
         let mut pending = store.pending_parts.lock().unwrap();
@@ -1401,6 +1407,21 @@ mod tests {
         serde_json::to_vec(&v).unwrap()
     }
 
+    /// 每个测试独占一个临时 base_dir。
+    ///
+    /// chunk 落盘路径 = base_dir + rel_path；base_dir 为空时退化为 CWD 相对路径，
+    /// 于是所有测试都在读写同一个 `core/x` 文件。cargo test 默认多线程并行，
+    /// Windows 下并发打开/写同一文件触发共享冲突 → `ErrorCode::Internal`（500），
+    /// 表现为随机挂测试（e2e_full_session_lifecycle / verify_complete_… 交替失败），
+    /// 单跑必过。用 uuid 子目录隔离，从结构上消灭跨测试文件竞争。
+    fn test_store() -> Arc<SessionStore> {
+        let store = SessionStore::new();
+        let dir = std::env::temp_dir().join(format!("lanbak-store-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        store.with_base_dir(dir);
+        store
+    }
+
     // ---- A1 安全高危批：长度上限 / 接线常量 ----
 
     #[test]
@@ -1458,7 +1479,7 @@ mod tests {
     /// M17：register 后对端消失、再无任何分块 → 超过 300s 必须被巡检清掉。
     #[tokio::test]
     async fn m17_orphan_session_is_swept_after_idle_timeout() {
-        let store = SessionStore::new();
+        let store = test_store();
         route(
             &store,
             Method::POST,
@@ -1483,7 +1504,7 @@ mod tests {
     /// S3：活跃长传输在 chunk 处续期，巡检不得误杀。
     #[tokio::test]
     async fn s3_recently_active_session_is_not_swept() {
-        let store = SessionStore::new();
+        let store = test_store();
         route(
             &store,
             Method::POST,
@@ -1507,7 +1528,7 @@ mod tests {
     /// S3：心跳续期 —— 对端在线（无数据流动）也不是孤儿。
     #[tokio::test]
     async fn s3_heartbeat_renews_activity_and_defers_sweep() {
-        let store = SessionStore::new();
+        let store = test_store();
         route(
             &store,
             Method::POST,
@@ -1544,7 +1565,7 @@ mod tests {
     /// 在系统 uptime 不足时溢出（刚开机环境稳定性）。
     #[tokio::test]
     async fn s3_sweep_keeps_terminal_sessions() {
-        let store = SessionStore::new();
+        let store = test_store();
         route(
             &store,
             Method::POST,
@@ -1575,7 +1596,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_prepares_session() {
-        let store = SessionStore::new();
+        let store = test_store();
         let r = route(
             &store,
             Method::POST,
@@ -1596,7 +1617,7 @@ mod tests {
     /// 已有终态回执的任务保持原样（S1 终态单调）。
     #[tokio::test]
     async fn abort_marks_unconfirmed_tasks_cancelled() {
-        let store = SessionStore::new();
+        let store = test_store();
         setup(
             &store,
             "s1",
@@ -1664,7 +1685,7 @@ mod tests {
     /// 无文件（或全部有终态）时 abort 不产生虚假 cancelled。
     #[tokio::test]
     async fn abort_without_unconfirmed_tasks_marks_none() {
-        let store = SessionStore::new();
+        let store = test_store();
         setup(
             &store,
             "s1",
@@ -1708,7 +1729,7 @@ mod tests {
     /// 执行器对四种 trigger 都可调用且幂等（重复调用不炸、不重复标记）。
     #[tokio::test]
     async fn execute_cleanup_plan_is_idempotent() {
-        let store = SessionStore::new();
+        let store = test_store();
         for (sid, trigger) in [
             ("u", CleanupTrigger::UserAbort),
             ("p", CleanupTrigger::PeerLost),
@@ -1760,7 +1781,7 @@ mod tests {
     /// keep_in_memory=false 时执行器移除内存热表（sweep_idle 语义）。
     #[tokio::test]
     async fn execute_cleanup_plan_can_remove_from_memory() {
-        let store = SessionStore::new();
+        let store = test_store();
         setup(
             &store,
             "s1",
@@ -1787,7 +1808,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_session_id_rejected() {
-        let store = SessionStore::new();
+        let store = test_store();
         let r = route(
             &store,
             Method::POST,
@@ -1800,7 +1821,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_flow_register_prepare_chunk_phase_abort() {
-        let store = SessionStore::new();
+        let store = test_store();
         // register
         route(
             &store,
@@ -1879,7 +1900,7 @@ mod tests {
 
     #[tokio::test]
     async fn abort_unknown_session_is_404() {
-        let store = SessionStore::new();
+        let store = test_store();
         let r = route(
             &store,
             Method::POST,
@@ -1892,14 +1913,14 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_endpoint_404() {
-        let store = SessionStore::new();
+        let store = test_store();
         let r = route(&store, Method::GET, "/api/v4/session/nope", &[]).await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn non_v4_path_404() {
-        let store = SessionStore::new();
+        let store = test_store();
         let r = route(&store, Method::GET, "/api/v3/probe", &[]).await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
@@ -1920,7 +1941,7 @@ mod tests {
     /// 那句"unknown V4 endpoint"。
     #[tokio::test]
     async fn every_declared_route_is_actually_wired() {
-        let store = SessionStore::new();
+        let store = test_store();
         for r in routes::ALL {
             let method = match r.method {
                 routes::Method::Get => Method::GET,
@@ -1946,7 +1967,7 @@ mod tests {
     /// 一个会话只属于一个设备，否则"断开 A"可能收尾了 B 的传输。
     #[tokio::test]
     async fn prepare_rejects_a_session_owned_by_another_device() {
-        let store = SessionStore::new();
+        let store = test_store();
         route(
             &store,
             Method::POST,
@@ -2000,7 +2021,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_missing_piece_returns_200_chunkdiff() {
-        let store = SessionStore::new();
+        let store = test_store();
         setup(
             &store,
             "s1",
@@ -2024,7 +2045,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_confirmed_matching_sha_returns_206_with_quoted_etag() {
-        let store = SessionStore::new();
+        let store = test_store();
         setup(
             &store,
             "s1",
@@ -2064,7 +2085,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_confirmed_mismatched_sha_returns_412() {
-        let store = SessionStore::new();
+        let store = test_store();
         setup(
             &store,
             "s1",
@@ -2098,7 +2119,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_out_of_range_returns_416_with_content_range() {
-        let store = SessionStore::new();
+        let store = test_store();
         setup(
             &store,
             "s1",
@@ -2128,7 +2149,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_weak_etag_rejected_400() {
-        let store = SessionStore::new();
+        let store = test_store();
         setup(
             &store,
             "s1",
@@ -2151,7 +2172,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_incomplete_returns_412_with_reason() {
-        let store = SessionStore::new();
+        let store = test_store();
         setup(
             &store,
             "s1",
@@ -2174,7 +2195,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_complete_advances_to_completed() {
-        let store = SessionStore::new();
+        let store = test_store();
         setup(
             &store,
             "s1",
@@ -2208,7 +2229,7 @@ mod tests {
 
     #[tokio::test]
     async fn receipt_terminal_status_is_monotonic() {
-        let store = SessionStore::new();
+        let store = test_store();
         setup(
             &store,
             "s1",
@@ -2252,7 +2273,7 @@ mod tests {
 
     #[tokio::test]
     async fn receipt_unknown_file_rejected() {
-        let store = SessionStore::new();
+        let store = test_store();
         setup(
             &store,
             "s1",
@@ -2279,7 +2300,7 @@ mod tests {
 
     #[tokio::test]
     async fn tasks_lists_all_files_even_without_receipt() {
-        let store = SessionStore::new();
+        let store = test_store();
         setup(
             &store,
             "s1",
@@ -2307,7 +2328,7 @@ mod tests {
 
     #[tokio::test]
     async fn tasks_reflects_progress_when_chunks_confirmed() {
-        let store = SessionStore::new();
+        let store = test_store();
         setup(
             &store,
             "s1",
@@ -2562,7 +2583,7 @@ mod tests {
     /// 是否按序推进、终态是否可查询，只有端到端测试能证明。
     #[tokio::test]
     async fn e2e_full_session_lifecycle() {
-        let store = SessionStore::new();
+        let store = test_store();
         // 2 块文件：size = PIECE_SIZE*2
         let size = crate::transfer::chunk::PIECE_SIZE * 2;
         let sha = "abcdef0000000000000000000000000000000000000000000000000000000001";
@@ -2686,7 +2707,7 @@ mod tests {
     /// 会话保持 Aborted 供历史展示。
     #[tokio::test]
     async fn e2e_abort_path_marks_unconfirmed_cancelled() {
-        let store = SessionStore::new();
+        let store = test_store();
         let size = crate::transfer::chunk::PIECE_SIZE * 2;
         route(
             &store,

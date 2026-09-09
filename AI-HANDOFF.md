@@ -2,7 +2,7 @@
 
 > 阅读对象：**完全不了解本项目的新 AI**。
 > 本文档是自洽的，不需要你先看任何聊天记录。请按顺序读，不要跳。
-> 最后更新：2026-09-06（对齐 09-06 提交链 `ca6958bc` / `6a7621a` / `6981b01` / `f3fff4b` / `4a701af` / `c9a2bbe` / `fad5075`；`05ccacf` / `8225919` / `b24c390` 见 §5）。
+> 最后更新：2026-09-09（测试基建修复：flaky 根因消除 + chunk IO 错误吞没修复，详见 §8 末尾；此前对齐 09-06 提交链 `ca6958bc` / `6a7621a` / `6981b01` / `f3fff4b` / `4a701af` / `c9a2bbe` / `fad5075`；`05ccacf` / `8225919` / `b24c390` 见 §5）。
 > 更新守则：改了 §3 模块 / §4 端点 / §8 遗留项后，必须同步刷新本文件头部版本号，防止交接文档再次过期。
 
 ***
@@ -266,6 +266,11 @@ cargo clippy --features android-jni -- -D warnings   # 干净（已验证）
 7\. **待办（需环境）**：desktop 接入 core（G5，`atomic_file` .part + `PieceHashCache` 接线）；Android JNI `LanBackupCore`（G6）。
 
 Git 状态：`mobile/screenshot-before.png`、`mobile/screenshot-sync.png` 两个未跟踪文件，**有意不暂存**（历史遗留截图，与代码无关）。
+
+### 09-09 测试基建与正确性修复（`server/mod.rs`）
+
+1. **flaky 测试根因消除**：测试用 `relPath: "x"` + 空 `base_dir` → 落盘到 CWD 相对路径 `core/x`；cargo test 默认并行，多测试互踩同一文件（Windows 共享冲突 → `resolve_conflict`/`commit` 失败 → 500），`core/` 下遗留的 `x_*` 冲突副本即物证。修复：新增测试 helper `test_store()`，每个测试独占 uuid 临时 base_dir。修复前 5 连跑 2 挂（挂的测试随机），修复后 12 连跑全绿。
+2. **chunk IO 错误吞没修复（真实数据正确性 bug）**：`handle_chunk` 打开/写入 `.part` 的 `map_err` 链产出错误响应后被 `let _ =` 整体丢弃——写失败的块仍被标记 confirmed 并可能被原子提交。已改为显式 early return 500。顺带消除 `clippy::result_large_err`（新版 clippy 在 HEAD 上即报此 lint）。
 
 ***
 
