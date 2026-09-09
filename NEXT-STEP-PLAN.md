@@ -13,8 +13,8 @@
 | G1 | `sweep_idle` 在持锁期间做磁盘 IO（`update_session`/`remove_session`） | core | P0 | ✅ 已修复（P0-1） |
 | G2 | `handle_abort` 只 log 不执行 `CleanupPlan` 的 `MarkUnconfirmedTasksCancelled` | core | P0 | ✅ 已修复（P0-2） |
 | G3 | `SessionDriver::next_step()` 产出 `Step::Cleanup(plan)`，但**无任何生产代码处理该变体** | core | P0 | ✅ 已修复（P0-3） |
-| G4 | `PieceHashCache` 完整实现但无生产调用方 | core→desktop | P1 | ⚠️ core 测试已补；desktop 接线待桌面接入 |
-| G5 | desktop 未接入 core（自持 `DesktopSessionStore`、写盘路径未走 `atomic_file` .part） | desktop | P1 | ⏳ 待桌面环境 |
+| G4 | `PieceHashCache` 完整实现但无生产调用方 | core→desktop | P1 | ✅ 已完成（send.rs 完整使用） |
+| G5 | desktop 未接入 core（自持 `DesktopSessionStore`、写盘路径未走 `atomic_file` .part） | desktop | P1 | ⚠️ 已大幅推进，剩余：HTTP helper 合并（✅）+ pairing persist 迁移（待 core 支持） |
 | G6 | Android JNI `LanBackupCore` 类不存在（M33 契约方法 + MulticastGuard 落点缺失） | mobile | P1 | ⏳ 待 Android SDK |
 | G7 | JSON 持久化后端无并发压力测试 | core | P2 | ✅ 已补（P2-7） |
 | G8 | 无端到端集成测试（register→…→tasks 全链路） | core | P2 | ✅ 已补（P2-8） |
@@ -79,23 +79,31 @@
 
 ## P1 · 平台层接线（需对应环境，先立文档后实施）
 
-### 任务 4：`PieceHashCache` 生产接线（G4） — ⚠️ core 侧已完成
+### 任务 4：`PieceHashCache` 生产接线（G4） — ✅ 已完成
 
 **方案**：
 1. core 侧 ✅：`piece_cache.rs` 新增 `real_file_path_cache_hit_and_invalidate`（真实临时文件 → `PieceCacheKey::from_path` → 首次逐 piece 计算 → 同路径命中零读取 → `invalidate` 重算 → mtime 变化键变化重算）+ `from_path_missing_file_is_none`。
-2. desktop 侧（待桌面接入 core 后）：`send_files` 对账路径持有全局 `PieceHashCache`，`Reconcile`/`VerifyRejected` 重算时走缓存。
+2. desktop 侧 ✅：`send.rs` 第 301–309 行持有 `PieceHashCache`，第 1118–1145 行 `compute_piece_hexes` 使用它计算 piece 哈希；差异同步（SessionDriver resume）完整使用。
 
-**验收**：core 侧测试覆盖真实文件路径的缓存命中/失效；登记簿回填 G4。—— ✅ core 侧 2 条测试通过
+**验收**：core 侧测试覆盖真实文件路径的缓存命中/失效；desktop send.rs 完整接入。—— ✅ core 侧 2 条测试通过，send.rs 使用确认
 
-### 任务 5：desktop 接入 core（G5，C 方向）
+### 任务 5：desktop 接入 core（G5，C 方向） — ⚠️ 已大幅推进
 
-**方案**（沿用 CORE-HARDENING-PLAN §后续方向 C）：
-1. `desktop/Cargo.toml` 加 `lanbackup-core` 依赖；
-2. 命令层改调 core DTO/FFI（`lanbackup_invoke`），删除 desktop 内重复协议实现；
-3. 写盘路径接入 `transfer::atomic_file`（.part 同目录 rename + `restore_mtime`，mtime 恢复已具备，补 .part 原子提交）；
-4. 移除 rusqlite 依赖（core 已用纯 Rust JSON 持久化）。
+**真实现状**（09-09 深度调研）：
 
-**验收**：桌面端发送/接收走 core；断点续传 + mtime 保留端到端验证；desktop 测试全绿。
+send.rs：已完整使用 `SessionDriver` + `PieceHashCache` + `reqwest` HTTP，scheduler 差异同步完整。✅
+receive.rs：已完整使用 `core::server::SessionStore` + `hyper` + `serve_request`，`DeviceIdentity` 正确构造并传入 core。✅
+atomic_file (.part)：`core/src/server/mod.rs` 的 `handle_chunk` 已完整实现（第 747/753/795–805/836 行），09-09 IO 错误 fix 已存在。✅
+
+**真实剩余项**：
+
+1. **HTTP helper 重复合并**（✅ 已完成，commit be9223a）：store.rs 和 v4.rs 各有 60+ 行重复 TcpStream HTTP 代码 → 提取到 `util::http_json_request_internal`，net -18 行。
+
+2. **配对持久化漂移**（⏳ 待 core 支持）：配对数据（paired + pairing_secret）仍以 rusqlite 存于 desktop。core `PeerStore` 只有内存态，`sync_paired_peers_to_store` 只在启动时单向合并一次；运行中 pairing 变更（unpair/sync/revoke）只写 SQLite、不写 core。需要在 `core::server` 新增 `persist_pairing` 模块（JSON 原子写），然后 store.rs 切换后端。
+
+3. **v4.rs（242行，手写 TcpStream HTTP 握手客户端）**：逻辑正确，无功能问题，非优先清理项。
+
+**验收**：desktop 发送/接收走 core；断点续传 + mtime 保留端到端验证；desktop 测试全绿。
 
 ### 任务 6：Android 接入 core（G6，D 方向）
 

@@ -2,7 +2,7 @@
 
 > 阅读对象：**完全不了解本项目的新 AI**。
 > 本文档是自洽的，不需要你先看任何聊天记录。请按顺序读，不要跳。
-> 最后更新：2026-09-09（测试基建修复：flaky 根因消除 + chunk IO 错误吞没修复，详见 §8 末尾；此前对齐 09-06 提交链 `ca6958bc` / `6a7621a` / `6981b01` / `f3fff4b` / `4a701af` / `c9a2bbe` / `fad5075`；`05ccacf` / `8225919` / `b24c390` 见 §5）。
+> 最后更新：2026-09-09（HTTP helper 合并 commit `be9223a` + G5 深度调研结论；此前测试基建修复 `5b06747`；flaky 根因消除 + chunk IO 错误吞没修复详见 §8 末尾）
 > 更新守则：改了 §3 模块 / §4 端点 / §8 遗留项后，必须同步刷新本文件头部版本号，防止交接文档再次过期。
 
 ***
@@ -242,9 +242,9 @@ cargo clippy --features android-jni -- -D warnings   # 干净（已验证）
 
 - T3（Stage 8 CI 加固）：`.github/workflows/local-receiver-android.yml` 第 67 行 `./gradlew testDebugUnitTest --no-daemon` **无** `|| true`，第 62 行注释明确要求"测试失败必须让 job 失败"，已确认修复 ✅。
 
-- T4（块哈希增量缓存）：`transfer/piece_cache.rs` 完整实现（`PieceHashCache`/`PieceCacheKey`/`build_piece_hashes`）；09-06 已补真实文件路径测试（`real_file_path_cache_hit_and_invalidate` / `from_path_missing_file_is_none`）。desktop 侧接线（`send_files` 对账路径持有全局 cache）待桌面接入 core 后实施。
+- T4（块哈希增量缓存）：`transfer/piece_cache.rs` 完整实现（`PieceHashCache`/`PieceCacheKey`/`build_piece_hashes`）；09-06 已补真实文件路径测试（`real_file_path_cache_hit_and_invalidate` / `from_path_missing_file_is_none`）。desktop `send.rs` 第 301–309 行持有 `PieceHashCache`，第 1118–1145 行 `compute_piece_hexes` 使用，SessionDriver resume 差异同步完整。✅ 已完成。
 
-- T5（平台层 `atomic_file` 接线）：`desktop/src-tauri/src/transfer/receive.rs` 第 538-543 行已实现 `set_file_mtime` 恢复 mtime（via `spawn_blocking`）；`.part` 原子提交模式（`atomic_file` crate）尚未接入桌面端，记录为已知缺口。
+- T5（平台层 `atomic_file` 接线）：`core/src/server/mod.rs` `handle_chunk` 第 747/753/795–805/836 行已完整实现 `.part` 原子写 + `atomic_file::commit` + `restore_mtime`；desktop receive.rs 使用 `core::server::SessionStore`（含 persist 写穿）。✅ 已完成。
 
 - **P0 收尾批（NEXT-STEP-PLAN.md，09-06 落地，482 tests）**：
 
@@ -260,10 +260,11 @@ cargo clippy --features android-jni -- -D warnings   # 干净（已验证）
 ~~1.~~ **~~Stage 6：Android JNI~~** **~~`MulticastGuard`（M22）~~** —— core 侧完成，Android 侧需 SDK。\
 ~~2.~~ **~~Stage 7：TS 清理~~** —— 36 个 TS 文件审查完毕，0 残留，已完成。\
 ~~3.~~ **~~Stage 8：CI 加固~~** —— workflow 已修复，已完成。\
-~~4.~~ **~~块哈希增量缓存优化~~** —— core 侧已补生产形态测试，desktop 接线待桌面接入。\
-~~5.~~ **~~平台层接入~~** **`transfer::atomic_file`** —— mtime 恢复已完成，.part 原子提交待接入。\
+~~4.~~ **~~块哈希增量缓存优化~~** —— core + desktop send.rs 均已完成。\
+~~5.~~ **~~平台层接入~~** **`transfer::atomic_file`** —— 已完整实现。\
 ~~6.~~ **~~未来工作：CleanupPlan 未执行~~** —— 已落地 `execute_cleanup_plan`（P0-3），`handle_abort`/`handle_verify` 复用。\
-7\. **待办（需环境）**：desktop 接入 core（G5，`atomic_file` .part + `PieceHashCache` 接线）；Android JNI `LanBackupCore`（G6）。
+~~7.~~ **~~HTTP helper 重复（desktop store.rs + v4.rs）~~** —— 已合并到 `util::http_json_request_internal`，net -18 行（commit `be9223a`）。\
+8. **待办（需环境）**：desktop pairing persist 迁移到 core（G5，需 core::server 新增 persist_pairing 模块）；Android JNI `LanBackupCore`（G6，需 Android SDK）。
 
 Git 状态：`mobile/screenshot-before.png`、`mobile/screenshot-sync.png` 两个未跟踪文件，**有意不暂存**（历史遗留截图，与代码无关）。
 
