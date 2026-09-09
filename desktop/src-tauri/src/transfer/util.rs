@@ -280,9 +280,73 @@ pub(crate) fn infer_file_type(name: &str) -> String {
     }
 }
 
+/// HTTP JSON 请求内部实现（纯 TcpStream，无外部依赖）。
+///
+/// 所有参数均可自定义超时；`protocol_version` 为 `None` 时不发送 `X-Protocol-Version` 头。
+/// body 最大 64MB，超出返回错误。
+pub(crate) fn http_json_request_internal(
+    ip: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+    connect_ms: u64,
+    read_ms: u64,
+    write_ms: u64,
+    protocol_version: Option<&str>,
+) -> Result<serde_json::Value, AppError> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let addr = (ip, port)
+        .to_socket_addrs()
+        .map_err(|e| AppError(format!("解析地址 {ip}:{port} 失败: {e}")))?
+        .next()
+        .ok_or_else(|| AppError(format!("无可用地址: {ip}:{port}")))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(connect_ms))
+        .map_err(|e| AppError(format!("连接 {ip}:{port} 失败: {e}")))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(read_ms)))
+        .map_err(AppError::from_display)?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(write_ms)))
+        .map_err(AppError::from_display)?;
+
+    let self_device_id = crate::identity::get_device_id_no_ctx();
+    let proto_header = protocol_version
+        .map(|v| format!("X-Protocol-Version: {v}\r\n"))
+        .unwrap_or_default();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {ip}:{port}\r\nX-Device-Id: {self_device_id}\r\n{proto_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).map_err(AppError::from_display)?;
+
+    let mut resp_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut tmp = [0u8; 16 * 1024];
+    loop {
+        let n = stream.read(&mut tmp).map_err(AppError::from_display)?;
+        if n == 0 {
+            break;
+        }
+        resp_buf.extend_from_slice(&tmp[..n]);
+        if resp_buf.len() > 64 * 1024 * 1024 {
+            return Err(AppError("HTTP 响应超过 64MB 上限".to_string()));
+        }
+    }
+    let text = String::from_utf8_lossy(&resp_buf);
+    let json_part = text.splitn(2, "\r\n\r\n").nth(1)
+        .ok_or_else(|| AppError("HTTP 响应缺少 body 分隔符".to_string()))?;
+    if json_part.trim().is_empty() {
+        return Err(AppError("HTTP 响应 body 为空".to_string()));
+    }
+    serde_json::from_str(json_part)
+        .map_err(|e| AppError(format!("解析响应失败: {e}")))
+}
+
 /// 递归扫描目录
 pub async fn scan_directory(dir: String) -> Result<Vec<ScannedEntry>, AppError> {
-    crate::log_debug!("扫描目录: {dir}");
     let dir_for_task = dir.clone();
     let entries = tokio::task::spawn_blocking(move || {
         let mut entries = Vec::new();

@@ -33,51 +33,8 @@ fn http_json_request_inner(
     path: &str,
     body: &str,
 ) -> Result<serde_json::Value, AppError> {
-    use std::io::{Read, Write};
-    use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::Duration;
-
-    let addr = (ip, port)
-        .to_socket_addrs()
-        .map_err(|e| AppError(format!("解析地址 {ip}:{port} 失败: {e}")))?
-        .next()
-        .ok_or_else(|| AppError(format!("无可用地址: {ip}:{port}")))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1500))
-        .map_err(|e| AppError(format!("连接 {ip}:{port} 失败: {e}")))?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(3000)))
-        .map_err(AppError::from_display)?;
-    stream
-        .set_write_timeout(Some(Duration::from_millis(3000)))
-        .map_err(AppError::from_display)?;
-    let self_device_id = crate::identity::get_device_id_no_ctx();
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {ip}:{port}\r\nX-Device-Id: {self_device_id}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(req.as_bytes()).map_err(AppError::from_display)?;
-    let mut resp_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
-    {
-        let mut tmp = [0u8; 16 * 1024];
-        loop {
-            let n = stream.read(&mut tmp).map_err(AppError::from_display)?;
-            if n == 0 {
-                break;
-            }
-            resp_buf.extend_from_slice(&tmp[..n]);
-            if resp_buf.len() > 64 * 1024 * 1024 {
-                return Err(AppError("HTTP 响应超过 64MB 上限".to_string()));
-            }
-        }
-    }
-    let text = String::from_utf8_lossy(&resp_buf);
-    let json_part = text.splitn(2, "\r\n\r\n").nth(1)
-        .ok_or_else(|| AppError("HTTP 响应缺少 body 分隔符".to_string()))?;
-    if json_part.trim().is_empty() {
-        return Err(AppError("HTTP 响应 body 为空".to_string()));
-    }
-    serde_json::from_str(json_part)
-        .map_err(|e| AppError(format!("解析响应失败: {e}")))
+    // connect 1500ms, read 3000ms, write 3000ms, 无 X-Protocol-Version
+    http_json_request_internal(ip, port, method, path, body, 1500, 3000, 3000, None)
 }
 
 /// sync_all_peers 的「连续 unknown」保护计数（进程内，不落库）：

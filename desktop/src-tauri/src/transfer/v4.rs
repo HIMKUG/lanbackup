@@ -4,6 +4,7 @@
 //! Transcript：frame(DOMAIN_PATH_A, [deviceId, clientEphPub, clientNonce, serverNonce, serverStaticPub])
 //! Tag：HMAC-SHA256(key, transcript) → hex
 
+use super::*;
 use tauri::{AppHandle, Manager};
 
 use crate::db::AppError;
@@ -76,48 +77,8 @@ fn v4_http_long(
     body: &str,
     read_ms: u64,
 ) -> Result<serde_json::Value, AppError> {
-    use std::io::{Read, Write};
-    use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::Duration;
-
-    let addr = (ip, port)
-        .to_socket_addrs()
-        .map_err(|e| AppError(format!("解析地址 {ip}:{port} 失败: {e}")))?
-        .next()
-        .ok_or_else(|| AppError(format!("无可用地址: {ip}:{port}")))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1500))
-        .map_err(|e| AppError(format!("连接 {ip}:{port} 失败: {e}")))?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(read_ms)))
-        .map_err(AppError::from_display)?;
-    stream
-        .set_write_timeout(Some(Duration::from_millis(5000)))
-        .map_err(AppError::from_display)?;
-    let self_device_id = crate::identity::get_device_id_no_ctx();
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {ip}:{port}\r\nX-Device-Id: {self_device_id}\r\nX-Protocol-Version: 4.0\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(req.as_bytes()).map_err(AppError::from_display)?;
-    let mut resp_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
-    let mut tmp = [0u8; 16 * 1024];
-    loop {
-        let n = stream.read(&mut tmp).map_err(AppError::from_display)?;
-        if n == 0 {
-            break;
-        }
-        resp_buf.extend_from_slice(&tmp[..n]);
-        if resp_buf.len() > 64 * 1024 * 1024 {
-            return Err(AppError("HTTP 响应超过 64MB 上限".to_string()));
-        }
-    }
-    let text = String::from_utf8_lossy(&resp_buf);
-    let json_part = text.splitn(2, "\r\n\r\n").nth(1)
-        .ok_or_else(|| AppError("HTTP 响应缺少 body 分隔符".to_string()))?;
-    if json_part.trim().is_empty() {
-        return Err(AppError("HTTP 响应 body 为空".to_string()));
-    }
-    serde_json::from_str(json_part).map_err(|e| AppError(format!("解析响应失败: {e}")))
+    // connect 1500ms, write 5000ms, 带 X-Protocol-Version: 4.0
+    http_json_request_internal(ip, port, method, path, body, 1500, read_ms, 5000, Some("4.0"))
 }
 
 /// GET /api/v4/probe（直连对端 receive port，不走 port+1）
