@@ -55,6 +55,7 @@ use crate::pairing::trust::{self, TrustRecord};
 use crate::version::{Capabilities, DEFAULT_PORT, PROTOCOL_VERSION};
 
 use super::{err_response, ok_json, parse_body, SessionStore};
+use super::persist_pairing::PairingPersister;
 
 /// probe 签发但尚未被消费的 nonce 上限。
 ///
@@ -148,9 +149,19 @@ impl PeerRecord {
 }
 
 /// 已配对/已知对端的注册表（内存实现；生产换 rusqlite）。
-#[derive(Default)]
 pub struct PeerStore {
     inner: Mutex<HashMap<String, PeerRecord>>,
+    /// 可选持久化后端。有则在每次写操作后顺手写穿。
+    persister: Option<std::sync::Arc<PairingPersister>>,
+}
+
+impl Default for PeerStore {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+            persister: None,
+        }
+    }
 }
 
 impl PeerStore {
@@ -158,14 +169,49 @@ impl PeerStore {
         Self::default()
     }
 
+    /// 用持久化后端构造 + 冷启动预填充（初始化时串行执行，无并发竞争）。
+    pub(crate) fn with_persister_and_cold(
+        p: std::sync::Arc<PairingPersister>,
+        cold: Vec<PeerRecord>,
+    ) -> Self {
+        let mut inner: HashMap<String, PeerRecord> = Default::default();
+        for rec in cold {
+            inner.insert(rec.device_id.clone(), rec);
+        }
+        Self {
+            inner: Mutex::new(inner),
+            persister: Some(p),
+        }
+    }
+
     /// 取对端记录（克隆）。不存在返回 `None`。
     pub async fn entry(&self, id: &str) -> Option<PeerRecord> {
         self.inner.lock().await.get(id).cloned()
     }
 
-    /// 写入/覆盖对端记录。
+    /// 当前所有对端（诊断/测试）。
+    pub async fn all(&self) -> Vec<PeerRecord> {
+        self.inner.lock().await.values().cloned().collect()
+    }
+
+    /// 写穿：把当前全量记录持久化到磁盘（失败只 warn，不阻断）。
+    async fn persist_write(&self) {
+        if let Some(ref p) = self.persister {
+            let snapshot = {
+                let g = self.inner.lock().await;
+                g.values().cloned().collect::<Vec<_>>()
+            };
+            p.persist(&snapshot);
+        }
+    }
+
+    /// 写入/覆盖对端记录，并顺手写穿。
     pub async fn put(&self, rec: PeerRecord) {
-        self.inner.lock().await.insert(rec.device_id.clone(), rec);
+        {
+            let mut g = self.inner.lock().await;
+            g.insert(rec.device_id.clone(), rec);
+        }
+        self.persist_write().await;
     }
 
     /// S9：逐字段合并 —— 新记录**缺字段时保留旧值**，绝不整条覆盖。
@@ -183,37 +229,35 @@ impl PeerStore {
     ///
     /// 记录不存在时等价于 [`Self::put`]。
     pub async fn merge(&self, rec: PeerRecord) {
-        let mut g = self.inner.lock().await;
-        match g.get_mut(&rec.device_id) {
-            Some(existing) => {
-                if !rec.alias.is_empty() {
-                    existing.alias = rec.alias;
+        {
+            let mut g = self.inner.lock().await;
+            match g.get_mut(&rec.device_id) {
+                Some(existing) => {
+                    if !rec.alias.is_empty() {
+                        existing.alias = rec.alias;
+                    }
+                    if !rec.public_key.is_empty() {
+                        existing.public_key = rec.public_key;
+                    }
+                    if !rec.pairing_secret.is_empty() {
+                        existing.pairing_secret = rec.pairing_secret;
+                    }
+                    if rec.trust != TrustRecord::default() {
+                        existing.trust = rec.trust;
+                    }
+                    if rec.presence != Presence::Unknown {
+                        existing.presence = rec.presence;
+                    }
+                    if rec.last_peer_status.is_some() {
+                        existing.last_peer_status = rec.last_peer_status;
+                    }
                 }
-                if !rec.public_key.is_empty() {
-                    existing.public_key = rec.public_key;
+                None => {
+                    g.insert(rec.device_id.clone(), rec);
                 }
-                if !rec.pairing_secret.is_empty() {
-                    existing.pairing_secret = rec.pairing_secret;
-                }
-                if rec.trust != TrustRecord::default() {
-                    existing.trust = rec.trust;
-                }
-                if rec.presence != Presence::Unknown {
-                    existing.presence = rec.presence;
-                }
-                if rec.last_peer_status.is_some() {
-                    existing.last_peer_status = rec.last_peer_status;
-                }
-            }
-            None => {
-                g.insert(rec.device_id.clone(), rec);
             }
         }
-    }
-
-    /// 当前所有对端（诊断/测试）。
-    pub async fn all(&self) -> Vec<PeerRecord> {
-        self.inner.lock().await.values().cloned().collect()
+        self.persist_write().await;
     }
 }
 

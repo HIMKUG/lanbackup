@@ -40,6 +40,8 @@ pub mod control;
 pub mod sync_api;
 /// 传输会话的磁盘持久化（见 [`persist`] 模块文档：纯 Rust 原子写 JSON 后端）。
 pub(crate) mod persist;
+/// 配对记录的磁盘持久化（见 [`persist_pairing`] 模块文档：纯 Rust 原子写 JSON 后端）。
+pub(crate) mod persist_pairing;
 
 /// 单个会话的运行时记录
 pub struct SessionRecord {
@@ -173,6 +175,18 @@ impl SessionStore {
             None => None,
         };
 
+        // 配对记录持久化：与 persist 同目录
+        let pairing_persister = match persist_dir {
+            Some(dir) => match persist_pairing::PairingPersister::open(dir) {
+                Ok(p) => Some(Arc::new(p)),
+                Err(e) => {
+                    log::warn!("配对持久化不可用，降级为纯内存：{e}");
+                    None
+                }
+            },
+            None => None,
+        };
+
         let mut inner = HashMap::new();
         if let Some(p) = &persist {
             match p.load_all() {
@@ -181,12 +195,23 @@ impl SessionStore {
             }
         }
 
-        Arc::new(Self {
+        // 冷启动：从磁盘恢复 PeerStore（初始化时串行填充，无需并发保护）
+        let peers = if let Some(ref pp) = pairing_persister {
+            let cold = pp.load_all();
+            if !cold.is_empty() {
+                log::info!("配对记录冷启动恢复: {} 台", cold.len());
+            }
+            PeerStore::with_persister_and_cold(Arc::clone(pp), cold)
+        } else {
+            PeerStore::new()
+        };
+
+        Arc::new(SessionStore {
             inner: Mutex::new(inner),
             identity,
             alias: alias.to_string(),
             device_type,
-            peers: PeerStore::new(),
+            peers,
             handshake: HandshakeStore::new(),
             sync: sync_api::SyncStore::new(),
             persist,
