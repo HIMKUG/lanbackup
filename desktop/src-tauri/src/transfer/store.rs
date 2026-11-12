@@ -2,9 +2,17 @@
 //!
 //! 纯文件拆分重构：本文件内容从原 transfer.rs 原样移入，逻辑零改动。
 //! 通过 `use super::*` 访问 mod.rs 中的类型与外部 use。
+//!
+//! 配对记录的磁盘持久化现在走两条路径：
+//! 1. SQLite（原有，SQLite↔core drift 在 G5 消除）
+//! 2. core PeerStore（由 PairingState.session_store 注入，写穿消除 drift）
 
 use super::*;
 use base64::Engine as _;
+use lanbackup_core::dto::handshake::PairingState as TrustPairingState;
+use lanbackup_core::pairing::machine::PairingEvent;
+use lanbackup_core::pairing::trust::TrustRecord;
+use lanbackup_core::server::control::PeerRecord;
 
 pub(crate) fn http_json_request(
     ip: &str,
@@ -34,7 +42,7 @@ fn http_json_request_inner(
     body: &str,
 ) -> Result<serde_json::Value, AppError> {
     // connect 1500ms, read 3000ms, write 3000ms, 无 X-Protocol-Version
-    http_json_request_internal(ip, port, method, path, body, 1500, 3000, 3000, None)
+    http_json_request_internal(ip, port, method, path, body, &HttpRequestOptions::default())
 }
 
 /// sync_all_peers 的「连续 unknown」保护计数（进程内，不落库）：
@@ -63,6 +71,81 @@ fn all_paired_peers(app: &AppHandle) -> Vec<serde_json::Value> {
         }
     }
     out
+}
+
+/// G5：将 PairingState 中的配对记录同步写入 core PeerStore，消除 SQLite↔core drift。
+/// 在每一次配对写操作（confirm/sync/unpair/reset）后调用。
+pub(crate) fn sync_paired_to_core(app: &AppHandle) {
+    let store = match app.state::<PairingState>().session_store.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => return,
+    };
+    let store = match store {
+        Some(s) => s,
+        None => return, // SessionStore 未初始化（接收服务器尚未启动），跳过
+    };
+
+    let (paired_clone, secrets_map) = 'scope: {
+        let st = app.state::<PairingState>();
+        let paired_clone = match st.paired.lock() {
+            Ok(m) => m.clone(),
+            Err(_) => return,
+        };
+        let secrets_map = st.secrets.blocking_read();
+        // Clone the HashMap so the guard can be dropped before the async block
+        let map_clone = (*secrets_map).clone();
+        break 'scope (paired_clone, map_clone);
+    };
+
+    for (device_id, record) in paired_clone.iter() {
+        let status = record.get("status").and_then(|v| v.as_str()).unwrap_or("");
+
+        let trust_state = match status {
+            "ACTIVE" => TrustPairingState::Active,
+            "PENDING" | "REVOKE_PENDING" => TrustPairingState::Pending,
+            "REVOKED" | "DELETED" => TrustPairingState::Revoked,
+            _ => {
+                crate::log_debug!(
+                    "sync_paired_to_core: 跳过非活跃状态 deviceId={} status={}",
+                    device_id,
+                    status
+                );
+                continue;
+            }
+        };
+
+        let alias = record
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let peer_public_key = record
+            .get("peerPublicKey")
+            .and_then(|v| v.as_str())
+            .map(|s| base64::engine::general_purpose::STANDARD.decode(s).unwrap_or_default())
+            .unwrap_or_default();
+
+        let pairing_secret = secrets_map.get(device_id).cloned().unwrap_or_default();
+
+        let mut trust = TrustRecord::new();
+        let _ = trust.apply(PairingEvent::PeerConfirmed);
+        trust.state = trust_state;
+
+        let peer_record = PeerRecord::new(
+            device_id,
+            &alias,
+            peer_public_key,
+            pairing_secret,
+            trust,
+        );
+
+        let store = store.clone();
+        tokio::spawn(async move {
+            store.merge_peer(peer_record).await;
+        });
+    }
+    crate::log_debug!("sync_paired_to_core: 已推送 {} 条到 core PeerStore", paired_clone.len());
 }
 
 /// 本机被验证方记录的对端信任列表（双端配对同步）
@@ -179,6 +262,7 @@ pub fn confirm_paired(
         name
     );
     persist_paired(&app);
+    sync_paired_to_core(&app);
     Ok(())
 }
 
@@ -238,6 +322,7 @@ pub fn sync_paired(app: AppHandle, peers: Vec<serde_json::Value>) -> Result<(), 
     // UI 轮询伴随调用（每 10s）：DEBUG 级别，避免心跳刷屏
     crate::log_debug!("配对记录已全量同步: {peer_count} 台");
     persist_paired(&app);
+    sync_paired_to_core(&app);
     let ms = start.elapsed().as_millis();
     if ms >= 100 {
         crate::log_warn!("sync_paired 耗时 {ms}ms（疑似 SQLite 落盘瓶颈）");
@@ -278,21 +363,7 @@ pub fn persist_paired(app: &AppHandle) {
         }
     }
     // 加密在锁外进行（PBKDF2 只占本线程 CPU）
-    let rows: Vec<(
-        String,
-        String,
-        String,
-        i64,
-        String,
-        String,
-        Option<Vec<u8>>,
-        Option<String>,
-        String,
-        Option<Vec<u8>>,
-        i64,
-        i64,
-        Option<String>,
-    )> = peers
+    let rows: Vec<crate::db::PairedPeerRow> = peers
         .iter()
         .filter_map(|p| {
             let manifest = p.get("lastManifest")
@@ -351,15 +422,14 @@ pub fn persist_paired(app: &AppHandle) {
             ))
         })
         .collect();
-    if let Err(e) = crate::db::save_paired_peers(&app, rows) {
+    if let Err(e) = crate::db::save_paired_peers(app, rows) {
         crate::log_warn!("配对记录落盘失败: {e}");
     }
 }
-
 /// 用本机 L1 storage_key（PBKDF2-600k(连接码, salt=SHA256(本机device_id))）加密 pairing_secret。
 /// 加密/解密都是本机进行（方案.txt §2.1 L1：每设备唯一，防彩虹表）。
 fn encrypt_storage_secret(app: &AppHandle, _peer_device_id: &str, secret: &[u8]) -> Option<Vec<u8>> {
-    let code = identity::get_self_code(app);
+    let code = identity::get_self_code(app).ok()?;
     let my_id = identity::get_device_id(app);
     let key = crate::crypto::derive_storage_key_v2(&code, my_id.as_bytes()).ok()?;
     crate::crypto::encrypt(&key, secret).ok()
@@ -369,7 +439,7 @@ fn encrypt_storage_secret(app: &AppHandle, _peer_device_id: &str, secret: &[u8])
 fn decrypt_storage_secret(app: &AppHandle, _peer_device_id: &str, b64: &str) -> Option<Vec<u8>> {
     use base64::Engine as _;
     let data = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-    let code = identity::get_self_code(app);
+    let code = identity::get_self_code(app).ok()?;
     let my_id = identity::get_device_id(app);
     // v2：PBKDF2-600k（本轮写入一律 v2）
     if let Ok(key) = crate::crypto::derive_storage_key_v2(&code, my_id.as_bytes()) {
@@ -605,6 +675,7 @@ pub fn unpair_peer(app: AppHandle, device_id: String) -> Result<serde_json::Valu
                     s.remove(&device_id);
                 }
                 crate::transfer::persist_paired(&app);
+                sync_paired_to_core(&app);
                 let _ = app.emit("pair-unpaired", serde_json::json!({ "deviceId": device_id }));
                 crate::log_info!("在线解配对成功: deviceId={}", crate::logger::mask(&device_id));
                 return Ok(serde_json::json!({ "status": "REVOKED", "mode": "online" }));
@@ -629,6 +700,7 @@ pub fn unpair_peer(app: AppHandle, device_id: String) -> Result<serde_json::Valu
         }
     }
     persist_paired(&app);
+    sync_paired_to_core(&app);
     crate::log_info!("离线解配对: deviceId={} → REVOKE_PENDING（等待对方上线同步）", crate::logger::mask(&device_id));
     Ok(serde_json::json!({ "status": "REVOKE_PENDING", "mode": "offline", "revokeToken": token }))
 }
@@ -670,6 +742,7 @@ pub fn sync_all_peers(app: AppHandle) -> Result<serde_json::Value, AppError> {
                         s.remove(&device_id);
                     }
                     crate::transfer::persist_paired(&app);
+                    sync_paired_to_core(&app);
                     let _ = send_revoke_ack(&app, ip.clone(), port, device_id.clone(), token);
                     if let Ok(mut m) = sync_unknown_strikes().lock() {
                         m.remove(&device_id);
@@ -704,6 +777,7 @@ pub fn sync_all_peers(app: AppHandle) -> Result<serde_json::Value, AppError> {
                     s.remove(&device_id);
                 }
                 crate::transfer::persist_paired(&app);
+                sync_paired_to_core(&app);
                 if let Ok(mut m) = sync_unknown_strikes().lock() {
                     m.remove(&device_id);
                 }
@@ -749,6 +823,7 @@ pub fn reset_all_pairings(app: AppHandle) -> Result<(), AppError> {
         *k = Some(new_key);
     }
     persist_paired(&app);
+    sync_paired_to_core(&app);
     crate::transfer::notify_peers_disconnect(&app);
     let _ = app.emit("paired-updated", ());
     crate::log_info!("物理重置：已清空所有配对并重新生成签名身份");
@@ -778,6 +853,7 @@ pub fn reset_all_state(app: &AppHandle) -> Result<(), AppError> {
     crate::db::save_sig_key(app, &sig.0, &sig.1)?;
     if let Ok(mut k) = app.state::<PairingState>().sig_key.lock() { *k = Some(sig); }
     persist_paired(app);
+    sync_paired_to_core(app);
     crate::transfer::notify_peers_disconnect(app);
     let _ = app.emit("paired-updated", ());
     let _ = app.emit("pair-unpaired", serde_json::json!({ "reset": true }));

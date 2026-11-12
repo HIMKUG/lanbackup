@@ -208,6 +208,15 @@ pub struct FileMeta {
     /// 每个 piece 的 SHA-256（piece = 4MB）
     #[serde(rename = "pieceHashes", skip_serializing_if = "Option::is_none")]
     pub piece_hashes: Option<Vec<String>>,
+    /// 该文件是否按 AEAD 加密传输（WB-0540：`size` 始终是**明文**字节数，
+    /// `sha256` 是明文整文件哈希；`pieceHashes` 在加密文件上是**线路密文**
+    /// 的 SHA-256 —— 接收端按收到的字节比对）。
+    #[serde(rename = "encrypted", default)]
+    pub encrypted: bool,
+    /// 加密文件的线路总字节数 = `size` + piece 数 × 16B GCM tag。
+    /// 明文文件为 `None`；`encrypted=true` 时必须提供且与服务端推算一致。
+    #[serde(rename = "wireSize", skip_serializing_if = "Option::is_none")]
+    pub wire_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

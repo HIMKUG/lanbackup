@@ -1,0 +1,4 @@
+# WB-1034：钉住工具链版本 —— CI 与本地使用同一编译器，消除"我这能编"漂移。
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]

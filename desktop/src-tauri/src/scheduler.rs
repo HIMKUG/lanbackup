@@ -7,8 +7,6 @@ use sha2::Digest;
 use tokio::sync::{Semaphore, RwLock};
 use rand::Rng;
 
-use reqwest::Client;
-
 use crate::db::AppError;
 
 #[derive(Debug, Clone)]
@@ -167,7 +165,7 @@ impl MerkleTree {
             .map_err(|e| AppError(format!("读取文件元数据失败 {}: {}", path.display(), e)))?;
         let file_size = metadata.len();
 
-        let total_pieces = ((file_size + piece_size - 1) / piece_size) as usize;
+        let total_pieces = file_size.div_ceil(piece_size) as usize;
         let mut piece_hashes: Vec<String> = Vec::with_capacity(total_pieces);
 
         let block_size: u64 = 16 * 1024;
@@ -184,14 +182,14 @@ impl MerkleTree {
             let mut offset = piece_start;
 
             while offset < piece_end {
-                let read_size = (block_size as u64).min(piece_end - offset) as usize;
+                let read_size = block_size.min(piece_end - offset) as usize;
                 std::io::Read::read_exact(&mut file, &mut block_buf[..read_size])
                     .map_err(|e| AppError(format!("读取块失败 {}: {}", path.display(), e)))?;
                 file_hasher.update(&block_buf[..read_size]);
 
                 let leaf_hash = sha2::Sha256::digest(&block_buf[..read_size]).to_vec();
                 leaf_hashes.push(leaf_hash);
-                offset += block_size as u64;
+                offset += block_size;
             }
 
             let piece_root = if leaf_hashes.len() == 1 {
@@ -235,7 +233,7 @@ impl MerkleTree {
 
         let mut level: Vec<Vec<u8>> = hashes.to_vec();
         while level.len() > 1 {
-            let next_len = (level.len() + 1) / 2;
+            let next_len = level.len().div_ceil(2);
             let mut next: Vec<Vec<u8>> = Vec::with_capacity(next_len);
             for chunk in level.chunks(2) {
                 if chunk.len() == 2 {
@@ -258,7 +256,7 @@ impl MerkleTree {
     }
 
     pub fn piece_hashes_hex(&self) -> Vec<String> {
-        self.piece_hashes.iter().map(|h| hex::encode(h)).collect()
+        self.piece_hashes.iter().map(hex::encode).collect()
     }
 }
 
@@ -433,75 +431,6 @@ pub fn build_manifest(
         piece_hashes,
         protocol_extensions: vec!["scheduler-v1".to_string()],
     })
-}
-
-#[derive(Debug)]
-pub enum UploadChunkResponse {
-    Ok,
-    ChecksumFailed { reason: String },
-}
-
-pub struct SchedulerHttpClient {
-    client: Client,
-}
-
-impl SchedulerHttpClient {
-    pub fn new() -> Result<Self, AppError> {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(70))
-            .build()
-            .map_err(|e| AppError(format!("创建 HTTP 客户端失败: {e}")))?;
-        Ok(Self { client })
-    }
-
-    pub async fn upload_chunk(
-        &self,
-        ip: &str,
-        port: u16,
-        session_id: &str,
-        file_id: &str,
-        token: &str,
-        chunk_index: u32,
-        data: Vec<u8>,
-    ) -> Result<UploadChunkResponse, AppError> {
-        let url = format!(
-            "http://{}:{}/api/v4/session/chunk?sessionId={}&fileId={}&token={}&chunkIndex={}",
-            ip, port,
-            urlencoding::encode(session_id),
-            urlencoding::encode(file_id),
-            urlencoding::encode(token),
-            chunk_index
-        );
-
-        let resp = self.client
-            .post(&url)
-            .header("Content-Type", "application/octet-stream")
-            .body(data)
-            .send()
-            .await
-            .map_err(|e| AppError(format!("upload_chunk 请求失败: {e}")))?;
-
-        let status = resp.status().as_u16();
-
-        if status == 200 {
-            Ok(UploadChunkResponse::Ok)
-        } else if status == 422 {
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            let reason = body.get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("sha256_mismatch")
-                .to_string();
-            Ok(UploadChunkResponse::ChecksumFailed { reason })
-        } else {
-            Err(AppError(format!("upload_chunk 失败: {status}")))
-        }
-    }
-}
-
-impl Default for SchedulerHttpClient {
-    fn default() -> Self {
-        Self::new().expect("创建 SchedulerHttpClient 失败")
-    }
 }
 
 #[cfg(test)]

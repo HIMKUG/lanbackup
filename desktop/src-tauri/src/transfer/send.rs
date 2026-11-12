@@ -1,1145 +1,792 @@
-//! 传输模块 - 发送端流程（V4 协议版）
+//! 传输模块 - 发送端流程（V4 统一 piece 协议）
 //!
-//! 使用 V4 协议端点与接收端通信：
-//! - POST /api/v4/session/register   会话注册
-//! - POST /api/v4/session/prepare    上传准备，响应带 token
-//! - POST /api/v4/session/chunk      分块上传
-//! - GET  /api/v4/session/diff      块差异探测
-//! - POST /api/v4/session/heartbeat 心跳
-//! - POST /api/v4/session/abort     中止会话
+//! 只走一条链路，不再有 tiny 私有打包 / `__chunked__` 分片路径 / 8MB 调度块：
 //!
-//! **调度核心**：使用 `lanbackup_core::transfer::SessionDriver` 作为唯一编排器。
-//! Decision-IO 分离原则 —— SessionDriver 只做决策，desktop 负责所有 IO。
+//! ```text
+//! register → prepare → diff（整文件权威位图）→ chunk（pieceIndex + sha256）
+//!          → verify（接收端实算 SHA-256）→ tasks（接收端终态）
+//! ```
+//!
+//! 关键不变量：
+//! - 每个 `fileId` 对应**一个逻辑文件**，落盘 `relPath` 与 prepare 声明一致；
+//! - 分块大小固定为 core 的 `PIECE_SIZE`（4MB），最后一块按剩余长度收缩；
+//! - 每一块请求都检查 HTTP 状态，4xx/5xx 绝不计成功；
+//! - 终态只认接收端 `verify` + `tasks`，本地发送完成不算完成。
 
 use super::*;
-use hex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lanbackup_core::dto::session::{
-    SessionRegisterRequest, FileMeta as CoreFileMeta,
-    PrepareRequest, PrepareResponse,
+    FileMeta as CoreFileMeta, PrepareRequest, PrepareResponse, SessionRegisterRequest,
+    SessionRegisterResponse, TaskListResponse, TaskStatus, VerifyFileResponse,
 };
-#[allow(unused_imports)]
-use lanbackup_core::transfer::session::{SessionDriver, Step, Outcome, Applied, SessionError};
-#[allow(unused_imports)]
-use lanbackup_core::transfer::chunk::{ChunkPlan, PIECE_SIZE, BASIC_CHUNK_SIZE, PIECES_PER_BLOCK, strong_checksum, weak_checksum, PieceHash};
-use lanbackup_core::transfer::{PieceHashCache, PieceCacheKey, piece_count};
-use lanbackup_core::version::{Capabilities, CAP_ADVANCED};
+use lanbackup_core::transfer::chunk::{piece_count, PIECE_SIZE};
+use lanbackup_core::version::{Capabilities, CAP_ENCRYPT};
+
+const MAX_INFLIGHT_PIECES: usize = 4;
+const MAX_RETRIES: u32 = 3;
+const PROGRESS_INTERVAL_MS: u64 = 120;
+
+#[derive(Clone)]
+struct PreparedFile {
+    file_id: String,
+    rel_path: String,
+    abs_path: PathBuf,
+    size: u64,
+    mtime_ms: i64,
+    /// 加密文件 = **线路密文**逐 piece SHA-256；明文文件 = 明文 piece SHA-256
+    piece_hashes: Vec<String>,
+    whole_sha: String,
+    /// 加密文件的 file key（kdf L4，由配对 secret 派生，仅存内存）
+    enc_key: Option<[u8; 32]>,
+}
 
 pub async fn send_files(
     app: AppHandle,
     target_ip: String,
     target_port: u16,
-    target_code: String,
+    _target_code: String,
     files: Vec<SendFileItem>,
     encryption_mode: String,
+    peer_id: Option<String>,
 ) -> Result<u64, AppError> {
-    crate::log_info!(
-        "发送文件: 目标={target_ip}:{target_port} 文件数={} 加密={} 模式={}",
-        files.len(),
-        if target_code.is_empty() { "否" } else { "是" },
-        encryption_mode
-    );
     if files.is_empty() {
         return Ok(0);
     }
-
-    let original_count = files.len();
-    let files: Vec<SendFileItem> = {
-        let mut seen: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
-        files.into_iter().filter(|f| {
-            use std::collections::hash_map::Entry;
-            match seen.entry(f.rel_path.clone()) {
-                Entry::Vacant(e) => { e.insert(()); true }
-                Entry::Occupied(_) => false,
-            }
-        }).collect()
-    };
-    if files.len() < original_count {
-        crate::log_warn!("send_files: 去重前 {} 文件，去重后 {} 文件", original_count, files.len());
-    }
-    let started = std::time::Instant::now();
-
-    let use_encryption = !target_code.is_empty();
-    let mut ecdh_sender_pub: Option<String> = None;
-    let mut ecdh_sender_priv: Option<(String, [u8; 32])> = None;
-    if use_encryption && encryption_mode == "ecdh" {
-        let (priv_b64, pub_b64) = crate::crypto::ecdh_generate_keypair()
-            .map_err(|e| AppError(format!("ECDH 密钥生成失败: {e}")))?;
-        let salt = crate::crypto::derive_local_storage_key(&target_code);
-        ecdh_sender_pub = Some(pub_b64);
-        ecdh_sender_priv = Some((priv_b64, salt));
-    }
-    let mut enc_key: Option<[u8; 32]> = if !use_encryption {
-        None
-    } else if encryption_mode == "ecdh" {
-        None
-    } else {
-        Some(crate::crypto::derive_local_storage_key(&target_code))
-    };
-
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(70))
-        .build()
-        .map_err(|e| AppError(format!("创建 HTTP 客户端失败: {e}")))?;
-
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let device_name = identity::get_device_name(&app);
-    let device_id = identity::get_device_id(&app);
-
-    {
-        let ip = target_ip.clone();
-        let ready = tauri::async_runtime::spawn_blocking(move || {
-            for _ in 0..10 {
-                let addr = format!("{ip}:{target_port}");
-                if let Ok(a) = addr.parse::<std::net::SocketAddr>() {
-                    if std::net::TcpStream::connect_timeout(
-                        &a,
-                        std::time::Duration::from_millis(500),
-                    ).is_ok() {
-                        return true;
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(300));
-            }
-            false
-        })
-        .await
-        .unwrap_or(false);
-        if ready {
-            crate::log_debug!("对端接收服务已就绪: {target_ip}:{target_port}");
-        } else {
-            crate::log_warn!("对端接收服务未就绪，继续尝试传输: {target_ip}:{target_port}");
-        }
-    }
-
-    const CHUNK_SIZE: u64 = 8 * 1024 * 1024;
-    const LARGE_THRESHOLD: u64 = 100 * 1024 * 1024;
-    const TINY_BATCH_SIZE: usize = 20;
-    let mut tiny: Vec<SendFileItem> = Vec::new();
-    let mut normal: Vec<SendFileItem> = Vec::new();
-    let mut large_legacy: Vec<(SendFileItem, u64)> = Vec::new();
-    let mut sched_plans: Vec<(usize, SendFileItem, u64, crate::scheduler::FileManifest)> = Vec::new();
-    let mut sched_counter = 0usize;
-    for f in &files {
-        let size = std::fs::metadata(&f.abs_path).map(|m| m.len()).unwrap_or(0);
-        if size > 0 && size < 10 * 1024 {
-            tiny.push(f.clone());
-        } else if size > LARGE_THRESHOLD {
-            if !use_encryption {
-                let manifest = crate::scheduler::build_manifest(
-                    format!("s{sched_counter}"),
-                    f.rel_path.clone(),
-                    std::path::Path::new(&f.abs_path),
-                    CHUNK_SIZE,
-                )?;
-                sched_plans.push((sched_counter, f.clone(), size, manifest));
-                sched_counter += 1;
-            } else {
-                large_legacy.push((f.clone(), size));
-            }
-        } else {
-            normal.push(f.clone());
-        }
-    }
-    let mut chunked_items: Vec<SendFileItem> = Vec::new();
-    let mut sched_slices: Vec<(usize, usize, u32)> = Vec::new();
-    if !large_legacy.is_empty() {
-        let queries: Vec<_> = large_legacy
-            .iter()
-            .map(|(f, _)| {
-                let ip = target_ip.clone();
-                let rel = f.rel_path.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    query_chunk_status(&ip, target_port, &rel)
-                })
-            })
-            .collect();
-        let results = futures_util::future::join_all(queries).await;
-        for ((f, size), res) in large_legacy.iter().zip(results) {
-            let status = match res {
-                Ok(Ok(v)) => Ok(v),
-                _ => Err(()),
-            };
-            match status {
-                Ok(received) => {
-                    let total = ((size + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
-                    let mut idx = 0u32;
-                    let mut off = 0u64;
-                    while off < *size {
-                        if !received.contains(&idx) {
-                            let chunk_size = (*size).min(off + CHUNK_SIZE) - off;
-                            let width = total.to_string().len();
-                            chunked_items.push(SendFileItem {
-                                rel_path: format!(
-                                    "__chunked__/{}/{:0width$}/{:0width$}",
-                                    pct_encode(&f.rel_path),
-                                    idx,
-                                    total,
-                                    width = width
-                                ),
-                                abs_path: f.abs_path.clone(),
-                                offset: Some(off),
-                                size: Some(chunk_size),
-                            });
-                        }
-                        off += CHUNK_SIZE;
-                        idx += 1;
-                    }
-                    if !received.is_empty() {
-                        crate::log_info!(
-                            "断点续传: {} 已收 {} 个分片，本次补传缺失分片",
-                            f.rel_path,
-                            received.len()
-                        );
-                    }
-                }
-                Err(_) => {
-                    crate::log_warn!("分片状态查询失败，整文件传输: {}", f.rel_path);
-                    normal.push(f.clone());
-                }
-            }
-        }
-    }
-    for (plan_k, f, size, _m) in &sched_plans {
-        let total = ((*size + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
-        let width = total.to_string().len();
-        let mut idx = 0u32;
-        let mut off = 0u64;
-        while off < *size {
-            let chunk_size = (*size).min(off + CHUNK_SIZE) - off;
-            let gi = chunked_items.len();
-            chunked_items.push(SendFileItem {
-                rel_path: format!(
-                    "__chunked__/{}/{:0width$}/{:0width$}",
-                    pct_encode(&f.rel_path),
-                    idx,
-                    total,
-                    width = width
-                ),
-                abs_path: f.abs_path.clone(),
-                offset: Some(off),
-                size: Some(chunk_size),
-            });
-            sched_slices.push((gi, *plan_k, idx));
-            off += CHUNK_SIZE;
-            idx += 1;
-        }
-    }
-
-    let mut upload_items: Vec<SendFileItem> = Vec::with_capacity(files.len() + 1);
-    let mut batch_tmp: Vec<PathBuf> = Vec::new();
-    for chunk in tiny.chunks(TINY_BATCH_SIZE) {
-        let tar = match pack_batch(chunk) {
-            Ok(t) => t,
-            Err(e) => {
-                for t in &batch_tmp {
-                    let _ = std::fs::remove_file(t);
-                }
-                return Err(e);
-            }
-        };
-        let tmp = std::env::temp_dir().join(format!(
-            "backup_batch_{}_{}_{}.tar",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0),
-            batch_tmp.len()
-        ));
-        std::fs::write(&tmp, &tar).map_err(AppError::from_display)?;
-        batch_tmp.push(tmp.clone());
-        upload_items.push(SendFileItem {
-            rel_path: format!("__batch__.agg.{}", batch_tmp.len()),
-            abs_path: tmp.to_string_lossy().to_string(),
-            offset: None,
-            size: None,
-        });
-    }
-    let chunked_count = chunked_items.len();
-    upload_items.extend(chunked_items);
-    upload_items.extend(normal.iter().cloned());
-    let batch_count = batch_tmp.len();
-
-    let sizes: Vec<u64> = upload_items
-        .iter()
-        .map(|f| {
-            let plain = f.size.unwrap_or_else(|| std::fs::metadata(&f.abs_path).map(|m| m.len()).unwrap_or(0));
-            if use_encryption {
-                crate::crypto::enc_output_size(plain)
-            } else {
-                plain
-            }
-        })
-        .collect();
-
-    let session_id = uuid::Uuid::new_v4().to_string();
-
-    let base_url = format!("http://{target_ip}:{target_port}");
-
-    let reg_req = SessionRegisterRequest {
-        device_id: device_id.clone(),
-        alias: device_name.clone(),
-        session_id: session_id.clone(),
-    };
-    match http_client
-        .post(format!("{base_url}/api/v4/session/register"))
-        .json(&reg_req)
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                crate::log_info!("register 成功 对端={}:{}", target_ip, target_port);
-            } else {
-                crate::log_warn!("register 失败 status={}", resp.status().as_u16());
-            }
-        }
-        Err(e) => crate::log_warn!("register 失败（不阻断传输）: {e}"),
-    }
-
-    let cache = std::sync::Arc::new(PieceHashCache::new());
-    let mut piece_hex_cache: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    let normal_start = batch_count + chunked_count;
-    for (i, f) in normal.iter().enumerate() {
-        let file_id = format!("f{}", normal_start + i);
-        if let Some(hexes) = compute_piece_hexes(&cache, &f.abs_path, sizes[normal_start + i]) {
-            piece_hex_cache.insert(file_id, hexes);
-        }
-    }
-
-    let mut prepare_files: std::collections::HashMap<String, CoreFileMeta> = std::collections::HashMap::new();
-    let mut file_size_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    for (i, f) in upload_items.iter().enumerate() {
-        let mtime = file_modified_millis(&f.abs_path).unwrap_or(0);
-        let size = sizes[i];
-        file_size_map.insert(format!("f{i}"), size);
-        let piece_hashes = if i >= normal_start {
-            piece_hex_cache.get(&format!("f{i}")).cloned()
-        } else {
-            None
-        };
-        prepare_files.insert(format!("f{i}"), CoreFileMeta {
-            file_id: format!("f{i}"),
-            file_name: f.rel_path.clone(),
-            rel_path: f.rel_path.clone(),
-            size,
-            mtime,
-            sha256: None,
-            merkle_root: None,
-            piece_hashes,
-        });
-    }
-    for (plan_k, f, _, m) in &sched_plans {
-        let fid = format!("s{plan_k}");
-        let mtime = file_modified_millis(&f.abs_path).unwrap_or(0);
-        file_size_map.insert(fid.clone(), m.file_size);
-        prepare_files.insert(fid.clone(), CoreFileMeta {
-            file_id: fid,
-            file_name: f.rel_path.clone(),
-            rel_path: f.rel_path.clone(),
-            size: m.file_size,
-            mtime,
-            sha256: Some(m.file_sha256.clone()),
-            merkle_root: m.merkle_root.clone(),
-            piece_hashes: Some(m.piece_hashes.clone()),
-        });
-    }
-    let prepare_req = PrepareRequest {
-        session_id: session_id.clone(),
-        device_id: device_id.clone(),
-        files: prepare_files,
-    };
-    let prepared: PrepareResponse = http_client
-        .post(format!("{base_url}/api/v4/session/prepare"))
-        .json(&prepare_req)
-        .timeout(std::time::Duration::from_secs(70))
-        .send()
-        .await
-        .map_err(|e| AppError(format!("准备上传失败: {e}")))?
-        .json()
-        .await
-        .map_err(|e| AppError(format!("解析 prepare 响应失败: {e}")))?;
-
-    if prepared.session_id.is_empty() {
-        crate::log_info!("prepare 无响应（目标端未接受任何文件）");
-        for t in &batch_tmp {
-            let _ = std::fs::remove_file(t);
-        }
-        return Ok(0);
-    }
-    let response_session_id = prepared.session_id.clone();
     crate::log_info!(
-        "prepare 成功 session={} 接受文件数={}",
-        crate::logger::mask(&response_session_id),
-        prepared.files.len()
+        "发送文件: 目标={}:{} 文件数={} 加密模式={} 配对设备={}",
+        target_ip,
+        target_port,
+        files.len(),
+        encryption_mode,
+        peer_id.as_deref().unwrap_or("<未指定>")
     );
 
-    if enc_key.is_none() && use_encryption {
-        if let (Some((priv_b64, salt)), Some(pub_recv)) = (&ecdh_sender_priv, &ecdh_sender_pub) {
-            let shared = crate::crypto::ecdh_derive_shared_secret(priv_b64, pub_recv)
-                .map_err(|e| AppError(format!("ECDH 共享密钥派生失败: {e}")))?;
-            enc_key = Some(
-                crate::crypto::derive_session_key(&shared, salt)
-                    .map_err(|e| AppError(format!("session_key 派生失败: {e}")))?,
-            );
-            crate::log_info!("ECDH 复杂加密协商完成，session_key 已派生");
-        } else {
-            crate::log_warn!("接收端未返回 ECDH 公钥，降级为简单加密");
-            enc_key = Some(crate::crypto::derive_local_storage_key(&target_code));
-        }
+    // WB-0032：加密能力协商在 register 之后做（需要对端能力位 + 本机配对密钥）。
+    // ecdh（每会话 ECDH 密钥协商）仍未实现，显式请求直接拒绝，绝不静默降级。
+    if encryption_mode == "ecdh" {
+        return Err(AppError(
+            "ECDH 加密尚未实现：请使用兼容模式（已配对设备将自动启用 AEAD 加密）".to_string(),
+        ));
     }
+    let wants_encryption = encryption_mode == "simple" || encryption_mode == "auto";
+    // 配对 secret：仅当指定来源设备（peerId）且本机存有其 32B 配对密钥时可用。
+    // 密钥只在本进程内存中流转，不进日志（WB-0653）。
+    let enc_secret: Option<[u8; 32]> = peer_id.as_deref().and_then(|pid| {
+        let st = app.try_state::<PairingState>()?;
+        let map = st.secrets.try_read().ok()?;
+        let v = map.get(pid)?;
+        if v.len() != 32 {
+            crate::log_warn!("对端配对密钥长度异常（{}B），跳过加密协商", v.len());
+            return None;
+        }
+        let mut k = [0u8; 32];
+        k.copy_from_slice(v);
+        Some(k)
+    });
+
+    let session_id = hex::encode(rand::random::<[u8; 16]>());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    {
+        let st = app.state::<TransferState>();
+        st.active_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(session_id.clone(), cancel.clone());
+    }
+    if let Some(st) = app.try_state::<PairingState>() {
+        st.transfer_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let result = run_send(
+        &app,
+        SendTarget { ip: &target_ip, port: target_port },
+        &session_id,
+        files,
+        &cancel,
+        EncryptionPlan { wants: wants_encryption, secret: enc_secret },
+    )
+    .await;
 
     {
         let st = app.state::<TransferState>();
-        let mut sessions = st.active_sessions.lock().unwrap_or_else(|p| p.into_inner());
-        sessions.insert(response_session_id.clone(), cancel.clone());
+        st.active_sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&session_id);
     }
-
-    let sched = app.state::<crate::scheduler::SendScheduler>();
-    let store = app.state::<session_store::DesktopSessionStore>();
-    let _peer_session_id = sched.add_peer(target_ip.clone(), target_port).await;
-    sched.set_peer_state(&target_ip, target_port, crate::scheduler::SessionState::Sending).await;
-    let session_files: Vec<session_store::FileManifest> = sched_plans
-        .iter()
-        .map(|(_, f, size, m)| session_store::FileManifest {
-            id: m.file_id.clone(),
-            file_name: f.rel_path.clone(),
-            size: *size,
-            sha256: m.file_sha256.clone(),
-            merkle_root: m.merkle_root.clone(),
-            piece_hashes: m.piece_hashes.clone(),
-            chunk_size: Some(m.chunk_size),
-        })
-        .collect();
-    let _ = store
-        .create_session(session_store::SessionState {
-            id: response_session_id.clone(),
-            files: session_files,
-            peers: vec![crate::scheduler::PeerInfo {
-                peer_id: device_id.clone(),
-                alias: device_name.clone(),
-                ip: target_ip.clone(),
-                port: target_port,
-                status: crate::scheduler::PeerStatus::Connected,
-            }],
-            progress: std::collections::HashMap::new(),
-            created_at: session_store_ts(),
-            updated_at: session_store_ts(),
-            status: session_store::SessionStatus::Active,
-        })
-        .await;
-
-    let mut skip_global: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    if !sched_plans.is_empty() {
-        crate::log_info!("Scheduler 差异同步: 接收端 chunkDiff 探测（V4 对端）");
-        for (gi, plan_k, chunk_idx) in &sched_slices {
-            let fid = format!("s{plan_k}");
-            let matched = matches!(
-                http_client
-                    .get(format!(
-                        "{base_url}/api/v4/session/diff?sessionId={}&fileId={}&chunkIndex={}&chunkSize={}",
-                        urlencoding::encode(&response_session_id),
-                        urlencoding::encode(&fid),
-                        chunk_idx,
-                        CHUNK_SIZE
-                    ))
-                    .send()
-                    .await,
-                Ok(resp) if resp.status().as_u16() == 206
-            );
-            if matched {
-                skip_global.insert(batch_count + gi);
-            }
-        }
-        if !skip_global.is_empty() {
-            crate::log_info!(
-                "Scheduler 差异同步: 跳过 {} 个已匹配分片",
-                skip_global.len()
-            );
-        }
+    if let Some(st) = app.try_state::<PairingState>() {
+        st.transfer_count.fetch_sub(1, Ordering::Relaxed);
     }
-
-    let sched_global: std::collections::HashSet<usize> =
-        sched_slices.iter().map(|(gi, _, _)| batch_count + gi).collect();
-    let sched_idx_map: std::collections::HashMap<usize, (usize, u32)> = sched_slices
-        .iter()
-        .map(|(gi, pk, ci)| (batch_count + gi, (*pk, *ci)))
-        .collect();
-
-    let negotiated_caps = Capabilities::from_bits(prepared.capabilities.bits());
-    let use_advanced = negotiated_caps.contains(CAP_ADVANCED);
-    let mut skip_pieces: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
-    let mut skip_blocks: std::collections::HashMap<String, std::collections::HashSet<u64>> = std::collections::HashMap::new();
-
-    if use_advanced {
-        for (plan_k, _f, size, _manifest) in &sched_plans {
-            let plan = ChunkPlan::new(*size, lanbackup_core::dto::session::Algorithm::Advanced);
-            let confirmed = query_confirmed_pieces(&http_client, &base_url, &response_session_id, &format!("s{plan_k}"), plan.piece_count, PIECE_SIZE).await;
-            if let Some(cp) = confirmed {
-                let piece_count = plan.piece_count;
-                let block_count = plan.block_count;
-                let driver = SessionDriver::resume(plan, false, &cp);
-                let step = driver.next_step();
-                let key = format!("s{plan_k}");
-                if let Step::SendPiece { .. } = step {
-                    let mut cp_vec: Vec<u64> = cp.iter().copied().collect();
-                    cp_vec.sort_unstable();
-                    let blocks: std::collections::HashSet<u64> = cp.iter().map(|p| p / PIECES_PER_BLOCK).collect();
-                    let skipped_pieces = cp.len();
-                    let skipped_blocks = blocks.len();
-                    skip_pieces.insert(key.clone(), cp_vec);
-                    skip_blocks.insert(key, blocks);
-                    crate::log_info!("SessionDriver: 跳过 {}/{} piece ({}/{} block)",
-                        skipped_pieces, piece_count, skipped_blocks, block_count);
-                } else if step.is_done() {
-                    skip_pieces.insert(key.clone(), vec![]);
-                    skip_blocks.insert(key, (0..block_count).collect());
-                }
-            } else {
-                skip_pieces.insert(format!("s{plan_k}"), vec![]);
-                skip_blocks.insert(format!("s{plan_k}"), std::collections::HashSet::new());
-            }
-        }
-    }
-
-    use std::sync::atomic::Ordering;
-    let total_units = (upload_items.len() - skip_global.len()) as u64;
-    let sent_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let planned_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let sched_client = std::sync::Arc::new(crate::scheduler::SchedulerHttpClient::new()?);
-
-    for (bi, f) in upload_items.iter().take(batch_count).enumerate() {
-        let file_id = format!("f{bi}");
-        let Some(token) = prepared.files.get(&file_id) else {
-            continue;
-        };
-        let upload_size = sizes[bi];
-        planned_bytes.fetch_add(upload_size, Ordering::Relaxed);
-        crate::log_info!("批量聚合上传 tiny → {} ({}B)", f.rel_path, upload_size);
-        let key = per_file_enc_key(&app, &target_ip, &file_id, enc_key);
-        upload_single_with_retry(
-            &http_client,
-            target_ip.clone(),
-            target_port,
-            response_session_id.clone(),
-            file_id,
-            token.clone(),
-            PathBuf::from(&f.abs_path),
-            upload_size,
-            None,
-            None,
-            key,
-            cancel.clone(),
-            app.clone(),
-            f.rel_path.clone(),
-            started,
-            sent_counter.load(Ordering::Relaxed),
-            total_units,
-        )
-        .await
-        .map_err(|e| {
-            for t in &batch_tmp {
-                let _ = std::fs::remove_file(t);
-            }
-            e
-        })?;
-        sent_counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    let normal_units: Vec<(usize, &SendFileItem)> = upload_items
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i >= batch_count && !skip_global.contains(i))
-        .collect();
-    let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send>>> =
-        Vec::with_capacity(normal_units.len());
-    for (i, f) in normal_units {
-        let token = match prepared.files.get(&format!("f{i}")) {
-            Some(t) => t.clone(),
-            None => {
-                crate::log_debug!("目标端未接受 {}，跳过", f.rel_path);
-                continue;
-            }
-        };
-        planned_bytes.fetch_add(sizes[i], Ordering::Relaxed);
-        let sent_now = sent_counter.load(Ordering::Relaxed);
-        let counter = sent_counter.clone();
-        let app2 = app.clone();
-        let ip = target_ip.clone();
-        let sid = response_session_id.clone();
-        let cancel2 = cancel.clone();
-        let rel = f.rel_path.clone();
-        let path = PathBuf::from(&f.abs_path);
-        let size_i = sizes[i];
-        let offset = f.offset;
-        let csize = f.size;
-        let client_ref = &http_client;
-
-        if sched_global.contains(&i) {
-            let (plan_k, chunk_idx) = *sched_idx_map.get(&i).unwrap_or(&(0, 0));
-            let file_key = format!("s{plan_k}");
-            if skip_blocks.get(&file_key).map(|s| s.contains(&(chunk_idx as u64))).unwrap_or(false) {
-                let skipped_n = counter.load(Ordering::Relaxed);
-                let _ = app2.emit(
-                    "send-progress",
-                    serde_json::json!({
-                        "sent": skipped_n,
-                        "total": total_units,
-                        "fileName": f.rel_path,
-                        "stage": "skipping",
-                        "bytes": 0,
-                        "totalBytes": 0,
-                        "bytesSent": 0,
-                        "elapsedMs": started.elapsed().as_millis() as u64,
-                    }),
-                );
-                continue;
-            }
-            let pieces_total = sched_plans[plan_k].3.total_chunks;
-            let file_id = format!("f{i}");
-            let sc = sched_client.clone();
-            let sched2 = sched.clone();
-            let store2 = store.clone();
-            let ip2 = target_ip.clone();
-            let path2 = PathBuf::from(&f.abs_path);
-            let off = offset.unwrap_or(0);
-            let csize2 = csize.unwrap_or(0) as usize;
-            let fname = f.rel_path.clone();
-            let sem = sched2.global_chunks();
-            let rb = sched2.retry_bucket();
-            let counter2 = counter.clone();
-            let app3 = app2.clone();
-            futs.push(Box::pin(async move {
-                let _permit = sem
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| AppError("调度器信号量关闭".to_string()))?;
-                let data = {
-                    use std::io::{Read, Seek, SeekFrom};
-                    let mut file = std::fs::File::open(&path2)
-                        .map_err(|e| AppError(format!("打开分片失败 {}: {e}", path2.display())))?;
-                    file.seek(SeekFrom::Start(off))
-                        .map_err(|e| AppError(format!("分片 seek 失败: {e}")))?;
-                    let mut buf = vec![0u8; csize2];
-                    file.read_exact(&mut buf)
-                        .map_err(|e| AppError(format!("分片读取失败: {e}")))?;
-                    buf
-                };
-                upload_scheduler_chunk(
-                    &sc,
-                    &ip2,
-                    target_port,
-                    &sid,
-                    &file_id,
-                    &token,
-                    chunk_idx,
-                    data,
-                    &rb,
-                    &store2,
-                    &sid,
-                    &fname,
-                    size_i,
-                    pieces_total,
-                    &app3,
-                    started,
-                    sent_now,
-                    total_units,
-                )
-                .await?;
-                let n = counter2.fetch_add(1, Ordering::Relaxed) + 1;
-                let _ = app3.emit(
-                    "send-progress",
-                    serde_json::json!({
-                        "sent": n,
-                        "total": total_units,
-                        "fileName": "",
-                        "stage": "sending",
-                        "bytes": 0,
-                        "totalBytes": 0,
-                        "bytesSent": 0,
-                        "elapsedMs": started.elapsed().as_millis() as u64,
-                    }),
-                );
-                Ok::<(), AppError>(())
-            }));
-            continue;
-        }
-
-        let file_id = format!("f{i}");
-        let key = per_file_enc_key(&app2, &ip, &file_id, enc_key);
-        futs.push(Box::pin(async move {
-            upload_single_with_retry(
-                client_ref,
-                ip,
-                target_port,
-                sid,
-                file_id,
-                token,
-                path,
-                size_i,
-                offset,
-                csize,
-                key,
-                cancel2,
-                app2.clone(),
-                rel,
-                started,
-                sent_now,
-                total_units,
-            )
-            .await?;
-            let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-            let _ = app2.emit(
-                "send-progress",
-                serde_json::json!({
-                    "sent": n,
-                    "total": total_units,
-                    "fileName": "",
-                    "stage": "sending",
-                    "bytes": 0,
-                    "totalBytes": 0,
-                    "bytesSent": 0,
-                    "elapsedMs": started.elapsed().as_millis() as u64,
-                }),
-            );
-            Ok::<(), AppError>(())
-        }));
-    }
-    let results: Result<Vec<()>, AppError> = futures_util::stream::iter(futs)
-        .buffer_unordered(8)
-        .try_collect()
-        .await;
-    if let Err(e) = results {
-        sched.set_peer_state(&target_ip, target_port, crate::scheduler::SessionState::Error(e.to_string())).await;
-        sched.remove_peer(&target_ip, target_port).await;
-        let _ = store.fail_session(&response_session_id, Some(e.to_string())).await;
-        for t in &batch_tmp {
-            let _ = std::fs::remove_file(t);
-        }
-        return Err(e);
-    }
-    sched.set_peer_state(&target_ip, target_port, crate::scheduler::SessionState::Complete).await;
-    sched.remove_peer(&target_ip, target_port).await;
-    let _ = store.complete_session(&response_session_id).await;
-    let sent = sent_counter.load(Ordering::Relaxed);
-    let total_bytes = planned_bytes.load(Ordering::Relaxed);
-    crate::log_info!("发送完成: 共发送 {sent}/{total_units} 个传输单元");
-
-    if let Err(e) = app
-        .state::<crate::AppState>()
-        .db
-        .add_transfer("out", &target_ip, sent, total_bytes, started.elapsed().as_millis() as u64)
-    {
-        crate::log_warn!("写入传输历史失败: {e}");
-    }
-    let _ = app.emit("transfers-updated", ());
-
-    for t in &batch_tmp {
-        let _ = std::fs::remove_file(t);
-    }
-
-    Ok(sent)
+    result
 }
 
-async fn upload_scheduler_chunk(
-    client: &crate::scheduler::SchedulerHttpClient,
-    ip: &str,
+/// 发送目标（IP:端口）。
+struct SendTarget<'a> {
+    ip: &'a str,
     port: u16,
+}
+
+/// 加密协商输入（是否要求加密 + 已配对设备的 32B 密钥）。
+struct EncryptionPlan {
+    wants: bool,
+    secret: Option<[u8; 32]>,
+}
+
+async fn run_send(
+    app: &AppHandle,
+    target: SendTarget<'_>,
     session_id: &str,
-    file_id: &str,
-    token: &str,
-    chunk_index: u32,
-    data: Vec<u8>,
-    retry_bucket: &tokio::sync::Semaphore,
-    store: &session_store::DesktopSessionStore,
-    store_session_id: &str,
-    file_name: &str,
-    upload_size: u64,
-    pieces_total: u32,
-    app: &tauri::AppHandle,
-    started: std::time::Instant,
-    sent_so_far: u64,
-    total_units: u64,
-) -> Result<(), AppError> {
-    let mut attempts = 0u32;
-    loop {
-        attempts += 1;
-        let _retry_permit = retry_bucket
-            .acquire()
+    files: Vec<SendFileItem>,
+    cancel: &tokio_util::sync::CancellationToken,
+    enc: EncryptionPlan,
+) -> Result<u64, AppError> {
+    let started = std::time::Instant::now();
+    let base = format!("http://{}:{}", target.ip, target.port);
+    let client = reqwest::Client::builder()
+        // 不设全局 70s 超时：大文件会被整段传输时间一刀切。改为每请求超时。
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| AppError(format!("创建 HTTP 客户端失败: {e}")))?;
+
+    // ── 1. 规范化 + 去重 + 单遍哈希 ──
+    let mut seen = std::collections::HashSet::new();
+    let mut items: Vec<SendFileItem> = Vec::new();
+    for f in files {
+        let normalized = lanbackup_core::sync::manifest::validate_rel_path(&f.rel_path)
+            .map_err(|e| AppError(format!("非法相对路径 {:?}: {e}", f.rel_path)))?;
+        if !seen.insert(normalized.clone()) {
+            crate::log_warn!("发送列表存在重复 relPath，已忽略: {normalized}");
+            continue;
+        }
+        items.push(SendFileItem {
+            rel_path: normalized,
+            abs_path: f.abs_path,
+        });
+    }
+    if items.is_empty() {
+        return Ok(0);
+    }
+    let total_files = items.len() as u64;
+
+    // 必须 `.cloned()`：用 `iter()` 借用的闭包在 tauri `generate_handler!` 的
+    // 高阶生命周期检查下报 "implementation of FnOnce is not general enough"。
+    #[allow(clippy::redundant_iter_cloned)]
+    let hashed = futures_util::stream::iter(items.iter().cloned().map(|item| {
+        let path = PathBuf::from(&item.abs_path);
+        async move {
+            tokio::task::spawn_blocking(move || hash_file(&path))
+                .await
+                .map_err(|e| AppError(format!("哈希任务失败: {e}")))?
+        }
+    }))
+    .buffer_unordered(4)
+    .collect::<Vec<Result<(u64, i64, Vec<String>, String), AppError>>>()
+    .await;
+
+    let mut prepared: Vec<PreparedFile> = Vec::with_capacity(items.len());
+    for (i, h) in hashed.into_iter().enumerate() {
+        let (size, mtime_ms, piece_hashes, whole_sha) = h?;
+        let item = &items[i];
+        prepared.push(PreparedFile {
+            file_id: format!("f{i}"),
+            rel_path: item.rel_path.clone(),
+            abs_path: PathBuf::from(&item.abs_path),
+            size,
+            mtime_ms,
+            piece_hashes,
+            whole_sha,
+            enc_key: None,
+        });
+    }
+
+    // ── 2. register（失败必须阻断：没有会话就没有后续端点）──
+    let reg_req = SessionRegisterRequest {
+        device_id: identity::get_device_id(app),
+        alias: identity::get_device_name(app)?,
+        session_id: session_id.to_string(),
+    };
+    let reg_resp = checked_json::<SessionRegisterResponse>(
+        client
+            .post(format!("{base}/api/v4/session/register"))
+            .json(&reg_req)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await,
+        "register",
+    )
+    .await?;
+    let peer_caps = Capabilities::from_bits(reg_resp.capabilities.bits());
+    // WB-0032/0650：协商默认一致 —— "用户要求加密 + 本机持有对端配对密钥 +
+    // 对端声明 CAP_ENCRYPT"三者同时成立才加密；任一不成立走明文，但必须发出
+    // 可见告警，绝不静默降级。
+    let encrypt = enc.wants && enc.secret.is_some() && peer_caps.contains(CAP_ENCRYPT);
+    if enc.wants && !encrypt {
+        crate::log_warn!("加密条件不满足（缺配对密钥或对端不支持），本次为明文传输");
+        let _ = app.emit(
+            "send-warning",
+            serde_json::json!({
+                "code": "ENCRYPTION_DEGRADED",
+                "message": "未能建立加密通道（缺配对密钥或对端不支持），本次为局域网明文传输"
+            }),
+        );
+    }
+    // 加密文件：prepare 必须携带**线路密文**的逐 piece 哈希 —— 对每个文件预演
+    // 一次逐 piece 加密（nonce=序号，确定性派生），得到密文哈希；上传时按同一
+    // 公式重加密，密文逐字节一致。
+    if let Some(secret) = enc.secret.filter(|_| encrypt) {
+        for pf in prepared.iter_mut() {
+            let sk = lanbackup_core::crypto::kdf::derive_session_key(&secret, &secret, session_id);
+            let fk = lanbackup_core::crypto::kdf::derive_file_key(&sk, &pf.file_id);
+            let path = pf.abs_path.clone();
+            let size = pf.size;
+            let sid = session_id.to_string();
+            let fid = pf.file_id.clone();
+            pf.piece_hashes = tokio::task::spawn_blocking(move || {
+                cipher_piece_hashes(&path, size, &sid, &fid, &fk)
+            })
             .await
-            .map_err(|_| AppError("调度器重试令牌桶关闭".to_string()))?;
-        match client
-            .upload_chunk(ip, port, session_id, file_id, token, chunk_index, data.clone())
-            .await
-        {
-            Ok(crate::scheduler::UploadChunkResponse::Ok) => break,
-            Ok(crate::scheduler::UploadChunkResponse::ChecksumFailed { reason }) => {
-                crate::log_warn!("Scheduler 分片校验失败 {} 块{}: {}", file_name, chunk_index, reason);
-                if attempts >= 3 {
-                    return Err(AppError(format!("Scheduler 分片校验失败: {file_name} 块{chunk_index}")));
-                }
-            }
-            Err(e) => {
-                if attempts >= 3 {
-                    return Err(e);
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(300 * attempts as u64)).await;
-            }
+            .map_err(|e| AppError(format!("加密预演任务失败: {e}")))??;
+            pf.enc_key = Some(fk);
         }
     }
-    let _ = store
-        .update_progress(
-            store_session_id,
-            {
-                let mut m = std::collections::HashMap::new();
-                m.insert(
-                    file_id.to_string(),
-                    crate::scheduler::TransferProgress {
-                        file_id: file_id.to_string(),
-                        sent_bytes: upload_size,
-                        total_bytes: upload_size,
-                        pieces_completed: chunk_index + 1,
-                        pieces_total,
-                        retry_count: attempts.saturating_sub(1),
-                        last_error: None,
-                    },
-                );
-                m
+
+    // ── 3. prepare：一个逻辑文件一条 meta ──
+    let mut prepare_files = std::collections::HashMap::new();
+    for pf in &prepared {
+        // WB-0540：size/整文件哈希始终是明文语义；加密文件的 wireSize 单独承载
+        // 线路字节数（明文 + 每 piece 16B GCM tag）。
+        prepare_files.insert(
+            pf.file_id.clone(),
+            CoreFileMeta {
+                file_id: pf.file_id.clone(),
+                file_name: pf.rel_path.clone(),
+                rel_path: pf.rel_path.clone(),
+                size: pf.size,
+                mtime: pf.mtime_ms,
+                sha256: Some(pf.whole_sha.clone()),
+                merkle_root: None,
+                piece_hashes: Some(pf.piece_hashes.clone()),
+                encrypted: encrypt,
+                wire_size: if encrypt {
+                    Some(pf.size + piece_count(pf.size) * 16)
+                } else {
+                    None
+                },
             },
+        );
+    }
+    let prepared_resp = checked_json::<PrepareResponse>(
+        client
+            .post(format!("{base}/api/v4/session/prepare"))
+            .json(&PrepareRequest {
+                session_id: session_id.to_string(),
+                device_id: identity::get_device_id(app),
+                files: prepare_files,
+            })
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await,
+        "prepare",
+    )
+    .await?;
+
+    let accepted: Vec<PreparedFile> = prepared
+        .into_iter()
+        .filter(|pf| prepared_resp.files.contains_key(&pf.file_id))
+        .collect();
+    if accepted.is_empty() {
+        return Err(AppError("接收端未接受任何文件".to_string()));
+    }
+    // 进度按线路字节数统计（加密文件 = 明文 + 每 piece 16B tag），与逐块累计一致
+    let bytes_total: u64 = accepted
+        .iter()
+        .map(|pf| {
+            if encrypt {
+                pf.size + piece_count(pf.size) * 16
+            } else {
+                pf.size
+            }
+        })
+        .sum();
+    let bytes_sent = AtomicU64::new(0);
+    let completed_files = AtomicU64::new(0);
+    let last_emit = AtomicU64::new(0);
+
+    // ── 4. 逐文件：diff → chunk → verify ──
+    let mut verified: Vec<String> = Vec::new();
+    for pf in &accepted {
+        if cancel.is_cancelled() {
+            return Err(AppError("发送已取消".to_string()));
+        }
+        let token = prepared_resp
+            .files
+            .get(&pf.file_id)
+            .cloned()
+            .unwrap_or_default();
+
+        // 整文件 diff：接收端返回 missing/mismatched 两个集合。
+        let diff_url = format!(
+            "{base}/api/v4/session/diff?sessionId={}&fileId={}&etag={}&token={}",
+            urlencoding::encode(session_id),
+            urlencoding::encode(&pf.file_id),
+            urlencoding::encode(&pf.whole_sha),
+            urlencoding::encode(&token),
+        );
+        let diff: lanbackup_core::dto::session::ChunkDiff = checked_json(
+            client
+                .get(&diff_url)
+                .timeout(std::time::Duration::from_secs(20))
+                .send()
+                .await,
+            "diff",
         )
-        .await;
+        .await?;
+
+        let mut to_send: Vec<u64> = diff
+            .missing_chunks
+            .iter()
+            .chain(diff.mismatched_chunks.iter())
+            .copied()
+            .collect();
+        to_send.sort_unstable();
+        to_send.dedup();
+        let total_pieces = pf.piece_hashes.len() as u64;
+        if let Some(bad) = to_send.iter().find(|i| **i >= total_pieces) {
+            return Err(AppError(format!(
+                "diff 返回越界 pieceIndex={bad}（文件 {} 共 {total_pieces} 块）",
+                pf.rel_path
+            )));
+        }
+        if !to_send.is_empty() {
+            crate::log_debug!(
+                "{}: 需要发送 {}/{} 块",
+                pf.rel_path,
+                to_send.len(),
+                total_pieces
+            );
+        }
+
+        upload_pieces(
+            app,
+            &client,
+            &base,
+            session_id,
+            pf,
+            &token,
+            &to_send,
+            &bytes_sent,
+            bytes_total,
+            &completed_files,
+            total_files,
+            &last_emit,
+            started,
+            cancel,
+        )
+        .await?;
+
+        // verify：接收端实算 SHA-256，必须与我们声明的整文件哈希一致。
+        let verify_url = format!(
+            "{base}/api/v4/session/verify?sessionId={}&fileId={}&token={}",
+            urlencoding::encode(session_id),
+            urlencoding::encode(&pf.file_id),
+            urlencoding::encode(&token),
+        );
+        let verify: VerifyFileResponse = checked_json(
+            client
+                .get(&verify_url)
+                .timeout(std::time::Duration::from_secs(120))
+                .send()
+                .await,
+            "verify",
+        )
+        .await?;
+        match verify.sha256.as_deref() {
+            Some(sha) if sha.eq_ignore_ascii_case(&pf.whole_sha) => {}
+            other => {
+                return Err(AppError(format!(
+                    "接收端校验失败 {}: 期望 {}，返回 {:?}",
+                    pf.rel_path, pf.whole_sha, other
+                )))
+            }
+        }
+        verified.push(pf.file_id.clone());
+        completed_files.fetch_add(1, Ordering::Relaxed);
+        emit_progress(
+            app,
+            ProgressSnapshot {
+                sent_files: completed_files.load(Ordering::Relaxed),
+                total_files,
+                bytes: bytes_sent.load(Ordering::Relaxed),
+                total_bytes: bytes_total,
+                file_name: &pf.rel_path,
+                stage: "verified",
+                started,
+            },
+        );
+    }
+
+    // ── 5. tasks：终态以接收端回执为准 ──
+    let tasks = fetch_tasks(&client, &base, session_id).await?;
+    let mut confirmed = 0u64;
+    for id in &verified {
+        match tasks.tasks.iter().find(|t| &t.file_id == id) {
+            Some(t) if t.status == TaskStatus::Completed => confirmed += 1,
+            Some(t) => crate::log_warn!("文件 {id} 接收端终态为 {:?}，不计成功", t.status),
+            None => crate::log_warn!("文件 {id} 不在接收端任务列表，不计成功"),
+        }
+    }
+
+    let elapsed = started.elapsed().as_millis() as u64;
+    crate::log_info!(
+        "发送结束: 接收端确认 {confirmed}/{total_files} 文件，{}/{} 字节，耗时 {elapsed}ms",
+        bytes_sent.load(Ordering::Relaxed),
+        bytes_total
+    );
     let _ = app.emit(
         "send-progress",
         serde_json::json!({
-            "sent": sent_so_far + 1,
-            "total": total_units,
+            "sent": confirmed,
+            "total": total_files,
+            "fileName": "",
+            "stage": "done",
+            "bytes": bytes_sent.load(Ordering::Relaxed),
+            "totalBytes": bytes_total,
+            "bytesSent": bytes_sent.load(Ordering::Relaxed),
+            "elapsedMs": elapsed,
+        }),
+    );
+    Ok(confirmed)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_pieces(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    base: &str,
+    session_id: &str,
+    pf: &PreparedFile,
+    token: &str,
+    indices: &[u64],
+    bytes_sent: &AtomicU64,
+    bytes_total: u64,
+    completed_files: &AtomicU64,
+    total_files: u64,
+    last_emit: &AtomicU64,
+    started: std::time::Instant,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(), AppError> {
+    let piece_hashes = pf.piece_hashes.clone();
+    let path = pf.abs_path.clone();
+    let size = pf.size;
+    let file_name = pf.rel_path.clone();
+    let enc_key = pf.enc_key;
+    let fid = pf.file_id.clone();
+    let sid = session_id.to_string();
+    let chunk_url = format!(
+        "{base}/api/v4/session/chunk?sessionId={}&fileId={}&token={}",
+        urlencoding::encode(session_id),
+        urlencoding::encode(&pf.file_id),
+        urlencoding::encode(token),
+    );
+
+    futures_util::stream::iter(indices.iter().copied().map(|idx| {
+        let client = client.clone();
+        let chunk_url = chunk_url.clone();
+        let path = path.clone();
+        let piece_hashes = piece_hashes.clone();
+        let file_name = file_name.clone();
+        let sid = sid.clone();
+        let fid = fid.clone();
+        let cancel = cancel.clone();
+        let app = app.clone();
+        async move {
+            if cancel.is_cancelled() {
+                return Err(AppError("发送已取消".to_string()));
+            }
+            let offset = idx * PIECE_SIZE;
+            let want = (size - offset).min(PIECE_SIZE) as usize;
+            let data = tokio::task::spawn_blocking(move || read_piece(&path, offset, want))
+                .await
+                .map_err(|e| AppError(format!("读取分块任务失败: {e}")))??;
+            // WB-0030：加密模式下先把明文 piece 加密成线路密文（nonce=序号，
+            // 确定性派生，与 prepare 预演逐字节一致），再对**密文**做完整性比对
+            let data = if let Some(fk) = enc_key {
+                let mut nonce = [0u8; lanbackup_core::crypto::aead::NONCE_LEN];
+                nonce[4..].copy_from_slice(&idx.to_be_bytes());
+                let aad = format!("lanbackup/v4/piece/{sid}/{fid}/{idx}").into_bytes();
+                lanbackup_core::crypto::aead::encrypt(&fk, &nonce, &data, &aad)
+                    .ok_or_else(|| AppError("piece 加密失败".to_string()))?
+            } else {
+                data
+            };
+            let got = hex::encode(sha256_bytes(&data));
+            if !piece_hashes[idx as usize].eq_ignore_ascii_case(&got) {
+                return Err(AppError(format!(
+                    "文件在传输期间发生变化：{} 块 {idx} 哈希不一致，请重试",
+                    file_name
+                )));
+            }
+
+            let mut attempt = 0u32;
+            loop {
+                if cancel.is_cancelled() {
+                    return Err(AppError("发送已取消".to_string()));
+                }
+                let url = format!("{chunk_url}&pieceIndex={idx}&sha256={got}");
+                let sent = client
+                    .post(&url)
+                    .header("Content-Type", "application/octet-stream")
+                    .timeout(std::time::Duration::from_secs(60))
+                    .body(data.clone())
+                    .send()
+                    .await;
+                match sent {
+                    Ok(resp) if resp.status().is_success() => break,
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        let snippet: String = body.chars().take(300).collect();
+                        if status.is_client_error()
+                            && status.as_u16() != 408
+                            && status.as_u16() != 429
+                        {
+                            return Err(AppError(format!(
+                                "分块 {idx} 被拒绝 HTTP {status}: {snippet}"
+                            )));
+                        }
+                        if attempt >= MAX_RETRIES {
+                            return Err(AppError(format!(
+                                "分块 {idx} 重试耗尽 HTTP {status}: {snippet}"
+                            )));
+                        }
+                    }
+                    Err(e) => {
+                        if attempt >= MAX_RETRIES {
+                            return Err(AppError(format!("分块 {idx} 请求失败: {e}")));
+                        }
+                        crate::log_warn!("分块 {idx} 网络错误，准备重试: {e}");
+                    }
+                }
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    200u64.saturating_mul(attempt as u64),
+                ))
+                .await;
+            }
+
+            let now_bytes =
+                bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed) + data.len() as u64;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let prev = last_emit.load(Ordering::Relaxed);
+            if now.saturating_sub(prev) >= PROGRESS_INTERVAL_MS {
+                last_emit.store(now, Ordering::Relaxed);
+                emit_progress(
+                    &app,
+                    ProgressSnapshot {
+                        sent_files: completed_files.load(Ordering::Relaxed),
+                        total_files,
+                        bytes: now_bytes,
+                        total_bytes: bytes_total,
+                        file_name: &file_name,
+                        stage: "sending",
+                        started,
+                    },
+                );
+            }
+            Ok(())
+        }
+    }))
+    .buffer_unordered(MAX_INFLIGHT_PIECES)
+    .try_collect::<Vec<()>>()
+    .await
+    .map(|_| ())
+}
+
+/// 一次进度事件的全部计数（打包传递，避免 8 个参数的调用点各写一遍字段名）。
+struct ProgressSnapshot<'a> {
+    sent_files: u64,
+    total_files: u64,
+    bytes: u64,
+    total_bytes: u64,
+    file_name: &'a str,
+    stage: &'a str,
+    started: std::time::Instant,
+}
+
+fn emit_progress(app: &AppHandle, p: ProgressSnapshot<'_>) {
+    let ProgressSnapshot { sent_files, total_files, bytes, total_bytes, file_name, stage, started } = p;
+    let _ = app.emit(
+        "send-progress",
+        serde_json::json!({
+            "sent": sent_files,
+            "total": total_files,
             "fileName": file_name,
-            "stage": "sending",
-            "bytes": upload_size,
-            "totalBytes": upload_size,
-            "bytesSent": upload_size,
+            "stage": stage,
+            "bytes": bytes,
+            "totalBytes": total_bytes,
+            "bytesSent": bytes,
             "elapsedMs": started.elapsed().as_millis() as u64,
         }),
     );
-    Ok(())
 }
 
-fn session_store_ts() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis().to_string())
-        .unwrap_or_else(|_| "0".to_string())
-}
-
-async fn upload_single(
+async fn fetch_tasks(
     client: &reqwest::Client,
-    target_ip: String,
-    target_port: u16,
-    session_id: String,
-    file_id: String,
-    token: String,
-    upload_path: PathBuf,
-    upload_size: u64,
-    offset: Option<u64>,
-    chunk_size: Option<u64>,
-    enc_key: Option<[u8; 32]>,
-    _cancel: tokio_util::sync::CancellationToken,
-    app: tauri::AppHandle,
-    file_name: String,
-    started: std::time::Instant,
-    sent_so_far: u64,
-    total_units: u64,
-) -> Result<(), AppError> {
-    crate::log_debug!("开始上传 {} ({}B)", file_name, upload_size);
-    let mut file = tokio::fs::File::open(&upload_path)
-        .await
-        .map_err(|e| AppError(format!("打开文件失败 {}: {e}", upload_path.display())))?;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    if let Some(off) = offset {
-        file.seek(std::io::SeekFrom::Start(off))
-            .await
-            .map_err(|e| AppError(format!("分片 seek 失败 {}: {e}", upload_path.display())))?;
-    }
-    let limited = file.take(chunk_size.unwrap_or(u64::MAX));
-    let fname = file_name.clone();
-    let mut bytes_sent = 0u64;
-    let mut last_progress = std::time::Instant::now();
-    let app2 = app.clone();
-    let mut on_chunk = move |n: usize| {
-        bytes_sent += n as u64;
-        let now = std::time::Instant::now();
-        if now.duration_since(last_progress).as_millis() >= 250 {
-            last_progress = now;
-            let _ = app2.emit(
-                "send-progress",
-                serde_json::json!({
-                    "sent": sent_so_far,
-                    "total": total_units,
-                    "fileName": fname,
-                    "stage": "sending",
-                    "bytes": bytes_sent,
-                    "totalBytes": upload_size,
-                    "bytesSent": bytes_sent,
-                    "elapsedMs": started.elapsed().as_millis() as u64,
-                }),
-            );
-        }
-    };
-    let body = if let Some(k) = enc_key {
-        let stream = futures_util::stream::unfold(
-            (limited, k, false, 0u64, file_name.clone()),
-            |(mut r, key, header_sent, blocks_out, probe_name)| async move {
-                let mut buf = vec![0u8; crate::crypto::STREAM_ENC_BLOCK];
-                let mut total = 0usize;
-                while total < buf.len() {
-                    match r.read(&mut buf[total..]).await {
-                        Ok(0) => break,
-                        Ok(n) => total += n,
-                        Err(e) => return Some((Err(e), (r, key, header_sent, blocks_out, probe_name))),
-                    }
-                }
-                if total == 0 {
-                    if header_sent {
-                        crate::log_debug!("加密流 EOF: {} 共产出 {blocks_out} 块", probe_name);
-                        return None;
-                    }
-                    let out = crate::crypto::stream_header_bytes(crate::crypto::STREAM_ENC_BLOCK).to_vec();
-                    return Some((Ok(out), (r, key, true, blocks_out + 1, probe_name)));
-                }
-                let mut out = Vec::with_capacity(12 + total + 32);
-                if !header_sent {
-                    out.extend_from_slice(&crate::crypto::stream_header_bytes(crate::crypto::STREAM_ENC_BLOCK));
-                }
-                buf.truncate(total);
-                if blocks_out == 0 {
-                    crate::log_debug!("加密流首块: {} {total}B", probe_name);
-                }
-                match crate::crypto::seal_stream_block(&key, &mut buf, &mut out) {
-                    Ok(()) => Some((Ok(out), (r, key, true, blocks_out + 1, probe_name))),
-                    Err(e) => Some((Err(std::io::Error::new(std::io::ErrorKind::Other, e)), (r, key, true, blocks_out + 1, probe_name))),
-                }
-            },
-        )
-        .map(move |chunk| {
-            if let Ok(data) = &chunk {
-                on_chunk(data.len());
-            }
-            chunk
-        });
-        reqwest::Body::wrap_stream(stream)
-    } else {
-        let stream = tokio_util::io::ReaderStream::with_capacity(limited, 256 * 1024).map(
-            move |chunk| {
-                if let Ok(data) = &chunk {
-                    on_chunk(data.len());
-                }
-                chunk
-            },
-        );
-        reqwest::Body::wrap_stream(stream)
-    };
-
+    base: &str,
+    session_id: &str,
+) -> Result<TaskListResponse, AppError> {
     let url = format!(
-        "http://{target_ip}:{target_port}/api/v4/session/chunk?sessionId={}&fileId={}&token={}",
-        urlencoding::encode(&session_id),
-        urlencoding::encode(&file_id),
-        urlencoding::encode(&token)
+        "{base}/api/v4/session/tasks?sessionId={}",
+        urlencoding::encode(session_id)
     );
-    client
-        .post(&url)
-        .header("Content-Type", "application/octet-stream")
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| AppError(format!("上传失败 {file_name}: {e}")))?;
-    crate::log_debug!("上传完成 {file_name} ({}B)", upload_size);
-    Ok(())
-}
-
-fn extract_status_code(err: &str) -> Option<u16> {
-    err.split("statusCode")
-        .nth(1)
-        .and_then(|s| s.chars().filter(|c| c.is_ascii_digit()).take(3).collect::<String>().parse().ok())
-}
-
-async fn upload_single_with_retry(
-    client: &reqwest::Client,
-    target_ip: String,
-    target_port: u16,
-    session_id: String,
-    file_id: String,
-    token: String,
-    upload_path: PathBuf,
-    upload_size: u64,
-    offset: Option<u64>,
-    chunk_size: Option<u64>,
-    enc_key: Option<[u8; 32]>,
-    cancel: tokio_util::sync::CancellationToken,
-    app: tauri::AppHandle,
-    file_name: String,
-    started: std::time::Instant,
-    sent_so_far: u64,
-    total_units: u64,
-) -> Result<(), AppError> {
-    const MAX_RETRIES: u32 = 5;
-    let mut attempt = 0;
-    loop {
-        match upload_single(
-            client,
-            target_ip.clone(),
-            target_port,
-            session_id.clone(),
-            file_id.clone(),
-            token.clone(),
-            upload_path.clone(),
-            upload_size,
-            offset,
-            chunk_size,
-            enc_key,
-            cancel.clone(),
-            app.clone(),
-            file_name.clone(),
-            started,
-            sent_so_far,
-            total_units,
+    let mut last: Option<AppError> = None;
+    for attempt in 0..=MAX_RETRIES {
+        match checked_json(
+            client
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(15))
+                .send()
+                .await,
+            "tasks",
         )
         .await
         {
-            Ok(()) => return Ok(()),
+            Ok(v) => return Ok(v),
             Err(e) => {
-                let err_str = e.0.as_str();
-                let status = extract_status_code(err_str).unwrap_or(0);
-                if !crate::scheduler::is_checksum_failure_retryable(status) {
-                    crate::log_warn!("上传失败（不重试 status={}) {}", status, err_str);
-                    return Err(e);
-                }
-                if attempt >= MAX_RETRIES {
-                    crate::log_error!("上传重试耗尽（status={}) {}", status, err_str);
-                    return Err(e);
-                }
-                let delay_ms = crate::scheduler::jittered_backoff_ms(attempt);
-                crate::log_warn!(
-                    "上传校验失败，重试 {}/{}（delay={}ms）: {}",
-                    attempt + 1,
-                    MAX_RETRIES,
-                    delay_ms,
-                    file_name
-                );
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                attempt += 1;
+                last = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    200u64.saturating_mul(attempt as u64 + 1),
+                ))
+                .await;
             }
         }
     }
+    Err(last.unwrap_or_else(|| AppError("tasks 查询失败".to_string())))
 }
 
-fn pack_batch(files: &[SendFileItem]) -> Result<Vec<u8>, AppError> {
-    let mut out: Vec<u8> = Vec::new();
-    for f in files {
-        let data = std::fs::read(&f.abs_path)
-            .map_err(|e| AppError(format!("读取小文件失败 {}: {e}", f.abs_path)))?;
-        let name = f.rel_path.as_bytes();
-        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        out.extend_from_slice(name);
-        out.extend_from_slice(&(data.len() as u64).to_le_bytes());
-        out.extend_from_slice(&data);
+async fn checked_json<T: serde::de::DeserializeOwned>(
+    resp: Result<reqwest::Response, reqwest::Error>,
+    what: &str,
+) -> Result<T, AppError> {
+    let resp = resp.map_err(|e| AppError(format!("{what} 请求失败: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(400).collect();
+        return Err(AppError(format!("{what} 失败 HTTP {status}: {snippet}")));
     }
-    Ok(out)
+    resp.json::<T>()
+        .await
+        .map_err(|e| AppError(format!("{what} 响应解析失败: {e}")))
 }
 
-pub fn query_chunk_status(ip: &str, port: u16, rel_path: &str) -> Result<Vec<u32>, AppError> {
-    let path = format!(
-        "/api/v4/sync/chunk-status?encodedPath={}",
-        pct_encode(rel_path)
-    );
-    let v = http_json_request(ip, port, "GET", &path, "")?;
-    let received: Vec<u32> = v
-        .get("receivedChunks")
-        .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|c| c.as_u64().map(|u| u as u32)).collect())
-        .unwrap_or_default();
-    crate::log_debug!(
-        "chunk-status 查询: 对端={}:{} file={} → 已收 {} 片",
-        ip, port,
-        crate::logger::mask(rel_path),
-        received.len()
-    );
-    Ok(received)
+fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().into()
 }
 
-fn file_modified_millis(abs_path: &str) -> Option<i64> {
-    std::fs::metadata(abs_path)
+/// 单遍读取文件：返回 `(size, mtime_ms, 每 piece SHA-256, 整文件 SHA-256)`。
+///
+/// 读完后复核 size/mtime；发送期间被改写的文件不允许"带着旧哈希传新内容"。
+fn hash_file(path: &Path) -> Result<(u64, i64, Vec<String>, String), AppError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let meta = std::fs::metadata(path)
+        .map_err(|e| AppError(format!("读取文件元数据失败 {}: {e}", path.display())))?;
+    if !meta.is_file() {
+        return Err(AppError(format!("不是普通文件: {}", path.display())));
+    }
+    let size = meta.len();
+    let mtime_ms = meta
+        .modified()
         .ok()
-        .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| AppError(format!("打开文件失败 {}: {e}", path.display())))?;
+    let mut whole = Sha256::new();
+    let mut pieces = Vec::with_capacity(size.div_ceil(PIECE_SIZE) as usize);
+    let mut remaining = size;
+    let mut buf = vec![0u8; PIECE_SIZE as usize];
+    while remaining > 0 {
+        let want = remaining.min(PIECE_SIZE) as usize;
+        f.read_exact(&mut buf[..want])
+            .map_err(|e| AppError(format!("读取文件失败 {}: {e}", path.display())))?;
+        whole.update(&buf[..want]);
+        let mut ph = Sha256::new();
+        ph.update(&buf[..want]);
+        pieces.push(hex::encode(ph.finalize()));
+        remaining -= want as u64;
+    }
+
+    let after = std::fs::metadata(path)
+        .map_err(|e| AppError(format!("复核文件元数据失败 {}: {e}", path.display())))?;
+    let after_mtime = after
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if after.len() != size || after_mtime != mtime_ms {
+        return Err(AppError(format!(
+            "文件在计算哈希期间发生变化，请重试: {}",
+            path.display()
+        )));
+    }
+    Ok((size, mtime_ms, pieces, hex::encode(whole.finalize())))
 }
 
-async fn query_confirmed_pieces(
-    client: &reqwest::Client,
-    base_url: &str,
+fn read_piece(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>, AppError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| AppError(format!("打开文件失败 {}: {e}", path.display())))?;
+    f.seek(SeekFrom::Start(offset))
+        .map_err(|e| AppError(format!("定位分块失败 {}: {e}", path.display())))?;
+    let mut data = vec![0u8; len];
+    f.read_exact(&mut data)
+        .map_err(|e| AppError(format!("读取分块失败 {}: {e}", path.display())))?;
+    Ok(data)
+}
+
+/// 加密预演：逐 piece 读明文 → AEAD 加密（nonce=序号，确定性）→ 返回**密文**的
+/// SHA-256 列表。与接收端解密公式完全同源（kdf L3/L4 + nonce 绑定序号 +
+/// AAD 绑定 session/file/piece），上传时按同一公式重加密，密文逐字节一致。
+fn cipher_piece_hashes(
+    path: &Path,
+    size: u64,
     session_id: &str,
     file_id: &str,
-    piece_count: u64,
-    piece_size: u64,
-) -> Option<Vec<u64>> {
-    let mut confirmed: Vec<u64> = Vec::new();
-    let mut all_confirmed = true;
-    for idx in 0..piece_count {
-        let url = format!(
-            "{}/api/v4/session/diff?sessionId={}&fileId={}&pieceIndex={}&pieceSize={}",
-            base_url,
-            urlencoding::encode(session_id),
-            urlencoding::encode(file_id),
-            idx,
-            piece_size
-        );
-        match client.get(&url).send().await {
-            Ok(resp) => {
-                if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-                    confirmed.push(idx);
-                } else {
-                    all_confirmed = false;
-                    break;
-                }
-            }
-            Err(_) => {
-                all_confirmed = false;
-                break;
-            }
-        }
+    file_key: &[u8; 32],
+) -> Result<Vec<String>, AppError> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| AppError(format!("打开文件失败 {}: {e}", path.display())))?;
+    let mut out = Vec::with_capacity(size.div_ceil(PIECE_SIZE) as usize);
+    let mut buf = vec![0u8; PIECE_SIZE as usize];
+    let mut idx: u64 = 0;
+    let mut remaining = size;
+    while remaining > 0 {
+        let want = remaining.min(PIECE_SIZE) as usize;
+        f.read_exact(&mut buf[..want])
+            .map_err(|e| AppError(format!("读取文件失败 {}: {e}", path.display())))?;
+        let mut nonce = [0u8; lanbackup_core::crypto::aead::NONCE_LEN];
+        nonce[4..].copy_from_slice(&idx.to_be_bytes());
+        let aad = format!("lanbackup/v4/piece/{session_id}/{file_id}/{idx}").into_bytes();
+        let ct = lanbackup_core::crypto::aead::encrypt(file_key, &nonce, &buf[..want], &aad)
+            .ok_or_else(|| AppError("piece 加密失败".to_string()))?;
+        out.push(hex::encode(sha256_bytes(&ct)));
+        idx += 1;
+        remaining -= want as u64;
     }
-    if confirmed.is_empty() && all_confirmed && piece_count > 0 {
-        return None;
-    }
-    Some(confirmed)
-}
-
-fn compute_piece_hexes(
-    cache: &std::sync::Arc<PieceHashCache>,
-    abs_path: &str,
-    file_size: u64,
-) -> Option<Vec<String>> {
-    let path = std::path::Path::new(abs_path);
-    let key = PieceCacheKey::from_path(path, file_size)?;
-    let piece_cnt = piece_count(file_size);
-    let hexes = cache.build_piece_hashes(key, piece_cnt, |piece_idx| {
-        let offset = piece_idx * PIECE_SIZE;
-        let remain = file_size.saturating_sub(offset);
-        let this_size = remain.min(PIECE_SIZE) as usize;
-        if this_size == 0 {
-            return vec![];
-        }
-        let mut read_buf = vec![0u8; this_size];
-        if let Ok(mut f) = std::fs::File::open(path) {
-            use std::io::{Read, Seek, SeekFrom};
-            if f.seek(SeekFrom::Start(offset)).is_ok() {
-                if f.read_exact(&mut read_buf).is_ok() {
-                    return read_buf;
-                }
-            }
-        }
-        vec![]
-    });
-    Some(hexes.into_iter().map(|p| hex::encode(p.strong)).collect())
+    Ok(out)
 }

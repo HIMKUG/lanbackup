@@ -15,13 +15,19 @@ pub struct ScannedEntry {
     mtime: u64,
 }
 
-/// URL 百分号编码
+/// URL 百分号编码（RFC3986 子集，保留 `~`）。
+///
+/// 当前发送端使用 `urlencoding` crate；保留本函数供 B4 的移动端对齐与
+/// 旧调用点迁移，避免各端各写一份编码表（WB-0507）。
+#[allow(dead_code)]
 pub(crate) fn pct_encode(s: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => {
                 out.push('%');
                 out.push(HEX[(b >> 4) as usize] as char);
@@ -30,25 +36,6 @@ pub(crate) fn pct_encode(s: &str) -> String {
         }
     }
     out
-}
-
-#[allow(dead_code)]
-pub(crate) fn pct_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[allow(dead_code)]
@@ -280,9 +267,25 @@ pub(crate) fn infer_file_type(name: &str) -> String {
     }
 }
 
+/// [`http_json_request_internal`] 的超时与协议头选项（缺省：1.5s 连接 / 3s 读写 / 不带版本头）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HttpRequestOptions<'a> {
+    pub connect_ms: u64,
+    pub read_ms: u64,
+    pub write_ms: u64,
+    pub protocol_version: Option<&'a str>,
+}
+
+impl Default for HttpRequestOptions<'_> {
+    fn default() -> Self {
+        Self { connect_ms: 1500, read_ms: 3000, write_ms: 3000, protocol_version: None }
+    }
+}
+
 /// HTTP JSON 请求内部实现（纯 TcpStream，无外部依赖）。
 ///
-/// 所有参数均可自定义超时；`protocol_version` 为 `None` 时不发送 `X-Protocol-Version` 头。
+/// 超时与 `protocol_version` 打包成 [`HttpRequestOptions`]：参数从 9 个降到 6 个，
+/// 调用方用 `..Default::default()` 只覆盖自己关心的项。
 /// body 最大 64MB，超出返回错误。
 pub(crate) fn http_json_request_internal(
     ip: &str,
@@ -290,11 +293,14 @@ pub(crate) fn http_json_request_internal(
     method: &str,
     path: &str,
     body: &str,
-    connect_ms: u64,
-    read_ms: u64,
-    write_ms: u64,
-    protocol_version: Option<&str>,
+    options: &HttpRequestOptions,
 ) -> Result<serde_json::Value, AppError> {
+    let HttpRequestOptions {
+        connect_ms,
+        read_ms,
+        write_ms,
+        protocol_version,
+    } = *options;
     use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration;
@@ -336,7 +342,7 @@ pub(crate) fn http_json_request_internal(
         }
     }
     let text = String::from_utf8_lossy(&resp_buf);
-    let json_part = text.splitn(2, "\r\n\r\n").nth(1)
+    let json_part = text.split_once("\r\n\r\n").map(|x| x.1)
         .ok_or_else(|| AppError("HTTP 响应缺少 body 分隔符".to_string()))?;
     if json_part.trim().is_empty() {
         return Err(AppError("HTTP 响应 body 为空".to_string()));
@@ -345,12 +351,41 @@ pub(crate) fn http_json_request_internal(
         .map_err(|e| AppError(format!("解析响应失败: {e}")))
 }
 
+/// 扫描接收目录并构建 core 清单（含 `delete/` 墓碑）。
+///
+/// 清单是 `GET /api/v4/manifest` 的唯一数据源：不喂给 core，对端拿到的
+/// 永远是空清单，增量规划会退化为每次全量传输。
+pub(crate) fn scan_manifest(
+    dir: &Path,
+) -> Result<lanbackup_core::dto::sync::Manifest, AppError> {
+    let mut entries = Vec::new();
+    scan_dir_recursive(dir, "", 0, &mut entries)?;
+    let pairs = entries.into_iter().map(|e| {
+        (
+            e.rel_path,
+            lanbackup_core::dto::sync::ManifestEntry {
+                size: e.size,
+                mtime: e.mtime as i64,
+            },
+        )
+    });
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Ok(lanbackup_core::sync::manifest::build_manifest(
+        &identity::get_device_id_no_ctx(),
+        now_ms,
+        pairs,
+    ))
+}
+
 /// 递归扫描目录
 pub async fn scan_directory(dir: String) -> Result<Vec<ScannedEntry>, AppError> {
     let dir_for_task = dir.clone();
     let entries = tokio::task::spawn_blocking(move || {
         let mut entries = Vec::new();
-        scan_dir_recursive(&PathBuf::from(&dir_for_task), "", &mut entries)?;
+        scan_dir_recursive(&PathBuf::from(&dir_for_task), "", 0, &mut entries)?;
         Ok::<_, AppError>(entries)
     })
     .await
@@ -359,11 +394,22 @@ pub async fn scan_directory(dir: String) -> Result<Vec<ScannedEntry>, AppError> 
     Ok(entries)
 }
 
+/// 扫描防护（WB-0502）：深度与条目上限 —— 深树防栈溢出，海量条目防内存膨胀。
+/// 触顶按错误上抛（调用方可见），绝不静默截断后冒充完整清单。
+const SCAN_MAX_DEPTH: usize = 32;
+const SCAN_MAX_ENTRIES: usize = 200_000;
+
 fn scan_dir_recursive(
     base: &Path,
     rel: &str,
+    depth: usize,
     out: &mut Vec<ScannedEntry>,
 ) -> Result<(), AppError> {
+    if depth > SCAN_MAX_DEPTH {
+        return Err(AppError(format!(
+            "目录嵌套超过 {SCAN_MAX_DEPTH} 层，已停止扫描（疑似循环挂载/异常深树）: {rel}"
+        )));
+    }
     let cur = if rel.is_empty() {
         base.to_path_buf()
     } else {
@@ -390,8 +436,10 @@ fn scan_dir_recursive(
                 continue;
             }
         };
+        // 不跟随符号链接与 Windows junction/reparse（WB-0503）：file_type()
+        // 在 Windows 上把 junction 识别为 symlink，两平台一致跳过。
         if ftype.is_symlink() {
-            crate::log_warn!("跳过符号链接（不跟随，归档语义）: {child_rel}");
+            crate::log_warn!("跳过符号链接/junction（不跟随，归档语义）: {child_rel}");
             continue;
         }
         if name == ".chunks"
@@ -402,12 +450,23 @@ fn scan_dir_recursive(
             crate::log_debug!("跳过内部文件: {child_rel}");
             continue;
         }
+        // WB-0504：core 接收端的传输临时文件 `*.part.<sid>.<fid>` 不得混进清单，
+        // 否则半截文件会被当成真实文件同步/备份。
+        if name.contains(".part.") {
+            crate::log_debug!("跳过传输临时文件: {child_rel}");
+            continue;
+        }
+        if out.len() >= SCAN_MAX_ENTRIES {
+            return Err(AppError(format!(
+                "扫描条目数超过上限（{SCAN_MAX_ENTRIES}），已停止：请缩小目录范围"
+            )));
+        }
         if !ftype.is_file() && !ftype.is_dir() {
             crate::log_warn!("跳过特殊文件（设备/管道/套接字）: {child_rel}");
             continue;
         }
         if ftype.is_dir() {
-            scan_dir_recursive(base, &child_rel, out)?;
+            scan_dir_recursive(base, &child_rel, depth + 1, out)?;
         } else if ftype.is_file() {
             let meta = match entry.metadata() {
                 Ok(m) => m,

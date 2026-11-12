@@ -12,6 +12,11 @@
     "size"
   ],
   "properties": {
+    "encrypted": {
+      "description": "该文件是否按 AEAD 加密传输（WB-0540：`size` 始终是**明文**字节数， `sha256` 是明文整文件哈希；`pieceHashes` 在加密文件上是**线路密文** 的 SHA-256 —— 接收端按收到的字节比对）。",
+      "default": false,
+      "type": "boolean"
+    },
     "fileId": {
       "description": "文件唯一 ID",
       "type": "string"
@@ -54,6 +59,15 @@
     },
     "size": {
       "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "wireSize": {
+      "description": "加密文件的线路总字节数 = `size` + piece 数 × 16B GCM tag。 明文文件为 `None`；`encrypted=true` 时必须提供且与服务端推算一致。",
+      "type": [
+        "integer",
+        "null"
+      ],
       "format": "uint64",
       "minimum": 0.0
     }

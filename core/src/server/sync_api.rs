@@ -28,31 +28,34 @@
 //! GET `manifest` 自然就带上了墓碑。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use http_body_util::Full;
-use hyper::{Response, StatusCode};
-use serde_json::json;
+use hyper::Response;
 use tokio::sync::Mutex;
 
 use crate::dto::sync::{
-    ChunkStatusResponse, DisconnectRequest, Manifest, MoveToDeleteRequest, SyncDirRequest,
-    SyncStrategy,
+    ChunkStatusResponse, DisconnectRequest, DisconnectResponse, Manifest, ManifestEntry,
+    MoveToDeleteRequest, MoveToDeleteResponse, SyncDirRequest, SyncDirResponse, SyncStrategy,
 };
 use crate::dto::Presence;
 use crate::error::ErrorCode;
 use crate::pairing::machine::allows_transfer;
 use crate::state::transfer::TransferEvent;
 use crate::sync::manifest::{
-    is_in_delete_dir, is_safe_rel_path, normalize_rel_path, tombstone_path,
+    is_in_delete_dir, tombstone_path,
 };
 use crate::transfer::chunk::piece_count;
 
-use super::{err_response, extract_query, file_incomplete_reason, ok_json, parse_body};
-use super::{json_response, persist::SessionPersister, SessionStore};
+use super::{err_response, file_incomplete_reason, ok_json, parse_body, parse_query};
+use crate::sync::manifest::validate_rel_path;
+use super::{persist::SessionPersister, SessionStore};
 
 /// 一个对端的目录映射约定（`sync-dir` 登记的内容）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 需要 serde：持久化后端（`sync-dirs.json`）按设备存整表（WB-0416）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DirMapping {
     /// 发起端的备份根标识
     pub root_id: String,
@@ -69,6 +72,10 @@ struct SyncState {
     snapshot: Option<Manifest>,
     /// deviceId → 目录映射
     dirs: HashMap<String, DirMapping>,
+    /// `path → 原条目`：本会话内产生过的墓碑（WB-0426）。
+    /// 平台重扫会把磁盘上的 `delete/` 文件带回清单，但"清单里有、磁盘上
+    /// 本来就没有"的墓碑只有这里能兜住；每次推入新清单时合并回来。
+    tombstones: HashMap<String, ManifestEntry>,
 }
 
 /// 假删除的三种结果。分开表达，是为了让响应能如实告诉对端"这条到底怎么了"。
@@ -95,25 +102,45 @@ impl SyncStore {
         Self::default()
     }
 
-    /// 接持久化后端的构造。打开时把磁盘上的 `last-manifest.json` 重载回
-    /// `snapshot` —— 否则进程一重启，上次同步快照丢失，下一轮退化成全量备份。
-    /// （`SessionStore::open` 与 `s10` 测试使用；lib 非测试构建暂无其他调用点。）
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 接持久化后端的构造。打开时重载三份冷数据：
+    /// `last-manifest.json`（快照，三路对比第三路）、`tombstones.json`（墓碑，
+    /// WB-0426）、`sync-dirs.json`(目录映射，WB-0416) ——
+    /// 否则进程一重启，快照丢失退化为全量备份、墓碑丢失会复活用户删掉的文件。
     pub(crate) fn with_persist(persist: Option<Arc<SessionPersister>>) -> Self {
         let mut s = Self { inner: Mutex::default(), persist };
         if let Some(p) = &s.persist {
+            let g = s.inner.get_mut();
             if let Some(m) = p.load_last_manifest() {
                 // 快照只供三路对比读取，重载失败可接受（按首次同步处理）
-                s.inner.get_mut().snapshot = Some(m);
+                g.snapshot = Some(m);
+            }
+            let tombstones = p.load_tombstones();
+            if !tombstones.is_empty() {
+                // 重启后本地清单还是空的；先把墓碑合回去，等平台首次扫描推入时
+                // `set_local_manifest` 会再合并一次（幂等）。
+                for (k, v) in &tombstones {
+                    g.local.files.insert(k.clone(), v.clone());
+                }
+                g.tombstones = tombstones;
+            }
+            let dirs = p.load_sync_dirs();
+            if !dirs.is_empty() {
+                g.dirs = dirs;
             }
         }
         s
     }
 
     /// 平台层推入一次扫描结果。传入的清单会被原样保存
-    /// （调用方应先经 [`crate::sync::manifest::build_manifest`] 归一化）。
+    /// （调用方应先经 [`crate::sync::manifest::build_manifest`] 归一化），
+    /// 并把本端产生过的墓碑合并回来（WB-0426）。
     pub async fn set_local_manifest(&self, m: Manifest) {
-        self.inner.lock().await.local = m;
+        let mut g = self.inner.lock().await;
+        let mut m = m;
+        for (p, e) in &g.tombstones {
+            m.files.insert(p.clone(), e.clone());
+        }
+        g.local = m;
     }
 
     pub async fn local_manifest(&self) -> Manifest {
@@ -136,11 +163,13 @@ impl SyncStore {
     }
 
     pub async fn put_mapping(&self, device_id: &str, m: DirMapping) {
-        self.inner
-            .lock()
-            .await
-            .dirs
-            .insert(device_id.to_string(), m);
+        let mut g = self.inner.lock().await;
+        g.dirs.insert(device_id.to_string(), m);
+        // WB-0416：写穿持久化。失败只告警 —— 映射是"约定"不是正确性前提，
+        // 重启后丢失的代价是重新登记一次，不该让同步请求 500。
+        if let Some(p) = &self.persist {
+            p.write_sync_dirs(&g.dirs);
+        }
     }
 
     pub async fn mapping(&self, device_id: &str) -> Option<DirMapping> {
@@ -160,7 +189,12 @@ impl SyncStore {
         let tomb = tombstone_path(normalized);
         match g.local.files.remove(normalized) {
             Some(entry) => {
-                g.local.files.insert(tomb.clone(), entry);
+                g.local.files.insert(tomb.clone(), entry.clone());
+                // WB-0426：记入墓碑集合并写穿 —— 重启后重扫合并，永不复活
+                g.tombstones.insert(tomb.clone(), entry);
+                if let Some(p) = &self.persist {
+                    p.write_tombstones(&g.tombstones);
+                }
                 MoveOutcome::Moved(tomb)
             }
             // 源不在了但墓碑已存在 → 上一次已经搬完，属幂等重放
@@ -180,20 +214,20 @@ impl SyncStore {
 async fn require_transferable(
     store: &Arc<SessionStore>,
     device_id: &str,
-) -> Result<(), Response<Full<bytes::Bytes>>> {
+) -> Result<(), super::ErrResponse> {
     match store.peers.entry(device_id).await {
         Some(p) if allows_transfer(p.trust.state) => Ok(()),
-        Some(p) => Err(err_response(
+        Some(p) => Err(Box::new(err_response(
             ErrorCode::Untrusted,
             &format!(
                 "当前配对状态 {:?} 不允许同步操作：请先完成配对",
                 p.trust.state
             ),
-        )),
-        None => Err(err_response(
+        ))),
+        None => Err(Box::new(err_response(
             ErrorCode::UnknownDevice,
             "设备未配对：请先完成配对",
-        )),
+        ))),
     }
 }
 
@@ -204,12 +238,16 @@ pub async fn handle_manifest(
     store: &Arc<SessionStore>,
     path: &str,
 ) -> Response<Full<bytes::Bytes>> {
-    let device_id = match extract_query(path, "deviceId") {
-        Some(s) => s,
+    let q = match parse_query(path) {
+        Ok(q) => q,
+        Err(e) => return err_response(ErrorCode::BadRequest, &e),
+    };
+    let device_id = match q.get("deviceId") {
+        Some(s) => s.clone(),
         None => return err_response(ErrorCode::BadRequest, "缺少 deviceId 参数"),
     };
     if let Err(resp) = require_transferable(store, &device_id).await {
-        return resp;
+        return *resp;
     }
     ok_json(store.sync.local_manifest().await)
 }
@@ -231,12 +269,16 @@ pub async fn handle_chunk_status(
     store: &Arc<SessionStore>,
     path: &str,
 ) -> Response<Full<bytes::Bytes>> {
-    let session_id = match extract_query(path, "sessionId") {
-        Some(s) => s,
+    let q = match parse_query(path) {
+        Ok(q) => q,
+        Err(e) => return err_response(ErrorCode::BadRequest, &e),
+    };
+    let session_id = match q.get("sessionId") {
+        Some(s) => s.clone(),
         None => return err_response(ErrorCode::BadRequest, "缺少 sessionId 参数"),
     };
-    let file_id = match extract_query(path, "fileId") {
-        Some(s) => s,
+    let file_id = match q.get("fileId") {
+        Some(s) => s.clone(),
         None => return err_response(ErrorCode::BadRequest, "缺少 fileId 参数"),
     };
 
@@ -245,6 +287,20 @@ pub async fn handle_chunk_status(
         Some(r) => r,
         None => return err_response(ErrorCode::NotFound, "会话不存在"),
     };
+    // WB-0401：块状态与 diff 同源 —— 能推断文件大小与传输进度，生产模式必须
+    // 带 prepare 签发的文件 token，不能"知道 sessionId 就能查"。
+    if store
+        .require_active_peer
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let token = match q.get("token") {
+            Some(t) => t,
+            None => return err_response(ErrorCode::Untrusted, "缺少 token 参数"),
+        };
+        if rec.tokens.get(&file_id) != Some(token) {
+            return err_response(ErrorCode::Untrusted, "token 无效或不属于该文件");
+        }
+    }
     let meta = match rec.files.get(&file_id) {
         Some(m) => m,
         None => return err_response(ErrorCode::NotFound, "文件未登记"),
@@ -286,19 +342,21 @@ pub async fn handle_sync_dir(
         Err(e) => return err_response(ErrorCode::BadRequest, &e),
     };
     if let Err(resp) = require_transferable(store, &req.device_id).await {
-        return resp;
+        return *resp;
+    }
+    if req.root_id.is_empty() || req.root_id.len() > 128 {
+        return err_response(ErrorCode::BadRequest, "rootId 长度非法（1..=128）");
     }
 
-    let target = normalize_rel_path(&req.target_dir);
-    if !is_safe_rel_path(&target) {
-        return err_response(
-            ErrorCode::BadRequest,
-            &format!(
-                "targetDir 不安全（{:?}）：不得含 `..`、盘符或指向备份根之外",
-                req.target_dir
-            ),
-        );
-    }
+    let target = match validate_rel_path(&req.target_dir) {
+        Ok(t) => t,
+        Err(e) => {
+            return err_response(
+                ErrorCode::BadRequest,
+                &format!("targetDir 不安全（{:?}）：{e}", req.target_dir),
+            )
+        }
+    };
     // 接收目录不能是（或落在）假删除目录：那会让正常接收的文件与墓碑混在一起，
     // 下一轮对比就把刚收到的文件当成"用户已删除"。
     if is_in_delete_dir(&target) {
@@ -315,14 +373,14 @@ pub async fn handle_sync_dir(
     };
     store.sync.put_mapping(&req.device_id, mapping).await;
 
-    ok_json(json!({
-        "deviceId": req.device_id,
-        "rootId": req.root_id,
-        "targetDir": target,
-        "strategy": req.strategy,
+    ok_json(SyncDirResponse {
+        device_id: req.device_id,
+        root_id: req.root_id,
+        target_dir: target,
+        strategy: req.strategy,
         // 发起端据此跑 sync::plan::decide 的第三路
-        "peerManifest": store.sync.local_manifest().await,
-    }))
+        peer_manifest: store.sync.local_manifest().await,
+    })
 }
 
 /// `POST /api/v4/move-to-delete` —— 假删除（移入 `delete/`，**不真删**）。
@@ -337,18 +395,40 @@ pub async fn handle_move_to_delete(
         Ok(r) => r,
         Err(e) => return err_response(ErrorCode::BadRequest, &e),
     };
+    // WB-0427：批量上限 —— 锁内逐条搬移，无上限的请求会把清单锁攥在手里。
+    if req.rel_paths.len() > MAX_MOVE_PATHS {
+        return err_response(
+            ErrorCode::BadRequest,
+            &format!("单批 relPaths 超过上限（{MAX_MOVE_PATHS}）"),
+        );
+    }
     if let Err(resp) = require_transferable(store, &req.device_id).await {
-        return resp;
+        return *resp;
     }
 
+    let base_dir = store.base_dir.read().unwrap().clone();
     let mut moved = Vec::new();
     let mut skipped = Vec::new();
     let mut rejected = Vec::new();
     for raw in &req.rel_paths {
-        let p = normalize_rel_path(raw);
         // 不安全路径**显式上报**，不静默丢弃：删除动作作用在真实文件系统上，
         // 悄悄跳过会让用户以为删掉了。
-        if !is_safe_rel_path(&p) {
+        let p = match validate_rel_path(raw) {
+            Ok(p) => p,
+            Err(_) => {
+                rejected.push(raw.clone());
+                continue;
+            }
+        };
+        // WB-0423：清单与磁盘必须同源。只改清单会让"已删除"停留在内存投影，
+        // 磁盘文件还在 —— 重启后重扫把它带回清单，对端再把文件传回来。
+        // 磁盘搬移失败必须显式 rejected，不得冒充 moved。
+        if let Err(e) = move_file_to_delete_dir(&base_dir, &p) {
+            log::warn!(
+                "假删除磁盘搬移失败 device={} file={} : {e}",
+                req.device_id,
+                p
+            );
             rejected.push(raw.clone());
             continue;
         }
@@ -362,15 +442,42 @@ pub async fn handle_move_to_delete(
     skipped.sort();
     rejected.sort();
 
-    json_response(
-        StatusCode::OK,
-        &json!({
-            "deviceId": req.device_id,
-            "moved": moved,
-            "skipped": skipped,
-            "rejected": rejected,
-        }),
-    )
+    ok_json(MoveToDeleteResponse {
+        device_id: req.device_id,
+        moved,
+        skipped,
+        rejected,
+    })
+}
+
+/// 单批假删除路径数上限（WB-0427）。
+const MAX_MOVE_PATHS: usize = 1000;
+
+/// 把 `base_dir/<rel>` 物理搬入 `base_dir/delete/<rel>`（同盘 rename，原子）。
+///
+/// - 源不存在 → `Ok(())`：清单里的条目仍要搬成墓碑（对端需要知道"这是有意删除"）；
+/// - 目标已存在 → `Ok(())`：上次已搬完（幂等重放）；
+/// - 其余失败（占用/权限）→ `Err`：调用方必须报 rejected。
+fn move_file_to_delete_dir(base_dir: &std::path::Path, rel: &str) -> std::io::Result<()> {
+    let join = |p: &str| {
+        if base_dir.as_os_str().is_empty() {
+            PathBuf::from(p)
+        } else {
+            base_dir.join(p)
+        }
+    };
+    let src = join(rel);
+    if !src.exists() {
+        return Ok(());
+    }
+    let dst = join("delete").join(rel);
+    if dst.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(&src, &dst)
 }
 
 /// `POST /api/v4/disconnect` —— 断开连接。
@@ -395,6 +502,12 @@ pub async fn handle_disconnect(
         Ok(r) => r,
         Err(e) => return err_response(ErrorCode::BadRequest, &e),
     };
+
+    // WB-0431：断开会中止该设备全部在途会话，必须先证明这是台受信设备 ——
+    // 未配对/已吊销设备发来的 disconnect 一律拒绝。
+    if let Err(resp) = require_transferable(store, &req.device_id).await {
+        return *resp;
+    }
 
     let mut rec = match store.peers.entry(&req.device_id).await {
         Some(r) => r,
@@ -431,18 +544,20 @@ pub async fn handle_disconnect(
     drop(guard);
     aborted.sort();
 
-    ok_json(json!({
-        "deviceId": req.device_id,
+    ok_json(DisconnectResponse {
+        device_id: req.device_id,
         // 明确回传：断开之后配对关系仍在
-        "pairingState": pairing_state,
-        "presence": Presence::Offline,
-        "abortedSessions": aborted,
-    }))
+        pairing_state,
+        presence: Presence::Offline,
+        aborted_sessions: aborted,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::StatusCode;
+    use serde_json::json;
     use crate::dto::handshake::PairingState;
     use crate::dto::sync::ManifestEntry;
     use crate::dto::DeviceType;
@@ -455,7 +570,11 @@ mod tests {
     use hyper::Method;
 
     fn app() -> Arc<SessionStore> {
-        SessionStore::with_identity(DeviceIdentity::generate(), "srv", DeviceType::Desktop)
+        let s = SessionStore::with_identity(DeviceIdentity::generate(), "srv", DeviceType::Desktop);
+        let dir = std::env::temp_dir().join(format!("lanbak-sync-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        s.with_base_dir(dir);
+        s
     }
 
     fn active_trust() -> TrustRecord {
@@ -625,11 +744,14 @@ mod tests {
         )
         .await;
         for i in confirm {
+            let offset = i * crate::transfer::chunk::PIECE_SIZE;
+            let len = (size - offset).min(crate::transfer::chunk::PIECE_SIZE) as usize;
+            let data = vec![0u8; len];
             route(
                 s,
                 Method::POST,
                 &format!("/api/v4/session/chunk?sessionId=s1&fileId=f1&pieceIndex={i}"),
-                &[],
+                &data,
             )
             .await;
         }
@@ -1037,5 +1159,276 @@ mod tests {
         .await;
         assert_eq!(second["abortedSessions"], json!([]));
         assert_eq!(second["pairingState"], json!("active"));
+    }
+
+    // ── 区域二：会话闸 / 生产模式认证 / 真实假删除 ───────────────
+
+    /// WB-0297：单设备会话数上限 —— 第 9 个会话必须被拒，洪泛不得撑爆会话表；
+    /// 其他设备不受影响。
+    #[tokio::test]
+    async fn register_enforces_per_peer_session_cap() {
+        let s = app();
+        pair(&s, "p1").await;
+        for i in 0..8 {
+            let r = route(
+                &s,
+                Method::POST,
+                "/api/v4/session/register",
+                &bytes(json!({"deviceId":"p1","alias":"a","sessionId":format!("cap-{i}")})),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::OK, "第 {} 个会话应成功", i + 1);
+        }
+        let r = route(
+            &s,
+            Method::POST,
+            "/api/v4/session/register",
+            &bytes(json!({"deviceId":"p1","alias":"a","sessionId":"cap-overflow"})),
+        )
+        .await;
+        assert_eq!(
+            r.status(),
+            StatusCode::CONFLICT,
+            "第 9 个会话必须被上限闸拒绝"
+        );
+        pair(&s, "p2").await;
+        let r = route(
+            &s,
+            Method::POST,
+            "/api/v4/session/register",
+            &bytes(json!({"deviceId":"p2","alias":"b","sessionId":"p2-s1"})),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK, "上限按设备隔离，不得误伤他人");
+    }
+
+    /// WB-0302/0307：prepare 的大小与哈希数量闸。
+    #[tokio::test]
+    async fn prepare_enforces_size_and_hash_count_gates() {
+        let s = app();
+        pair(&s, "p1").await;
+        route(
+            &s,
+            Method::POST,
+            "/api/v4/session/register",
+            &bytes(json!({"deviceId":"p1","alias":"a","sessionId":"s1"})),
+        )
+        .await;
+        // 单文件超过 512GiB 上限
+        let r = route(
+            &s,
+            Method::POST,
+            "/api/v4/session/prepare",
+            &bytes(json!({
+                "sessionId":"s1","deviceId":"p1",
+                "files":{"big":{"fileId":"big","fileName":"b","relPath":"b","size":549755813889i64,"mtime":1}}
+            })),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "单文件超上限必须 400");
+
+        // pieceHashes 数量与 piece 数不符（size=100 → 1 piece）
+        let fake = "a".repeat(64);
+        let r = route(
+            &s,
+            Method::POST,
+            "/api/v4/session/prepare",
+            &bytes(json!({
+                "sessionId":"s1","deviceId":"p1",
+                "files":{"f1":{"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1,
+                                "pieceHashes":[fake, fake]}}
+            })),
+        )
+        .await;
+        assert_eq!(
+            r.status(),
+            StatusCode::BAD_REQUEST,
+            "哈希数量与 piece 数不符必须 400，否则逐块比对系统性错位"
+        );
+    }
+
+    /// WB-0353/0354：终态会话心跳被拒；位图版本由服务端权威自增。
+    #[tokio::test]
+    async fn heartbeat_rejects_terminal_and_version_is_server_authoritative() {
+        let s = app();
+        pair(&s, "p1").await;
+        session_with(&s, 100, &[]).await;
+        let v1 = body_json(
+            route(
+                &s,
+                Method::POST,
+                "/api/v4/session/heartbeat",
+                &bytes(json!({"sessionId":"s1","bitmapVersion":999})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            v1["bitmapVersion"],
+            json!(1),
+            "客户端自报 999 不得推高服务端版本"
+        );
+        let v2 = body_json(
+            route(
+                &s,
+                Method::POST,
+                "/api/v4/session/heartbeat",
+                &bytes(json!({"sessionId":"s1","bitmapVersion":0})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(v2["bitmapVersion"], json!(2), "重复心跳每次只 +1，重放不推进多格");
+
+        route(
+            &s,
+            Method::POST,
+            "/api/v4/session/abort",
+            &bytes(json!({"sessionId":"s1"})),
+        )
+        .await;
+        let r = route(
+            &s,
+            Method::POST,
+            "/api/v4/session/heartbeat",
+            &bytes(json!({"sessionId":"s1","bitmapVersion":5})),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::CONFLICT, "终态会话不得靠心跳永生");
+    }
+
+    /// WB-0423/0426：假删除必须真的把磁盘文件搬进 delete/，
+    /// 且墓碑在重启 + 重扫后仍在 —— 否则用户删掉的文件会被复活。
+    #[tokio::test]
+    async fn move_to_delete_moves_the_real_file_and_tombstone_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("lanbak-tomb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = SessionStore::open(DeviceIdentity::generate(), "srv", DeviceType::Desktop, Some(&dir));
+        s.with_base_dir(dir.clone());
+        s.peers
+            .put(PeerRecord::new("p1", "", vec![], vec![9u8; 32], active_trust()))
+            .await;
+        std::fs::write(dir.join("a.txt"), b"data").unwrap();
+        seed_manifest(&s, &[("a.txt", 4, 1)]).await;
+
+        let v = body_json(
+            route(
+                &s,
+                Method::POST,
+                "/api/v4/move-to-delete",
+                &bytes(json!({"deviceId":"p1","relPaths":["a.txt"]})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(v["moved"], json!(["delete/a.txt"]));
+        assert!(!dir.join("a.txt").exists(), "磁盘文件必须真的搬走，不得只改清单");
+        assert!(dir.join("delete").join("a.txt").exists(), "文件应落在 delete/ 下");
+
+        // 重启：新进程 + 平台重扫（假设重扫结果为空表）→ 墓碑必须由持久化兜底
+        let s2 = SessionStore::open(DeviceIdentity::generate(), "srv", DeviceType::Desktop, Some(&dir));
+        s2.peers
+            .put(PeerRecord::new("p1", "", vec![], vec![9u8; 32], active_trust()))
+            .await;
+        let rescanned = crate::sync::manifest::build_manifest(
+            "srv",
+            1701,
+            Vec::<(String, ManifestEntry)>::new(),
+        );
+        s2.set_local_manifest(rescanned).await;
+        let v = body_json(
+            route(&s2, Method::GET, "/api/v4/manifest?deviceId=p1", &[]).await,
+        )
+        .await;
+        assert!(
+            v["files"]["delete/a.txt"].is_object(),
+            "重启后墓碑丢失：下一轮三路对比会把用户删掉的文件复活"
+        );
+    }
+
+    /// WB-0431：disconnect 是清场动作，未配对 404、已吊销 401。
+    #[tokio::test]
+    async fn disconnect_rejects_untrusted_devices() {
+        let s = app();
+        let r = route(
+            &s,
+            Method::POST,
+            "/api/v4/disconnect",
+            &bytes(json!({"deviceId":"ghost"})),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+
+        let mut t = active_trust();
+        t.apply(PairingEvent::PeerUnpair).unwrap();
+        s.peers
+            .put(PeerRecord::new("revoked", "", vec![], vec![], t))
+            .await;
+        let r = route(
+            &s,
+            Method::POST,
+            "/api/v4/disconnect",
+            &bytes(json!({"deviceId":"revoked"})),
+        )
+        .await;
+        assert_eq!(
+            r.status(),
+            StatusCode::UNAUTHORIZED,
+            "已吊销设备不得通过 disconnect 清掉在途会话"
+        );
+    }
+
+    /// WB-0401：生产模式下 chunk-status 必须带 prepare 签发的文件 token。
+    #[tokio::test]
+    async fn chunk_status_requires_file_token_in_production_mode() {
+        let s = app();
+        s.with_require_active_peer(true);
+        pair(&s, "p1").await;
+        route(
+            &s,
+            Method::POST,
+            "/api/v4/session/register",
+            &bytes(json!({"deviceId":"p1","alias":"a","sessionId":"s1"})),
+        )
+        .await;
+        let pr = body_json(
+            route(
+                &s,
+                Method::POST,
+                "/api/v4/session/prepare",
+                &bytes(json!({
+                    "sessionId":"s1","deviceId":"p1",
+                    "files":{"f1":{"fileId":"f1","fileName":"x","relPath":"x","size":100,"mtime":1}}
+                })),
+            )
+            .await,
+        )
+        .await;
+        let token = pr["files"]["f1"].as_str().unwrap().to_string();
+
+        let r = route(
+            &s,
+            Method::GET,
+            "/api/v4/chunk-status?sessionId=s1&fileId=f1",
+            &[],
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "无 token 不得查询块状态");
+        let r = route(
+            &s,
+            Method::GET,
+            &format!("/api/v4/chunk-status?sessionId=s1&fileId=f1&token={token}"),
+            &[],
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK, "带正确 token 应放行");
+        let r = route(
+            &s,
+            Method::GET,
+            "/api/v4/chunk-status?sessionId=s1&fileId=f1&token=wrong",
+            &[],
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
     }
 }

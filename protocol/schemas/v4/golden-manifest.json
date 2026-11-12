@@ -20,5 +20,5 @@
     "POST /api/v4/sync/disconnect"
   ],
   "schemaCount": 45,
-  "schemaHash": "e1e95babf99ef818d9a63969a3ae3f21d3194c004b3713cce7d1678e4de7890a"
+  "schemaHash": "65654b6b21bb59440abf0804c67b21399cb25351c7b59ff1e1faf203d9e6834c"
 }

@@ -38,13 +38,9 @@ impl Default for V4DiscoveryState {
     }
 }
 
+#[derive(Default)]
 pub struct DiscoveryState(V4DiscoveryState);
 
-impl Default for DiscoveryState {
-    fn default() -> Self {
-        Self(V4DiscoveryState::default())
-    }
-}
 
 /// 启动设备发现
 pub async fn start_discovery(app: AppHandle, server_port: u16) -> Result<String, AppError> {
@@ -75,7 +71,7 @@ pub async fn start_discovery(app: AppHandle, server_port: u16) -> Result<String,
         subnet_scan_inner(scan_app, server_port, stop_flag_inner, devices);
     });
 
-    Ok(format!("设备发现已启动"))
+    Ok("设备发现已启动".to_string())
 }
 
 /// 停止设备发现

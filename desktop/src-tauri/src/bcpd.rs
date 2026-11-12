@@ -22,7 +22,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand;
 use ring::hmac;
 use serde_json::{Value, json};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -116,11 +115,13 @@ fn build_beacon(app: &AppHandle, ts: u64) -> Option<String> {
 }
 
 /// 预解析一个收到的 bcpd 包：
+/// 校验步骤：
 /// 1. 类型必须是 bcpd；
 /// 2. ts 必须在 REPLAY_WINDOW_MS 内（防重放）；
 /// 3. (sender, ts) 未被重复处理过（dedup）；
 /// 4. m[] 中必须存在 p == 本机 deviceId 的 slot；
 /// 5. 用 secrets[发送方 deviceId] 重算 HMAC 必须匹配。
+///
 /// 通过返回 发送方设备Id，否则 None。
 fn try_parse_and_auth(app: &AppHandle, text: &str) -> Option<String> {
     let v: Value = serde_json::from_str(text).ok()?;

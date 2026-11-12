@@ -54,6 +54,13 @@
       ]
     },
     {
+      "description": "文件级传输中（调度层）",
+      "type": "string",
+      "enum": [
+        "processing"
+      ]
+    },
+    {
       "description": "已完成（终态）",
       "type": "string",
       "enum": [

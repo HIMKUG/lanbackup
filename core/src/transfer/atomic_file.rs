@@ -110,7 +110,15 @@ fn conflict_rename_path(final_path: &Path) -> PathBuf {
         .format(&time::macros::format_description!("[month][day][hour][minute][second]"))
         .unwrap_or_default();
     let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
-    parent.join(format!("{stem}_{stamp}{ext}"))
+    // WB-0477：同一秒内两个冲突副本会撞名 —— 直接覆盖会把上一份旧版本销毁。
+    // 撞名时追加 `-2`/`-3` 序号，保证每个旧版本都活下来。
+    let mut candidate = parent.join(format!("{stem}_{stamp}{ext}"));
+    let mut n = 2u32;
+    while candidate.exists() {
+        candidate = parent.join(format!("{stem}_{stamp}-{n}{ext}"));
+        n += 1;
+    }
+    candidate
 }
 
 /// 临时文件名后缀里允许出现的字符：仅字母数字与 `-_`。
@@ -184,6 +192,12 @@ pub fn commit_rename(part: &Path, final_path: &Path) -> std::io::Result<()> {
             ))
         }
     }
+    // WB-0472：rename 前必须把 part 的数据刷盘 —— 否则断电后 rename 已生效
+    // 而数据还在页缓存里，最终文件会是空洞/零字节（崩溃注入的真实教训）。
+    // 以写方式打开（FlushFileBuffers 需要写句柄）；失败尽力而为，不阻断提交。
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(part) {
+        let _ = f.sync_all();
+    }
     std::fs::rename(part, final_path)
 }
 
@@ -195,6 +209,15 @@ pub fn commit_rename(part: &Path, final_path: &Path) -> std::io::Result<()> {
 ///
 /// 注意：复制用 `std::fs::copy` 直接覆盖 `final_path`，所以不需要额外的临时 final。
 pub fn commit_copy_delete(part: &Path, final_path: &Path) -> std::io::Result<()> {
+    // WB-0474：降级路径必须显式可见 —— 静默 copy+delete 会让「旧 final 已删、
+    // 新 final 未写完」的读取窗口无人知晓。文件名只取 name，不在日志里落全路径。
+    log::warn!(
+        "原子 rename 不可用（跨卷/跨目录），降级为 copy+delete：复制期间 {} 存在短暂读取窗口",
+        final_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "final".to_string())
+    );
     std::fs::copy(part, final_path)?;
     // 复制成功后再删临时文件（失败也不影响：final 已是正确内容）
     let _ = std::fs::remove_file(part);
@@ -226,13 +249,61 @@ pub fn committed_bytes(part: &Path) -> u64 {
 /// 平台在 [`commit`] 之后**必须**调用本函数把 [`crate::dto::session::FileMeta::mtime`]
 /// 写回。
 ///
-/// `mtime_ns` 为纳秒级 Unix 时间戳（与 DTO 中的 `mtime` 字段语义一致）。
-pub fn restore_mtime(final_path: &Path, mtime_ns: i64) -> std::io::Result<()> {
-    let secs = mtime_ns.div_euclid(1_000_000_000).max(0) as u64;
-    let nsec = mtime_ns.rem_euclid(1_000_000_000) as u32;
-    let t = UNIX_EPOCH + std::time::Duration::new(secs, nsec);
+/// `mtime_ms` 为**毫秒级** Unix 时间戳，与 DTO 中的 `mtime` 字段语义一致
+/// （此前这里按纳秒解释，而线上 DTO 是毫秒 —— 恢复后的时间会偏差 1000 倍）。
+pub fn restore_mtime(final_path: &Path, mtime_ms: i64) -> std::io::Result<()> {
+    let mtime_ns = mtime_ms.saturating_mul(1_000_000);
+    // WB-0476：1970 年前（负值）的合法时间不得钳成 epoch —— 那会让三路对比
+    // 把"没变"误判成"变了"（mtime 漂移），每次都全量重传。负值显式回退 epoch；
+    // 平台不支持时如实报错，由调用方决定降级。
+    let t = if mtime_ns >= 0 {
+        let secs = mtime_ns.div_euclid(1_000_000_000) as u64;
+        let nsec = mtime_ns.rem_euclid(1_000_000_000) as u32;
+        UNIX_EPOCH + std::time::Duration::new(secs, nsec)
+    } else {
+        let abs = mtime_ns.unsigned_abs();
+        let d = std::time::Duration::new(abs / 1_000_000_000, (abs % 1_000_000_000) as u32);
+        match UNIX_EPOCH.checked_sub(d) {
+            Some(t) => t,
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("mtime 超出平台可表示范围: {mtime_ms}ms"),
+                ))
+            }
+        }
+    };
     let f = std::fs::OpenOptions::new().write(true).open(final_path)?;
     f.set_modified(t)
+}
+
+/// 验证完成后提交，并在覆盖旧文件时**保留旧版本**为同目录冲突副本。
+///
+/// 为什么不在收块前改名（旧实现）：一旦传输在中途失败，用户会看到原文件
+/// 已经"消失"、只剩一个带时间戳的副本。旧文件必须活到新文件完整通过校验。
+///
+/// 返回 `Ok(Some(path))` 表示旧文件被改名保存到了 `path`；`Ok(None)` 表示
+/// 之前没有旧文件。提交失败时尽力把旧文件改回原名。
+pub fn commit_preserving_conflict(
+    part: &Path,
+    final_path: &Path,
+) -> std::io::Result<Option<PathBuf>> {
+    let backup = if final_path.exists() {
+        let b = conflict_rename_path(final_path);
+        std::fs::rename(final_path, &b)?;
+        Some(b)
+    } else {
+        None
+    };
+    match commit(part, final_path) {
+        Ok(()) => Ok(backup),
+        Err(e) => {
+            if let Some(b) = &backup {
+                let _ = std::fs::rename(b, final_path);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// 平台写盘的统一入口：写临时文件 → [`commit`] 原子替换 → 恢复 mtime（可选）。
@@ -386,9 +457,9 @@ mod tests {
         let dir = tmp();
         let final_path = dir.join("f.txt");
         std::fs::write(&final_path, b"data").unwrap();
-        // 2023-11-14T22:13:20Z 的纳秒时间戳
-        let want_ns: i64 = 1_700_000_000_000_000_000;
-        restore_mtime(&final_path, want_ns).expect("恢复 mtime 应成功");
+        // 2023-11-14T22:13:20Z 的毫秒时间戳（DTO 的 mtime 单位）
+        let want_ms: i64 = 1_700_000_000_000;
+        restore_mtime(&final_path, want_ms).expect("恢复 mtime 应成功");
 
         let got = std::fs::metadata(&final_path)
             .unwrap()
@@ -398,6 +469,7 @@ mod tests {
             .unwrap()
             .as_nanos() as i64;
         // 部分平台 mtime 精度会落到秒级，容忍 2 秒偏差
+        let want_ns = want_ms * 1_000_000;
         assert!((got - want_ns).abs() <= 2_000_000_000, "mtime 应近似等于声明值（误差 {:.3}s）", (got - want_ns).abs() as f64 / 1e9);
     }
 
@@ -406,9 +478,10 @@ mod tests {
         let dir = tmp();
         let final_path = dir.join("final.bin");
         let part = part_path(&final_path, "s9", "f9");
-        let want_ns: i64 = 1_700_000_000_000_000_000;
+        let want_ms: i64 = 1_700_000_000_000;
+        let want_ns = want_ms * 1_000_000;
 
-        write_committed(&part, &final_path, Some(want_ns), |p| {
+        write_committed(&part, &final_path, Some(want_ms), |p| {
             std::fs::write(p, b"payload-bytes")
         })
         .expect("write_committed 应成功");

@@ -1,0 +1,90 @@
+# WB-1021/1022：Windows 后端门禁 —— core/desktop 变更必须触发本工作流。
+#
+# 现状说明（交付时如实记录）：
+# - core 侧 fmt/clippy(-D warnings)/test/schema-check 全部阻断；
+# - desktop 侧 clippy 暂不阻断：遗留 53318/旧 crypto 隔离代码仍产生 31 个
+#   dead_code 警告（WB-1070 待清），避免门禁被历史欠账卡死；
+# - frontend job 暂为 continue-on-error：desktop/node_modules 未入库、
+#   vue-tsc 门禁未接（WB-0974），首次 CI 运行后再转阻断。
+name: windows-core-desktop
+
+on:
+  push:
+    paths:
+      - "core/**"
+      - "desktop/src-tauri/**"
+      - "desktop/src/**"
+      - "shared-core/**"
+      - "protocol/**"
+      - ".github/workflows/windows-ci.yml"
+  pull_request:
+    paths:
+      - "core/**"
+      - "desktop/src-tauri/**"
+      - "desktop/src/**"
+      - "shared-core/**"
+      - "protocol/**"
+      - ".github/workflows/windows-ci.yml"
+
+jobs:
+  rust:
+    name: Rust (core + desktop)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: core fmt（非阻断，历史格式欠账待清）
+        working-directory: core
+        continue-on-error: true
+        run: cargo fmt -- --check
+
+      - name: core clippy -D warnings
+        working-directory: core
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: core test
+        working-directory: core
+        run: cargo test --lib
+
+      - name: schema golden check（WB-1044：契约指纹门禁）
+        working-directory: core
+        run: cargo run --bin gen_schema -- --check
+
+      - name: desktop test
+        working-directory: desktop/src-tauri
+        run: cargo test --lib
+
+      - name: desktop clippy（非阻断，隔离代码 dead_code 待清 WB-1070）
+        working-directory: desktop/src-tauri
+        continue-on-error: true
+        run: cargo clippy --lib -- -D warnings
+
+  frontend:
+    name: Frontend (desktop)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable corepack（pnpm 版本以 packageManager 字段为准，WB-1023）
+        run: corepack enable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install（--frozen-lockfile，WB-1024）
+        working-directory: desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        working-directory: desktop
+        run: pnpm build

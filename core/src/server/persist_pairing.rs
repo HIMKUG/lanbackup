@@ -98,7 +98,9 @@ impl PairingPersister {
         })
     }
 
-    /// 原子写全量配对记录：临时文件 + sync_all + rename。
+    /// 原子写全量配对记录：**进程内唯一**临时文件 + sync_all + rename（WB-0726）。
+    /// 固定 `.json.tmp` 名在并发 persist 时会互踩 —— A 的 rename 可能捡到
+    /// B 写了一半的临时文件，把半截 JSON 当成完整配对表。
     fn write_all(&self, records: &[PeerRecordJson]) {
         let data = match serde_json::to_vec(records) {
             Ok(d) => d,
@@ -107,7 +109,14 @@ impl PairingPersister {
                 return;
             }
         };
-        let tmp = self.path.with_extension("json.tmp");
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file_name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "paired_peers.json".to_string());
+        let tmp = self.path.with_file_name(format!("{file_name}.{seq}.tmp"));
         let result = (|| -> std::io::Result<()> {
             let mut f = File::create(&tmp)?;
             f.write_all(&data)?;
@@ -122,17 +131,40 @@ impl PairingPersister {
     }
 
     /// 冷启动重载：从磁盘读出所有配对记录。
-    /// 缺失或损坏时返回空 Vec（从无配对启动 → 等价于首次配对）。
+    ///
+    /// WB-0727：损坏**隔离**而非当空表 —— 先把坏文件改名留档（吊销记录、
+    /// pairing_secret 都在里面，直接覆盖等于帮攻击者/bug 销毁证据），
+    /// 再从空配对启动并告警。重启后对端可通过 sync-status 对账收敛。
     pub(crate) fn load_all(&self) -> Vec<PeerRecord> {
-        match fs::read(&self.path) {
-            Ok(bytes) => match serde_json::from_slice::<Vec<PeerRecordJson>>(&bytes) {
-                Ok(records) => records.into_iter().map(PeerRecordJson::into_peer_record).collect(),
-                Err(e) => {
-                    log::warn!("配对记录损坏（忽略，从空配对启动）: {e}");
-                    Vec::new()
+        let bytes = match fs::read(&self.path) {
+            Ok(b) => b,
+            Err(_) => return Vec::new(),
+        };
+        match serde_json::from_slice::<Vec<PeerRecordJson>>(&bytes) {
+            Ok(records) => records.into_iter().map(PeerRecordJson::into_peer_record).collect(),
+            Err(e) => {
+                static QUARANTINE_SEQ: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let seq = QUARANTINE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let file_name = self
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "paired_peers.json".to_string());
+                let quarantine = self
+                    .path
+                    .with_file_name(format!("{file_name}.corrupt.{seq}"));
+                match fs::rename(&self.path, &quarantine) {
+                    Ok(()) => log::error!(
+                        "配对记录损坏已隔离到 {:?}（原因: {e}）；从空配对启动，等待对账收敛",
+                        quarantine
+                    ),
+                    Err(re) => log::error!(
+                        "配对记录损坏且隔离失败（{re}，原因: {e}）；从空配对启动"
+                    ),
                 }
-            },
-            Err(_) => Vec::new(),
+                Vec::new()
+            }
         }
     }
 

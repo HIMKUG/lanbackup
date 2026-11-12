@@ -74,10 +74,6 @@ log = "0.4"
 # 启用 `android-jni` feature 后，`platform::android` 提供基于 JNI 的真实 `MulticastGuard`（M22）。
 jni = { version = "0.21", optional = true }
 
-# 发布优化：core 是性能热点，保持 opt-level 3
-[profile.release.package.lanbackup-core]
-opt-level = 3
-
 [features]
 default = []
 # Android 侧接入真实组播锁（M22）：启用后 `platform::android` 提供基于 JNI 的

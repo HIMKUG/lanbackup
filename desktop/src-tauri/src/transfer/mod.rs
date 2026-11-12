@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::AppError;
 use crate::identity;
-use crate::session_store;
+use lanbackup_core::server::SessionStore;
 
 mod send;
 mod receive;
@@ -84,18 +84,11 @@ pub struct FileMetadata {
     pub accessed: Option<String>,
 }
 
-/// 配对连接并发额度守卫（RAII）
-struct PairConnGuard(std::sync::Arc<std::sync::Mutex<u32>>);
-impl Drop for PairConnGuard {
-    fn drop(&mut self) {
-        if let Ok(mut c) = self.0.lock() {
-            *c = c.saturating_sub(1);
-        }
-    }
-}
-
 /// 全局传输状态（由 lib.rs 注入）
 pub struct TransferState {
+    /// WB-0117：启停单飞锁 —— start/stop 全程持锁串行化，
+    /// 并发 start_receiver 不再出现"双绑端口/旧服务未停新服务已起"的竞态。
+    pub(crate) lifecycle_lock: tokio::sync::Mutex<()>,
     #[allow(dead_code)]
     server: Mutex<Option<Arc<V4ServerHandle>>>,
     #[allow(dead_code)]
@@ -106,8 +99,6 @@ pub struct TransferState {
     pub(crate) pending_pairing_approvals: Mutex<HashMap<String, std::sync::mpsc::Sender<bool>>>,
     #[allow(dead_code)]
     pub(crate) pending_pairing_times: Mutex<HashMap<String, std::time::Instant>>,
-    #[allow(dead_code)]
-    pairing_listener: Mutex<Option<std::net::TcpListener>>,
     pub(crate) receiver_should_run: AtomicBool,
     pub(crate) receiver_stop_intent: AtomicBool,
     pub(crate) discoverable: AtomicBool,
@@ -130,6 +121,7 @@ pub(crate) const SESSION_SWEEP_INTERVAL_SECS: u64 = 60;
 impl Default for TransferState {
     fn default() -> Self {
         Self {
+            lifecycle_lock: tokio::sync::Mutex::new(()),
             server: Mutex::new(None),
             stop_tx: Mutex::new(None),
             receive_dir: Mutex::new(None),
@@ -137,7 +129,6 @@ impl Default for TransferState {
             pending_receive_times: Mutex::new(HashMap::new()),
             pending_pairing_approvals: Mutex::new(HashMap::new()),
             pending_pairing_times: Mutex::new(HashMap::new()),
-            pairing_listener: Mutex::new(None),
             receiver_should_run: AtomicBool::new(false),
             receiver_stop_intent: AtomicBool::new(false),
             discoverable: AtomicBool::new(false),
@@ -205,10 +196,6 @@ impl TransferState {
 pub struct SendFileItem {
     rel_path: String,
     abs_path: String,
-    #[serde(default)]
-    pub offset: Option<u64>,
-    #[serde(default)]
-    pub size: Option<u64>,
 }
 
 impl SendFileItem {
@@ -230,6 +217,9 @@ pub struct PairingState {
     pub secrets: tokio::sync::RwLock<HashMap<String, Vec<u8>>>,
     #[allow(unused)]
     pub used_jtis: Mutex<HashSet<String>>,
+    /// core SessionStore（由 receive.rs::start_receiver 注入）。
+    /// 用于在配对变更时同步写 core PeerStore，消除 SQLite↔core drift。
+    pub(crate) session_store: Mutex<Option<std::sync::Arc<SessionStore>>>,
 }
 
 impl Default for PairingState {
@@ -245,6 +235,7 @@ impl Default for PairingState {
             sig_key: Mutex::new(None),
             secrets: tokio::sync::RwLock::new(HashMap::new()),
             used_jtis: Mutex::new(HashSet::new()),
+            session_store: Mutex::new(None),
         }
     }
 }
@@ -266,8 +257,20 @@ pub(crate) fn get_or_create_sig_key(app: &AppHandle) -> (String, String) {
         }
         return generated;
     }
-    let generated = crate::crypto::sig_generate_keypair().unwrap_or_default();
-    let _ = crate::db::save_sig_key(app, &generated.0, &generated.1);
+    let generated = match crate::crypto::sig_generate_keypair() {
+        Ok(k) => k,
+        Err(e) => {
+            crate::log_error!("签名密钥生成失败（拒绝落空密钥）: {e}");
+            return (String::new(), String::new());
+        }
+    };
+    if generated.0.is_empty() || generated.1.is_empty() {
+        crate::log_error!("签名密钥生成返回空值（拒绝落盘）");
+        return (String::new(), String::new());
+    }
+    if let Err(e) = crate::db::save_sig_key(app, &generated.0, &generated.1) {
+        crate::log_error!("签名密钥落盘失败: {e}");
+    }
     if let Some(st) = app.try_state::<PairingState>() {
         if let Ok(mut k) = st.sig_key.lock() {
             *k = Some((generated.0.clone(), generated.1.clone()));
@@ -284,143 +287,6 @@ pub fn notify_peers_disconnect(app: &AppHandle) {
     }
 }
 
-pub fn pairing_port(receiver_port: u16) -> u16 {
-    receiver_port + 1
-}
-
-pub fn spawn_pairing_server(app: AppHandle) {
-    let port = pairing_port(53317);
-    crate::probe!("pairing: 开始绑定端口");
-    let mut listener = None;
-    for attempt in 0..5 {
-        match std::net::TcpListener::bind(("0.0.0.0", port)) {
-            Ok(l) => {
-                listener = Some(l);
-                crate::probe!(format!("pairing: 端口绑定成功（第 {} 次尝试）", attempt + 1));
-                break;
-            }
-            Err(_) if attempt < 4 => {
-                std::thread::sleep(std::time::Duration::from_millis(120));
-            }
-            Err(e) => {
-                crate::probe!("pairing: 端口绑定失败");
-                crate::log_warn!(
-                    "配对服务端口 {port} 绑定失败: {e}。对端按 (接收端口+1) 访问本机配对服务，\
-                     请释放占用 {port} 的进程后重启（不做端口回退：换端口会导致对端不可达）"
-                );
-                return;
-            }
-        }
-    }
-    let listener = match listener {
-        Some(l) => l,
-        None => return,
-    };
-    let thread_listener = match listener.try_clone() {
-        Ok(l) => l,
-        Err(e) => {
-            crate::log_warn!("配对服务 try_clone 失败: {e}");
-            return;
-        }
-    };
-    if let Ok(mut st) = app.state::<TransferState>().pairing_listener.lock() {
-        *st = Some(listener);
-    }
-    let pair_sem = Arc::new(std::sync::Mutex::new(0u32));
-    std::thread::spawn(move || {
-        crate::log_info!("配对服务已启动: 端口 {port}");
-        for stream in thread_listener.incoming() {
-            match stream {
-                Ok(mut s) => {
-                    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-                    let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-                    let app = app.clone();
-                    let pair_cap = 32u32;
-                    let over_cap = {
-                        let mut c = match pair_sem.lock() {
-                            Ok(g) => g,
-                            Err(p) => p.into_inner(),
-                        };
-                        if *c >= pair_cap {
-                            true
-                        } else {
-                            *c += 1;
-                            false
-                        }
-                    };
-                    if over_cap {
-                        crate::log_warn!("配对服务并发连接达上限({pair_cap})，丢弃多余连接");
-                        continue;
-                    }
-                    let pair_sem = pair_sem.clone();
-                    std::thread::spawn(move || {
-                        let _guard = PairConnGuard(pair_sem);
-                        let _ = handle_pairing_conn(app, &mut s);
-                    });
-                }
-                Err(_) => {
-                    crate::log_info!("配对服务已停止");
-                    break;
-                }
-            }
-        }
-    });
-}
-
-#[allow(dead_code)]
-pub fn stop_pairing_server(app: AppHandle) {
-    if let Ok(mut st) = app.state::<TransferState>().pairing_listener.lock() {
-        if let Some(l) = st.take() {
-            drop(l);
-        }
-    }
-}
-
-pub(crate) fn handle_move_to_delete(app: &AppHandle, body: &str) -> usize {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return 0;
-    };
-    let Some(files) = v.get("files").and_then(|f| f.as_array()) else {
-        return 0;
-    };
-    let Some(dir) = app
-        .state::<TransferState>()
-        .receive_dir
-        .lock()
-        .ok()
-        .and_then(|d| d.clone())
-    else {
-        return 0;
-    };
-    let delete_dir = dir.join("delete");
-    let mut moved = 0;
-    for f in files {
-        let Some(rel) = f.as_str() else { continue };
-        if rel.is_empty() || rel.contains("..") {
-            continue;
-        }
-        let src = dir.join(rel);
-        let dst = delete_dir.join(rel);
-        if src.exists() {
-            if let Some(parent) = dst.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if std::fs::rename(&src, &dst).is_ok() {
-                moved += 1;
-            }
-        }
-    }
-    crate::log_info!("镜像模式移动多余文件到 delete: {moved} 个");
-    moved
-}
-
-pub fn handle_pairing_conn(
-    app: AppHandle,
-    stream: &mut std::net::TcpStream,
-) -> Result<(), AppError> {
-    crate::pairing::handle_pairing_conn(app, stream)
-}
-
 #[allow(dead_code)]
 pub fn send_unpair(_ip: String, _port: u16, _device_id: String) -> Result<bool, AppError> {
     Err(AppError("send_unpair 已废弃，请使用 unpair_peer（store.rs）".to_string()))
@@ -433,7 +299,12 @@ pub async fn move_to_delete(ip: String, port: u16, files: Vec<String>) -> Result
     }).to_string();
     tauri::async_runtime::spawn_blocking(move || {
         let v = http_json_request(&ip, port, "POST", "/api/v4/move-to-delete", &body)?;
-        Ok(v.get("moved").and_then(|x| x.as_u64()).unwrap_or(0) as usize)
+        // WB-0425：core 响应是 typed MoveToDeleteResponse —— `moved` 是**路径数组**，
+        // 不是数字。此前按 as_u64 读恒得 0，前端"镜像确认"永远以为没删任何东西。
+        Ok(v.get("moved")
+            .and_then(|x| x.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0))
     })
     .await
     .map_err(|e| AppError(format!("任务执行失败: {e}")))?
@@ -442,7 +313,12 @@ pub async fn move_to_delete(ip: String, port: u16, files: Vec<String>) -> Result
 pub fn send_disconnect(ip: String, port: u16, device_id: String) -> Result<bool, AppError> {
     let body = serde_json::json!({"deviceId": device_id}).to_string();
     let v = http_json_request(&ip, port, "POST", "/api/v4/disconnect", &body)?;
-    Ok(v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
+    // WB-0435：core 响应是 typed DisconnectResponse（deviceId/pairingState/presence/
+    // abortedSessions），没有 `ok` 字段 —— 此前恒读 false，前端把每次断开都当失败。
+    // 断开语义：presence 归 offline 即成功（配对状态原样保留）。
+    Ok(v.get("presence")
+        .and_then(|x| x.as_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("offline")))
 }
 
 pub fn spawn_ui_watchdog(app: AppHandle) {
@@ -514,6 +390,10 @@ pub fn spawn_receiver_watchdog(app: AppHandle) {
             {
                 continue;
             }
+            // 防御模式下 probe 会被 core 总闸拒绝，不能据此判定服务死亡。
+            if state.defensive_hidden.load(Ordering::Relaxed) {
+                continue;
+            }
             let port = match state.server.lock() {
                 Ok(g) => match g.as_ref() {
                     Some(h) => h.port(),
@@ -526,12 +406,31 @@ pub fn spawn_receiver_watchdog(app: AppHandle) {
                 Err(_) => continue,
             };
             let Some(dir) = dir else { continue };
-            let Ok(addr) = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>() else {
+            let Ok(_addr) = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>() else {
                 continue;
             };
+            // WB-0058：TCP 能连上只说明端口有人监听，可能是别的进程。
+            // 必须走真实 /probe 并核对本机 deviceId，否则端口被占用时会误判健康。
+            let self_id = identity::get_device_id_no_ctx();
             let probe_ok = tauri::async_runtime::spawn_blocking(move || {
-                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(800))
-                    .is_ok()
+                match http_json_request_internal(
+                    "127.0.0.1",
+                    port,
+                    "GET",
+                    "/api/v4/probe",
+                    "",
+                    &HttpRequestOptions {
+                        connect_ms: 800,
+                        read_ms: 1500,
+                        write_ms: 800,
+                        protocol_version: Some("4.0"),
+                    },
+                ) {
+                    Ok(v) => {
+                        v.get("deviceId").and_then(|d| d.as_str()) == Some(self_id.as_str())
+                    }
+                    Err(_) => false,
+                }
             })
             .await
             .unwrap_or(false);

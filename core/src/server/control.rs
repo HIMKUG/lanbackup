@@ -43,7 +43,6 @@ use http_body_util::Full;
 use hyper::Response;
 use tokio::sync::Mutex;
 
-use crate::crypto::kdf::{self, sha256};
 use crate::crypto::sign::{self as p256sign, EphemeralKeyPair};
 use crate::dto::handshake::*;
 use crate::dto::Presence;
@@ -52,7 +51,7 @@ use crate::pairing::machine::PairingEvent;
 use crate::pairing::token::{self, Claims, ConsumedTokens, TokenKind, CHALLENGE_TTL_SECS};
 use crate::pairing::transcript;
 use crate::pairing::trust::{self, TrustRecord};
-use crate::version::{Capabilities, DEFAULT_PORT, PROTOCOL_VERSION};
+use crate::version::{DEFAULT_PORT, PROTOCOL_VERSION};
 
 use super::{err_response, ok_json, parse_body, SessionStore};
 use super::persist_pairing::PairingPersister;
@@ -149,20 +148,13 @@ impl PeerRecord {
 }
 
 /// 已配对/已知对端的注册表（内存实现；生产换 rusqlite）。
+#[derive(Default)]
 pub struct PeerStore {
     inner: Mutex<HashMap<String, PeerRecord>>,
     /// 可选持久化后端。有则在每次写操作后顺手写穿。
     persister: Option<std::sync::Arc<PairingPersister>>,
 }
 
-impl Default for PeerStore {
-    fn default() -> Self {
-        Self {
-            inner: Default::default(),
-            persister: None,
-        }
-    }
-}
 
 impl PeerStore {
     pub fn new() -> Self {
@@ -243,7 +235,19 @@ impl PeerStore {
                         existing.pairing_secret = rec.pairing_secret;
                     }
                     if rec.trust != TrustRecord::default() {
-                        existing.trust = rec.trust;
+                        // 终态单调：Revoked/Revoking 不得被桌面旧快照的
+                        // ACTIVE/PENDING "同步"回来（解配对复活）。
+                        let existing_terminal = matches!(
+                            existing.trust.state,
+                            PairingState::Revoked | PairingState::Revoking
+                        );
+                        let incoming_active = matches!(
+                            rec.trust.state,
+                            PairingState::Active | PairingState::Pending
+                        );
+                        if !(existing_terminal && incoming_active) {
+                            existing.trust = rec.trust;
+                        }
                     }
                     if rec.presence != Presence::Unknown {
                         existing.presence = rec.presence;
@@ -296,7 +300,17 @@ pub struct HandshakeStore {
     /// 用户在点"配对"时线下输入的 6 位连接码（绝不经过网络）。
     /// 首配（路径 A）验证 HMAC 时需要它派生密钥。
     pairing_code: Mutex<Option<String>>,
+    /// 首配失败计数：`deviceId -> (次数, 窗口起点)`。
+    ///
+    /// core 端点拿不到来源 IP（hyper 的 remote addr 未下传），用发起方
+    /// 自报 deviceId 做近似限流只能挡住"老实重试同一个 ID"的暴力尝试；
+    /// 真正的按 IP 限流在 B3 接入连接上下文后替换。两者不冲突。
+    pairing_failures: Mutex<HashMap<String, (u32, i64)>>,
 }
+
+/// 首配失败窗口与阈值：同一 deviceId 60 秒内失败 5 次即冷却。
+const PAIRING_FAIL_WINDOW_SECS: i64 = 60;
+const PAIRING_FAIL_MAX: u32 = 5;
 
 impl HandshakeStore {
     pub fn new() -> Self {
@@ -313,6 +327,37 @@ impl HandshakeStore {
 
     pub async fn get_pairing_code(&self) -> Option<String> {
         self.pairing_code.lock().await.clone()
+    }
+
+    /// 该 deviceId 是否处于首配失败冷却期。
+    pub async fn pairing_locked(&self, device_id: &str) -> bool {
+        let g = self.pairing_failures.lock().await;
+        match g.get(device_id) {
+            Some((count, first)) => {
+                now_secs().saturating_sub(*first) < PAIRING_FAIL_WINDOW_SECS
+                    && *count >= PAIRING_FAIL_MAX
+            }
+            None => false,
+        }
+    }
+
+    pub async fn note_pairing_failure(&self, device_id: &str) {
+        let now = now_secs();
+        let mut g = self.pairing_failures.lock().await;
+        let entry = g.entry(device_id.to_string()).or_insert((0, now));
+        if now.saturating_sub(entry.1) >= PAIRING_FAIL_WINDOW_SECS {
+            *entry = (1, now);
+        } else {
+            entry.0 = entry.0.saturating_add(1);
+        }
+        // 防止恶意 deviceId 轮换把 map 撑大
+        if g.len() > 1024 {
+            g.retain(|_, (_, first)| now.saturating_sub(*first) < PAIRING_FAIL_WINDOW_SECS);
+        }
+    }
+
+    pub async fn clear_pairing_failures(&self, device_id: &str) {
+        self.pairing_failures.lock().await.remove(device_id);
     }
 
     /// 记下一个刚签发的 serverNonce。超出上界时丢弃最旧的一个。
@@ -441,7 +486,7 @@ pub async fn handle_probe(store: &Arc<SessionStore>, _path: &str) -> Response<Fu
         protocol_version: PROTOCOL_VERSION,
         static_pub: b64u(&store.identity.public_key_bytes()),
         server_nonce,
-        capabilities: Capabilities::all(),
+        capabilities: store.capabilities(),
         presence: Some(Presence::Online),
         endpoint: None,
     };
@@ -547,25 +592,81 @@ async fn verify_path_a(
     req: &VerifyRequest,
     hmac: &str,
 ) -> Response<Full<bytes::Bytes>> {
+    if req.request_id.is_empty() || req.request_id.len() > 128 {
+        return err_response(ErrorCode::BadRequest, "requestId 长度非法");
+    }
+    if req.device_id.is_empty() || req.device_id.len() > 128 {
+        return err_response(ErrorCode::BadRequest, "deviceId 长度非法");
+    }
+    if req.device_id == store.identity.device_id() {
+        return err_response(ErrorCode::BadRequest, "不能与本机自己配对");
+    }
+    if store.handshake.pairing_locked(&req.device_id).await {
+        return err_response(
+            ErrorCode::RateLimitExceeded,
+            "首配失败次数过多，请稍后再试",
+        );
+    }
     let code = match store.handshake.get_pairing_code().await {
-        Some(c) => c,
-        None => return err_response(ErrorCode::BadRequest, "未设置连接码，无法首配"),
+        Some(c) if !c.is_empty() => c,
+        _ => {
+            return err_response(
+                ErrorCode::BadRequest,
+                "接收端尚未设置连接码：无法首配（请先在接收端启动接收服务）",
+            )
+        }
     };
     let client_eph = match b64u_decode(&req.client_eph_pub) {
         Some(b) => b,
-        None => return err_response(ErrorCode::BadRequest, "clientEphPub 非法 base64"),
+        None => {
+            store.handshake.note_pairing_failure(&req.device_id).await;
+            store
+                .handshake
+                .mark_failed(&req.request_id, "clientEphPub 非法 base64url")
+                .await;
+            return err_response(ErrorCode::BadRequest, "clientEphPub 非法 base64url");
+        }
     };
+    // SEC1 点编码：未压缩 65B（0x04）或压缩 33B（0x02/0x03）。
+    if !((client_eph.len() == 65 && client_eph[0] == 0x04)
+        || (client_eph.len() == 33 && matches!(client_eph[0], 0x02 | 0x03)))
+    {
+        store.handshake.note_pairing_failure(&req.device_id).await;
+        store
+            .handshake
+            .mark_failed(&req.request_id, "clientEphPub 不是合法 SEC1 点")
+            .await;
+        return err_response(
+            ErrorCode::BadRequest,
+            "clientEphPub 不是合法的 P-256 SEC1 点编码",
+        );
+    }
     let cn = match hex_dec(&req.client_nonce) {
-        Some(b) => b,
-        None => return err_response(ErrorCode::BadRequest, "clientNonce 非法 hex"),
+        Some(b) if b.len() == 32 => b,
+        _ => {
+            store.handshake.note_pairing_failure(&req.device_id).await;
+            store
+                .handshake
+                .mark_failed(&req.request_id, "clientNonce 非 32B hex")
+                .await;
+            return err_response(ErrorCode::BadRequest, "clientNonce 必须是 32B hex");
+        }
     };
     let sn = match hex_dec(&req.server_nonce) {
-        Some(b) => b,
-        None => return err_response(ErrorCode::BadRequest, "serverNonce 非法 hex"),
+        Some(b) if b.len() == 32 => b,
+        _ => {
+            store.handshake.note_pairing_failure(&req.device_id).await;
+            store
+                .handshake
+                .mark_failed(&req.request_id, "serverNonce 非 32B hex")
+                .await;
+            return err_response(ErrorCode::BadRequest, "serverNonce 必须是 32B hex");
+        }
     };
     // 先证明 serverNonce 出自本机 probe 且**未被用过**（模块文档约束 2）。
     // 放在验 HMAC 之前：nonce 不对就没必要做后面的密码学运算。
     if !store.handshake.take_nonce(&req.server_nonce).await {
+        store.handshake.note_pairing_failure(&req.device_id).await;
         store
             .handshake
             .mark_failed(&req.request_id, "serverNonce 无效或已被使用")
@@ -586,13 +687,24 @@ async fn verify_path_a(
         &server_static,
     ) {
         Some(t) => t,
-        None => return err_response(ErrorCode::BadRequest, "transcript 构造失败"),
+        None => {
+            store.handshake.note_pairing_failure(&req.device_id).await;
+            return err_response(ErrorCode::BadRequest, "transcript 构造失败");
+        }
     };
     let provided = match hex_dec(hmac) {
-        Some(b) => b,
-        None => return err_response(ErrorCode::BadRequest, "hmac 非法 hex"),
+        Some(b) if b.len() == 32 => b,
+        _ => {
+            store.handshake.note_pairing_failure(&req.device_id).await;
+            store
+                .handshake
+                .mark_failed(&req.request_id, "hmac 非 32B hex")
+                .await;
+            return err_response(ErrorCode::BadRequest, "hmac 必须是 32B hex");
+        }
     };
     if !transcript::verify_tag(&key, &tr, &provided) {
+        store.handshake.note_pairing_failure(&req.device_id).await;
         store
             .handshake
             .mark_failed(&req.request_id, "路径 A HMAC 校验失败")
@@ -603,18 +715,28 @@ async fn verify_path_a(
         );
     }
 
-    // 派生稳定的长期配对密钥。
+    // 长期配对密钥：**服务端本地 CSPRNG**，不再从连接码确定性派生。
     //
-    // **已知缺口（stopgap）**：路径 A/B 的 DTO（`VerifyRequest`/`VerifyResponse`）
-    // 不携带服务端的 *临时* ECDH 公钥，两端无法完成真正的 ECDH 共享密钥协商。
-    // 此处用连接码派生一个**稳定**的 `pairing_secret`，使重连（路径 B）的
-    // challenge 令牌可以验证。真正的 ECDH 线格式需待协议 README 明确后替换 ——
-    // 换的时候只动这三行，`kdf::derive_pairing_secret` 的调用形状不变。
-    let pairing_secret =
-        kdf::derive_pairing_secret(&sha256(code.as_bytes()), &code, b"lanbackup/v4/pairing/v1");
+    // 连接码只有 8 位、且在局域网里短期可嗅探；用它派生长期密钥等于把
+    // "一次性口令"升级成"永久密钥"。路径 B 的 challenge 令牌由本端签发并
+    // 验签，客户端不需要知道 pairing_secret，因此完全可以在服务端本地生成。
+    let pairing_secret: [u8; 32] = rand::random();
 
-    // 状态机是唯一依据：None →(Initiate)→ Pending →(PeerConfirmed)→ Active。
-    // 非法迁移会被 `apply` 拒绝，不会静默落地一个不该存在的状态。
+    // Revoked / Revoking 不得被一次 HMAC 直接复活：重新配对必须是显式流程
+    // （先在本机删除旧记录/重置），否则"吊销"只是一次可跳过的提示。
+    if let Some(existing) = store.peers.entry(&req.device_id).await {
+        match existing.trust.state {
+            PairingState::Revoked | PairingState::Revoking => {
+                store.handshake.note_pairing_failure(&req.device_id).await;
+                return err_response(
+                    ErrorCode::Untrusted,
+                    "该设备已被吊销：请先在两端删除旧配对记录后重新配对",
+                );
+            }
+            _ => {}
+        }
+    }
+
     let mut trust = TrustRecord::new();
     if let Err(il) = trust.apply(PairingEvent::Initiate) {
         return err_response(ErrorCode::IllegalState, &il.to_string());
@@ -625,7 +747,7 @@ async fn verify_path_a(
 
     store
         .peers
-        .put(PeerRecord::new(
+        .merge(PeerRecord::new(
             &req.device_id,
             "",
             client_eph,
@@ -637,11 +759,17 @@ async fn verify_path_a(
         .handshake
         .mark_done(&req.request_id, PairingState::Active)
         .await;
+    store
+        .handshake
+        .clear_pairing_failures(&req.device_id)
+        .await;
+    // WB-0019：返回**服务端**身份。回显客户端 deviceId 会让桌面把自己
+    // 存成对端（真实事故），后续所有信任对账都失去意义。
     ok_json(VerifyResponse {
         status: PairingState::Active,
-        device_id: req.device_id.clone(),
-        alias: None,
-        capabilities: Capabilities::all(),
+        device_id: store.identity.device_id().to_string(),
+        alias: Some(store.alias.clone()),
+        capabilities: store.capabilities(),
         request_id: req.request_id.clone(),
     })
 }
@@ -740,9 +868,9 @@ async fn verify_path_b(
         .await;
     ok_json(VerifyResponse {
         status: PairingState::Active,
-        device_id: req.device_id.clone(),
-        alias: None,
-        capabilities: Capabilities::all(),
+        device_id: store.identity.device_id().to_string(),
+        alias: Some(store.alias.clone()),
+        capabilities: store.capabilities(),
         request_id: req.request_id.clone(),
     })
 }
@@ -752,8 +880,12 @@ pub async fn handle_handshake_status(
     store: &Arc<SessionStore>,
     path: &str,
 ) -> Response<Full<bytes::Bytes>> {
-    let rid = match super::extract_query(path, "requestId") {
-        Some(s) => s,
+    let q = match super::parse_query(path) {
+        Ok(q) => q,
+        Err(e) => return err_response(ErrorCode::BadRequest, &e),
+    };
+    let rid = match q.get("requestId") {
+        Some(s) => s.clone(),
         None => return err_response(ErrorCode::BadRequest, "缺少 requestId 参数"),
     };
     // `done` 的语义是"已有结论"，失败也算结论 —— 否则客户端会对一个
@@ -785,8 +917,12 @@ pub async fn handle_sync_status(
     store: &Arc<SessionStore>,
     path: &str,
 ) -> Response<Full<bytes::Bytes>> {
-    let asker = match super::extract_query(path, "deviceId") {
-        Some(s) => s,
+    let q = match super::parse_query(path) {
+        Ok(q) => q,
+        Err(e) => return err_response(ErrorCode::BadRequest, &e),
+    };
+    let asker = match q.get("deviceId") {
+        Some(s) => s.clone(),
         None => return err_response(ErrorCode::BadRequest, "缺少 deviceId 参数"),
     };
     let (state, version) = match store.peers.entry(&asker).await {
@@ -1059,10 +1195,10 @@ mod tests {
         let server_nonce = probe_nonce(&s).await;
         let req = VerifyRequest {
             device_id: "peer-1".to_string(),
-            client_eph_pub: b64u(&[1u8; 33]),
+            client_eph_pub: b64u(&EphemeralKeyPair::generate().public_key_bytes()),
             client_nonce: hex_enc(&rand::random::<[u8; 32]>()),
             server_nonce,
-            hmac: Some("deadbeef".to_string()),
+            hmac: Some("00".repeat(32)),
             challenge_token: None,
             request_id: "rid-bad".to_string(),
         };
@@ -1456,10 +1592,10 @@ mod tests {
         let server_nonce = probe_nonce(&s).await;
         let req = VerifyRequest {
             device_id: "peer-1".to_string(),
-            client_eph_pub: b64u(&[1u8; 33]),
+            client_eph_pub: b64u(&EphemeralKeyPair::generate().public_key_bytes()),
             client_nonce: hex_enc(&rand::random::<[u8; 32]>()),
             server_nonce,
-            hmac: Some("deadbeef".to_string()),
+            hmac: Some("00".repeat(32)),
             challenge_token: None,
             request_id: "rid-f".to_string(),
         };
@@ -1952,5 +2088,31 @@ mod tests {
         let got = s.peers.entry("peer-1").await.unwrap();
         assert_eq!(got.public_key, vec![2u8; 32]);
         assert_eq!(got.pairing_secret, vec![2u8; 32]);
+    }
+
+    /// 终态单调：桌面旧快照（ACTIVE）不得把 core 的 Revoked 复活。
+    #[tokio::test]
+    async fn merge_never_resurrects_revoked_peer() {
+        let s = app();
+        let mut revoked = active_trust();
+        revoked.state = PairingState::Revoked;
+        s.peers
+            .put(PeerRecord::new("peer-1", "", vec![1u8; 33], vec![1u8; 32], revoked))
+            .await;
+        s.peers
+            .merge(PeerRecord::new(
+                "peer-1",
+                "old-snapshot",
+                vec![9u8; 33],
+                vec![9u8; 32],
+                active_trust(),
+            ))
+            .await;
+        let got = s.peers.entry("peer-1").await.unwrap();
+        assert_eq!(
+            got.trust.state,
+            PairingState::Revoked,
+            "吊销记录被旧快照复活"
+        );
     }
 }

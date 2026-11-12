@@ -114,6 +114,10 @@ pub fn run() {
             // Session 持久化存储（跨重启保持传输会话状态）
             let app_data = app.path().app_data_dir().map_err(|e| AppError(e.to_string()))?;
             probe!("[9] app_data_dir 获取成功");
+            // WB-0561/0564：身份初始化尽早 —— 随机安装 deviceId + 随机初始连接码，
+            // 之后所有网络/清单/注册调用都走持久身份
+            identity::init_identity(&app_data);
+            probe!("[9.5] identity 已初始化");
             let session_store = session_store::DesktopSessionStore::new(&app_data)
                 .map_err(|e| AppError(format!("SessionStore 初始化失败: {e}")))?;
             probe!("[10] DesktopSessionStore 已初始化");
@@ -146,8 +150,10 @@ pub fn run() {
                 probe!("[bg] 开始启动 watchdog");
                 transfer::spawn_ui_watchdog(app_handle.clone());
                 probe!("[bg] watchdog 完成，开始配对服务");
-                transfer::spawn_pairing_server(app_handle.clone());
-                probe!("[bg] 配对服务完成，开始接收 watchdog");
+                // WB-0100 / D3：V4 only。53318 手写 HTTP 配对服务不再启动，
+                // 配对统一走 core 的 /api/v4/handshake/*（53317）。
+                crate::log_info!("遗留 53318 配对服务已禁用（V4 only）");
+                probe!("[bg] 遗留配对服务已禁用，开始接收 watchdog");
                 transfer::spawn_receiver_watchdog(app_handle.clone());
                 probe!("[bg] 接收 watchdog 完成，开始常驻加密存在广播");
                 // 常驻加密存在：只要运行即宣告存在（仅受防御总闸约束），驱动已配对设备在线/离线
@@ -311,28 +317,30 @@ mod commands {
     }
 
     #[tauri::command]
-    pub fn get_self_code(app: AppHandle) -> String {        cmd_log!(logger::LogLevel::Info, "get_self_code", "入口");
-        let code = identity::get_self_code(&app);
+    pub fn get_self_code(app: AppHandle) -> Result<String, AppError> {
+        cmd_log!(logger::LogLevel::Info, "get_self_code", "入口");
+        // WB-0103：只返回展示码；错误上抛而非吞成假码
+        let r = identity::get_self_code(&app);
         cmd_log!(
             logger::LogLevel::Info,
             "get_self_code",
-            "出口 code={}",
-            logger::mask(&code)
+            "出口 ok={}",
+            r.is_ok()
         );
-        code
+        r
     }
 
     #[tauri::command]
-    pub fn refresh_self_code(app: AppHandle) -> String {
+    pub fn refresh_self_code(app: AppHandle) -> Result<String, AppError> {
         cmd_log!(logger::LogLevel::Info, "refresh_self_code", "入口");
-        let code = identity::refresh_self_code(&app);
+        let r = identity::refresh_self_code(&app);
         cmd_log!(
             logger::LogLevel::Info,
             "refresh_self_code",
-            "出口 code={}",
-            logger::mask(&code)
+            "出口 ok={}",
+            r.is_ok()
         );
-        code
+        r
     }
 
     #[tauri::command]
@@ -385,12 +393,13 @@ mod commands {
     }
 
     #[tauri::command]
-    pub fn get_self_info(app: AppHandle) -> serde_json::Value {
+    pub fn get_self_info(app: AppHandle) -> Result<serde_json::Value, AppError> {
         cmd_log!(logger::LogLevel::Info, "get_self_info", "入口");
+        // WB-0107：身份读取失败必须上抛（目录不可写等），不得静默回退假身份
         let info = serde_json::json!({
-            "name": identity::get_device_name(&app),
+            "name": identity::get_device_name(&app)?,
             "id": identity::get_device_id(&app),
-            "code": identity::get_self_code(&app),
+            "code": identity::get_self_code(&app)?,
         });
         cmd_log!(
             logger::LogLevel::Info,
@@ -398,7 +407,7 @@ mod commands {
             "出口 名称={}",
             info["name"]
         );
-        info
+        Ok(info)
     }
 
     #[tauri::command]
@@ -469,7 +478,17 @@ mod commands {
                         o.entry("pairingTimestamp".to_string()).or_insert_with(|| serde_json::json!(now));
                     }
                 }
+                // 本机作为"被配对"方向也要能在 core PeerStore 里看到该设备，
+                // 否则对端配对后立刻发文件会被 require_active_peer 拒掉。
+                // pairing_secret 是本机对方向签发 challenge 的本地密钥（对端不需要知道）。
+                if let Some(st) = app.try_state::<crate::transfer::PairingState>() {
+                    st.secrets
+                        .blocking_write()
+                        .entry(device_id.to_string())
+                        .or_insert_with(|| rand::random::<[u8; 32]>().to_vec());
+                }
                 crate::transfer::persist_paired(&app);
+                crate::transfer::sync_paired_to_core(&app);
                 cmd_log!(logger::LogLevel::Info, "v4_pair", "已持久化配对记录 deviceId={}", crate::logger::mask(device_id));
             }
         }
@@ -689,7 +708,7 @@ mod commands {
         cmd_log!(logger::LogLevel::Debug, "get_transfers", "入口 limit={limit}");
         run_blocking(move || {
             let state = app.state::<AppState>();
-            state.db.get_transfers(limit.max(1).min(100))
+            state.db.get_transfers(limit.clamp(1, 100))
         })
         .await?
     }
@@ -714,36 +733,140 @@ mod commands {
         .await?
     }
 
-    /// 读取应用配置（app_data_dir/config.json；无配置返回空对象，前端用默认值规范化）
+    /// 应用配置（WB-0750：typed schema，字段与 shared-core `AppConfig` 一一对应；
+    /// camelCase 走 serde rename，缺省字段用 Default 补齐，枚举值非法直接 400）
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    #[serde(default, rename_all = "camelCase")]
+    pub struct AppConfig {
+        pub role: AppRole,
+        pub receiver: ReceiverConfig,
+        pub sender: SenderConfig,
+    }
+
+    impl Default for AppConfig {
+        fn default() -> Self {
+            Self {
+                role: AppRole::Sender,
+                receiver: ReceiverConfig::default(),
+                sender: SenderConfig::default(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum AppRole {
+        Receiver,
+        Sender,
+        Free,
+    }
+
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+    #[serde(default, rename_all = "camelCase")]
+    pub struct ReceiverConfig {
+        pub enabled: bool,
+        pub receive_dir: String,
+        pub auto_start_receiver: bool,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    #[serde(default, rename_all = "camelCase")]
+    pub struct SenderConfig {
+        pub enabled: bool,
+        pub folders: Vec<SendFolder>,
+        pub strategy: SyncStrategyCfg,
+        pub target_peer_id: Option<String>,
+    }
+
+    impl Default for SenderConfig {
+        fn default() -> Self {
+            Self { enabled: true, folders: Vec::new(), strategy: SyncStrategyCfg::Archive, target_peer_id: None }
+        }
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    #[serde(default, rename_all = "camelCase")]
+    pub struct SendFolder {
+        pub id: String,
+        pub name: String,
+        pub path: String,
+        pub enabled: bool,
+    }
+
+    impl Default for SendFolder {
+        fn default() -> Self {
+            Self { id: String::new(), name: String::new(), path: String::new(), enabled: true }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum SyncStrategyCfg {
+        Archive,
+        Mirror,
+    }
+
+    /// 配置文件大小上限（WB-0762）：防 IPC/磁盘被巨型 Value 撑爆
+    const CONFIG_MAX_BYTES: usize = 64 * 1024;
+
+    /// 读取应用配置（app_data_dir/config.json；缺失按 Default；损坏按 Default + 告警，
+    /// **绝不用空对象覆盖回写** —— 那会把用户配置清空）
     #[tauri::command]
-    pub async fn get_config(app: AppHandle) -> Result<serde_json::Value, AppError> {
+    pub async fn get_config(app: AppHandle) -> Result<AppConfig, AppError> {
         cmd_log!(logger::LogLevel::Debug, "get_config", "入口");
         run_blocking(move || {
             let dir = app.path().app_data_dir().map_err(AppError::from_display)?;
             let path = dir.join("config.json");
-            match std::fs::read_to_string(&path) {
-                Ok(s) => serde_json::from_str(&s).map_err(AppError::from_display),
-                Err(_) => Ok(serde_json::json!({})),
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    serde_json::from_slice::<AppConfig>(&bytes).map_err(|e| {
+                        crate::log_error!("config.json 损坏（返回默认配置，不覆盖原文件）: {e}");
+                        AppError::from_display(e)
+                    })
+                }
+                Err(_) => Ok(AppConfig::default()),
             }
         })
         .await?
     }
 
-    /// 保存应用配置（角色/接收端/发送端，存 app_data_dir/config.json）
+    /// 保存应用配置（typed 校验 + 原子写：唯一临时名 → sync → rename，WB-0749/0763）
     #[tauri::command]
     pub async fn set_config(app: AppHandle, config: serde_json::Value) -> Result<(), AppError> {
         cmd_log!(
             logger::LogLevel::Info,
             "set_config",
-            "入口 角色={}",
+            "入口 角色={:?}",
             config.get("role").and_then(|r| r.as_str()).unwrap_or("?")
         );
         run_blocking(move || {
+            if config.to_string().len() > CONFIG_MAX_BYTES {
+                return Err(AppError(format!(
+                    "配置超过大小上限（{CONFIG_MAX_BYTES} 字节）"
+                )));
+            }
+            // 类型/枚举校验：role/strategy 非法值在此 400，不落盘
+            let cfg: AppConfig = serde_json::from_value(config)
+                .map_err(|e| AppError(format!("配置格式非法: {e}")))?;
             let dir = app.path().app_data_dir().map_err(AppError::from_display)?;
             std::fs::create_dir_all(&dir).map_err(AppError::from_display)?;
             let path = dir.join("config.json");
-            std::fs::write(&path, config.to_string()).map_err(AppError::from_display)?;
-            Ok(())
+            let data = serde_json::to_vec(&cfg).map_err(AppError::from_display)?;
+            let tmp = dir.join(format!("config.json.{}.tmp", std::process::id()));
+            let write = || -> std::io::Result<()> {
+                let mut f = std::fs::File::create(&tmp)?;
+                std::io::Write::write_all(&mut f, &data)?;
+                f.sync_all()?;
+                std::fs::rename(&tmp, &path)?;
+                Ok(())
+            };
+            match write() {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(AppError::from_display(e))
+                }
+            }
         })
         .await?
     }
@@ -803,6 +926,7 @@ mod commands {
         target_code: String,
         files: Vec<transfer::SendFileItem>,
         encryption_mode: String,
+        peer_id: Option<String>,
     ) -> Result<u64, AppError> {
         let names: Vec<String> = files.iter().map(|f| f.rel_path().to_string()).collect();
         cmd_log!(
@@ -821,6 +945,7 @@ mod commands {
             target_code,
             files,
             encryption_mode,
+            peer_id,
         )
         .await;
         cmd_log!(
@@ -904,6 +1029,14 @@ mod commands {
         app.state::<crate::transfer::TransferState>()
             .defensive_hidden
             .store(hidden, std::sync::atomic::Ordering::Relaxed);
+        // core 侧入站总闸必须同步：只改桌面内存标志拦不住直接打 53317 的请求。
+        if let Some(st) = app.try_state::<crate::transfer::PairingState>() {
+            if let Ok(g) = st.session_store.lock() {
+                if let Some(store) = g.as_ref() {
+                    store.set_defensive_hidden(hidden);
+                }
+            }
+        }
         // 防御总闸隐藏：本机不再明文/加密广播、拒绝一切入站连接（句柄层拒绝 + probe 空 id + announce 停）
         cmd_log!(
             logger::LogLevel::Info,

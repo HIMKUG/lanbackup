@@ -51,6 +51,64 @@ pub fn is_safe_rel_path(normalized: &str) -> bool {
         .all(|seg| seg != ".." && !(seg.len() == 2 && seg.ends_with(':')))
 }
 
+/// Windows 设备保留名（不区分大小写，带扩展名同样保留）。
+///
+/// `CON.txt`、`NUL.tar.gz` 在 Windows 上仍会被解析为设备，不是普通文件。
+const WINDOWS_RESERVED: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+fn windows_reserved(segment: &str) -> bool {
+    let stem = segment.split('.').next().unwrap_or(segment);
+    let upper = stem.to_ascii_uppercase();
+    WINDOWS_RESERVED.iter().any(|r| *r == upper)
+}
+
+/// 归一化 + **可落盘**校验的唯一入口。
+///
+/// 与 [`is_safe_rel_path`] 的区别：这里额外拒绝 Windows 实际会"打开设备/写错
+/// 路径"的写法（ADS 冒号、保留名、尾点/尾空格、控制符、非法字符、超长段），
+/// 并返回归一化后的路径供调用方直接拼 `rootDir`。
+///
+/// 失败必须**拒绝**而不是静默改写：`simplify` 一个恶意路径只会让审计日志里
+/// 的记录与实际落盘位置不一致。
+pub fn validate_rel_path(raw: &str) -> Result<String, String> {
+    // 绝对路径 / UNC 必须拒绝而不是"去掉前导斜杠当成相对路径"——
+    // 静默改写会让审计记录与实际落盘位置不一致，也会掩盖攻击尝试。
+    if raw.starts_with('/') || raw.starts_with('\\') {
+        return Err("绝对路径/UNC 路径不得作为相对路径".to_string());
+    }
+    let normalized = normalize_rel_path(raw);
+    if normalized.is_empty() {
+        return Err("空路径".to_string());
+    }
+    if normalized.len() > 4096 {
+        return Err("相对路径超过 4096 字节".to_string());
+    }
+    for segment in normalized.split('/') {
+        if segment == ".." {
+            return Err("路径包含 .. 段（穿越）".to_string());
+        }
+        if segment.len() > 255 {
+            return Err("单个路径段超过 255 字节".to_string());
+        }
+        if segment.ends_with('.') || segment.ends_with(' ') {
+            return Err(format!("路径段以点/空格结尾：{segment:?}"));
+        }
+        if segment
+            .chars()
+            .any(|c| (c as u32) < 0x20 || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        {
+            return Err(format!("路径段含 Windows 非法字符：{segment:?}"));
+        }
+        if windows_reserved(segment) {
+            return Err(format!("路径段是 Windows 保留设备名：{segment:?}"));
+        }
+    }
+    Ok(normalized)
+}
+
 /// 是否位于假删除目录之下。
 ///
 /// **镜像模式的死循环就卡在这一步**：`moveToDelete` 之后文件仍在 `delete/` 里，
@@ -159,6 +217,45 @@ mod tests {
         assert!(is_safe_rel_path("a/.../b"));
         // 单个点段已在归一化时消失，不该被误判
         assert!(is_safe_rel_path(&normalize_rel_path("./a/./b")));
+    }
+
+    #[test]
+    fn windows_hostile_paths_are_rejected() {
+        for bad in [
+            "../x",
+            r"..\x",
+            "/etc/passwd",
+            r"\\server\share\x",
+            "C:/Windows/x",
+            r"C:\Windows\x",
+            "dir/file.txt:stream",
+            "CON",
+            "con.txt",
+            "COM1.tar.gz",
+            "a/b.",
+            "a/b ",
+            "a/\u{1}/b",
+            "a/<b>",
+            "a/b|c",
+            "a/b?c",
+            &"x".repeat(256),
+        ] {
+            assert!(
+                validate_rel_path(bad).is_err(),
+                "恶意/非法路径未被拒绝: {bad:?}"
+            );
+        }
+        for ok in ["a/b/c.txt", "delete/x.txt", "中文/文件.txt"] {
+            assert!(
+                validate_rel_path(ok).is_ok(),
+                "合法路径被误拒: {ok:?}"
+            );
+        }
+        assert_eq!(
+            validate_rel_path(r".\a\b.txt").unwrap(),
+            "a/b.txt",
+            "合法相对路径应返回归一化结果"
+        );
     }
 
     #[test]

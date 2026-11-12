@@ -36,6 +36,18 @@ pub const CHALLENGE_TTL_SECS: i64 = 300;
 /// 对端一旦上线就用它兜底解除。30 天覆盖"出差回来才开机"这种真实场景。
 pub const REVOKE_TOKEN_TTL_SECS: i64 = 30 * 24 * 3600;
 
+/// 已消费 `jti` 的保留期（秒）= 吊销令牌 TTL（WB-0593）。
+///
+/// `exp` 到点**不能立刻遗忘** jti：本实现不因过期拒绝验签（时钟差），
+/// 若 prune 按 `exp` 清理，过期令牌在"被遗忘"后可以原样重放一次。
+/// 保留期把可重放窗口封死为 0 —— jti 在 `exp + 保留期` 前一直占用，
+/// 过了保留期令牌早已没有任何业务价值（challenge 会话 5 分钟就没了）。
+pub const TOKEN_RETENTION_SECS: i64 = REVOKE_TOKEN_TTL_SECS;
+
+/// 令牌最大长度（WB-0595）。固定头 + 小 JSON 载荷 + 64 字符签名，
+/// 合法令牌远小于该值；超限按格式错误拒绝。
+pub const MAX_TOKEN_LEN: usize = 4096;
+
 /// 固定的 JWS 头（`alg=HS256, typ=JWT`）。
 ///
 /// **不解析对端送来的 `alg`**：那是 JWT 最经典的漏洞面
@@ -68,6 +80,16 @@ pub struct Claims {
     pub nonce: String,
     /// 用途
     pub kind: TokenKind,
+}
+
+impl Claims {
+    /// 消费键的用途分量（`TokenKind` 无稳定 `as_str`，这里给一个）
+    pub(crate) fn kind_marker(&self) -> &'static str {
+        match self.kind {
+            TokenKind::Challenge => "challenge",
+            TokenKind::Revoke => "revoke",
+        }
+    }
 }
 
 impl Claims {
@@ -140,12 +162,18 @@ pub fn mint(secret: &[u8], claims: &Claims) -> String {
 ///
 /// **不因过期而失败** —— 过期与否由 [`VerifiedToken::expired`] 报告。
 /// `expected_kind` 做用途校验：一个 challenge 令牌不能被当成吊销令牌使用。
+///
+/// WB-0595：验签前先限长 —— 本实现的令牌是固定字段的小 JSON，超过 4KiB
+/// 必然是构造输入，先拒绝以免把巨大字符串喂进 base64/JSON 解析。
 pub fn verify(
     secret: &[u8],
     token: &str,
     now: i64,
     expected_kind: TokenKind,
 ) -> Result<VerifiedToken, TokenError> {
+    if token.len() > MAX_TOKEN_LEN {
+        return Err(TokenError::Malformed);
+    }
     let mut parts = token.split('.');
     let (Some(header), Some(payload), Some(sig), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -188,10 +216,14 @@ pub fn verify(
 ///
 /// 与"时间窗口"方案的区别：窗口内可以无限重放，一次性消费连第二次都不行，
 /// 而且完全不依赖时钟正确性。
+///
+/// WB-0592：消费键是 `(kind, sub, jti)` 三元组 —— 不同用途/不同对象的令牌
+/// 各自占用各自的 jti，一个用途的消费不得"顺手"挡掉另一个用途的合法令牌
+/// （跨设备/跨用途 DoS）。
 #[derive(Debug, Clone, Default)]
 pub struct ConsumedTokens {
-    /// jti → 该令牌的 `exp`（到点即可安全遗忘）
-    seen: HashMap<String, i64>,
+    /// (kind, sub, jti) → 可安全遗忘的时刻（`exp + TOKEN_RETENTION_SECS`）
+    seen: HashMap<(String, String, String), i64>,
 }
 
 impl ConsumedTokens {
@@ -202,22 +234,28 @@ impl ConsumedTokens {
     /// 尝试消费一个令牌。返回 `true` 表示首次使用（放行）；
     /// `false` 表示重放（拒绝）。
     pub fn consume(&mut self, claims: &Claims) -> bool {
+        let key = (
+            claims.kind_marker().to_string(),
+            claims.sub.clone(),
+            claims.jti.clone(),
+        );
         // `Entry` 一次哈希完成"查 + 插"，避免 contains_key + insert 的竞态窗口
-        match self.seen.entry(claims.jti.clone()) {
+        match self.seen.entry(key) {
             std::collections::hash_map::Entry::Occupied(_) => false,
             std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(claims.exp);
+                // WB-0593：保留期封死"过期后被 prune 遗忘再重放"的窗口
+                slot.insert(claims.exp.saturating_add(TOKEN_RETENTION_SECS));
                 true
             }
         }
     }
 
-    /// 清理已过期的记录。
+    /// 清理超过保留期的记录。
     ///
-    /// 这是 `exp` 唯一的实际用途。**必须周期性调用**：不清理的话集合随握手次数
-    /// 单调增长，长期驻留的桌面端进程会缓慢泄漏内存。
+    /// **必须周期性调用**：不清理的话集合随握手次数单调增长，长期驻留的
+    /// 桌面端进程会缓慢泄漏内存。
     pub fn prune(&mut self, now: i64) {
-        self.seen.retain(|_, exp| *exp >= now);
+        self.seen.retain(|_, until| *until >= now);
     }
 
     /// 当前记录条数（诊断/测试用）
@@ -360,28 +398,41 @@ mod tests {
         assert!(!store.consume(&v2.claims), "未过期的令牌也不得重复使用");
     }
 
+    /// WB-0593：jti 保留期封死"过期后被 prune 遗忘再重放"的窗口。
     #[test]
-    fn prune_forgets_only_expired_entries() {
+    fn expired_jti_is_retained_beyond_expiry_before_being_forgotten() {
         let mut store = ConsumedTokens::new();
-        store.consume(&Claims::challenge("d", "old", "n", 0)); // exp = 300
-        store.consume(&Claims::challenge("d", "new", "n", 1000)); // exp = 1300
-        assert_eq!(store.len(), 2);
-
-        store.prune(1000);
-        assert_eq!(store.len(), 1, "过期的 jti 应被遗忘，避免集合无限增长");
-
-        // 被遗忘之后同一个 jti 可以再次使用 —— 这是安全的：
-        // 令牌本身已过期，攻击者拿它也过不了业务层的其它检查。
-        assert!(store.consume(&Claims::challenge("d", "old", "n", 2000)));
+        let c = Claims::challenge("d", "old", "n", 0); // exp = 300
+        assert!(store.consume(&c));
+        // exp 刚过：不得立即遗忘 —— 遗忘即可原样重放一次
+        store.prune(CHALLENGE_TTL_SECS + 1);
+        assert_eq!(store.len(), 1, "exp 到点不得立即遗忘");
+        assert!(!store.consume(&c), "保留期内重放必须拒绝");
+        // 保留期（exp + 30d）过后才遗忘
+        store.prune(CHALLENGE_TTL_SECS + TOKEN_RETENTION_SECS + 1);
+        assert!(store.is_empty());
     }
 
+    /// WB-0592：消费键含用途与对象 —— 同一 jti 在不同 kind/sub 下互不干扰。
     #[test]
-    fn prune_keeps_entry_exactly_at_expiry_boundary() {
+    fn consumption_is_scoped_by_kind_and_subject() {
         let mut store = ConsumedTokens::new();
-        store.consume(&Claims::challenge("d", "j", "n", 0)); // exp = 300
-        store.prune(300);
-        assert_eq!(store.len(), 1, "恰好等于 exp 的瞬间还不该遗忘");
-        store.prune(301);
-        assert!(store.is_empty());
+        assert!(store.consume(&Claims::challenge("dev-1", "same-jti", "n", 0)));
+        // 同 kind 同 sub 同 jti → 重放
+        assert!(!store.consume(&Claims::challenge("dev-1", "same-jti", "n", 0)));
+        // 同 jti 不同 kind → 各自独立
+        assert!(store.consume(&Claims::revoke("dev-1", "same-jti", "n", 0)));
+        // 同 jti 同 kind 不同 sub → 各自独立
+        assert!(store.consume(&Claims::challenge("dev-2", "same-jti", "n", 0)));
+    }
+
+    /// WB-0595：超长令牌在 base64/JSON 解析前直接按格式错误拒绝。
+    #[test]
+    fn oversized_token_is_rejected_before_parsing() {
+        let junk = "a".repeat(MAX_TOKEN_LEN + 1);
+        assert_eq!(
+            verify(SECRET, &junk, 0, TokenKind::Challenge),
+            Err(TokenError::Malformed)
+        );
     }
 }

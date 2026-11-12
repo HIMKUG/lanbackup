@@ -1445,6 +1445,15 @@ onMounted(async () => {
           }
         }),
       );
+      // 发送警告（如接收端不支持加密）：必须让用户看见，不能只进日志
+      track(
+        await listen('send-warning', (e) => {
+          const p = e.payload as { code?: string; message?: string };
+          lastResult.value = p.message || '发送警告：对端能力不支持';
+          logger.warn('transfer', p.message || '发送警告');
+          emitBall('toast_puzzled', p.message);
+        }),
+      );
       // 接收确认弹窗（手机→电脑 prepare-upload）
       track(
         await listen('incoming-request', (e) => {
@@ -2261,8 +2270,19 @@ async function sendAllFolders(taskId: string, folders?: SendFolder[]): Promise<n
       ip: targetDevice.value!.ip,
       port: targetDevice.value!.port,
     });
-  } catch {
-    peer = null; // 对端清单获取失败 → 退化为两路对比，不阻断
+  } catch (e) {
+    // WB-0055：清单不可用绝不能静默退化成"全量重传"。明确告知并让用户选择。
+    peer = null;
+    const ok = await askConfirmAsync({
+      title: '对端清单不可用',
+      message: `无法读取「${targetDevice.value!.name}」的备份清单：${String(e)}。继续将退化为全量对比（可能重复传输）。是否继续？`,
+    });
+    if (!ok) {
+      lastResult.value = '已取消同步：对端清单不可用';
+      emitBall('toast_confused', lastResult.value);
+      return 0;
+    }
+    lastResult.value = '对端清单不可用，本次按全量对比继续';
   }
   const plan = planIncremental(allFiles, device.lastManifest, peer, device.syncStrategy, device.knownMissingOnPeer);
   // 更新对端缺失列表（即使无事可传，也要反映当前实际缺失状态）
@@ -2318,7 +2338,15 @@ async function sendAllFolders(taskId: string, folders?: SendFolder[]): Promise<n
     targetCode: targetDevice.value!.fingerprint,
     files,
     encryptionMode: encryptionMode.value,
+    peerId: targetDevice.value!.deviceId,
   });
+  // WB-0041：只有接收端逐文件确认完成后才能更新快照。少于计划数说明有文件
+  // 被拒绝/失败/未落盘 —— 此时写全量 manifest 会让这些文件永远不再重传。
+  if (sent < files.length) {
+    lastResult.value = `接收端仅确认 ${sent}/${files.length} 个文件，未更新快照，下一轮将重试`;
+    emitBall('toast_puzzled', lastResult.value);
+    return sent;
+  }
   const newManifest = buildManifest(allFiles);
   markBackupDone(state, targetDevice.value!.fingerprint, newManifest, Date.now());
   // 同上：写回 devices 记录供 confirmAllPairs 落库（防循环空写）

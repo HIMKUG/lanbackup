@@ -15,6 +15,25 @@ use tauri::{AppHandle, Manager};
 // base64：pairing_secret 列以 BLOB 加密字节存库，经 base64 随 JSON 返回给上层解密
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STD, engine::general_purpose::URL_SAFE_NO_PAD};
 
+/// paired_peers 全量落盘行：
+/// (device_id, name, ip, port, fingerprint, manifest_json, pairing_secret_enc, ips_json,
+///  status, peer_public_key_sec1, pairing_timestamp, last_heartbeat, pending_revoke_token_json)
+pub type PairedPeerRow = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    Option<Vec<u8>>,
+    Option<String>,
+    String,
+    Option<Vec<u8>>,
+    i64,
+    i64,
+    Option<String>,
+);
+
 /// 应用错误类型。序列化为纯字符串，与前端 `invoke` 错误格式兼容。
 #[derive(Debug)]
 pub struct AppError(pub String);
@@ -105,43 +124,75 @@ impl Database {
                 );",
             )
             .map_err(AppError::from_display)?;
-            // 老库迁移：CREATE TABLE IF NOT EXISTS 对已存在的表是 no-op。
-            // 方案.txt §4：用 PRAGMA user_version 做 schema 版本管理（SQLite 不支持
-            // ALTER ... ADD COLUMN IF NOT EXISTS）。旧记录 crypto_version 默认 1（SHA-256 派生），
-            // 惰性迁移到 v2（读 v1/v2 都能读，写一律 v2）。
+            // 老库迁移：方案.txt §4 用 PRAGMA user_version 做 schema 版本管理。
+            // WB-0681：**每版本一个事务**，DDL 与 user_version 同事务提交 ——
+            // 迁移中断要么整体回滚（下次重跑）、要么整体生效，不再有"半迁移"库。
+            // WB-0682：列存在性用 pragma_table_info 检测，不再靠"报错后忽略"。
             let version: u32 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .map_err(AppError::from_display)?;
+            // WB-0683：库比程序新 → 拒绝降级打开（旧程序写新库会静默破坏 schema）
+            if version > SCHEMA_VERSION {
+                return Err(AppError(format!(
+                    "数据库 schema 版本 {version} 高于本程序支持的 {SCHEMA_VERSION}：请先升级程序（拒绝降级打开以保护数据）"
+                )));
+            }
+            let migrate = |v: u32, sql: &str| -> Result<(), AppError> {
+                conn.execute_batch(&format!(
+                    "BEGIN IMMEDIATE;\n{sql}\nPRAGMA user_version = {v};\nCOMMIT;"
+                ))
+                .map_err(AppError::from_display)
+            };
             if version < 2 {
-                conn.execute_batch(
-                    "ALTER TABLE paired_peers ADD COLUMN pairing_secret BLOB;
-                     ALTER TABLE paired_peers ADD COLUMN crypto_version INTEGER NOT NULL DEFAULT 1;
-                     ALTER TABLE paired_peers ADD COLUMN static_pub BLOB;",
-                )
-                .map_err(AppError::from_display)?;
+                // v0 时代（user_version 纪元前）的旧库可能缺 manifest 列：先检测再补
+                let has_manifest: bool = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('paired_peers') WHERE name = 'manifest'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map(|c| c > 0)
+                    .map_err(AppError::from_display)?;
+                let ensure_manifest = if has_manifest {
+                    String::new()
+                } else {
+                    "ALTER TABLE paired_peers ADD COLUMN manifest TEXT NOT NULL DEFAULT '{}';"
+                        .to_string()
+                };
+                // 旧记录 crypto_version 默认 1（SHA-256 派生），惰性迁移到 v2
+                //（读 v1/v2 都能读，写一律 v2）
+                migrate(
+                    2,
+                    &format!(
+                        "{ensure_manifest}
+                         ALTER TABLE paired_peers ADD COLUMN pairing_secret BLOB;
+                         ALTER TABLE paired_peers ADD COLUMN crypto_version INTEGER NOT NULL DEFAULT 1;
+                         ALTER TABLE paired_peers ADD COLUMN static_pub BLOB;"
+                    ),
+                )?;
             }
             if version < 3 {
                 // 本机静态密钥表：空表即可，无记录 = 尚未生成（load 返回 NoRows → None）。
                 // 不播种占位行——zeroblob 占位会让 load 误判为有效密钥。
-                conn.execute_batch(
+                migrate(
+                    3,
                     "CREATE TABLE IF NOT EXISTS local_identity (
                         id INTEGER PRIMARY KEY CHECK (id = 1),
                         static_priv BLOB NOT NULL,
                         static_pub BLOB NOT NULL
                     );",
-                )
-                .map_err(AppError::from_display)?;
+                )?;
             }
             if version < 4 {
                 // 3.3：配对设备历史 IP 列表（JSON 数组，DHCP 场景 IP 变化后仍可匹配重连）
-                conn.execute_batch("ALTER TABLE paired_peers ADD COLUMN ips TEXT;")
-                    .map_err(AppError::from_display)?;
+                migrate(4, "ALTER TABLE paired_peers ADD COLUMN ips TEXT;")?;
             }
             if version < 5 {
                 // 新架构（v5）：配对信任状态机字段 + ECDSA 签名身份锚
                 // status: ACTIVE/REVOKE_PENDING/REVOKED；peer_public_key: 对方 ECDSA 公钥（SEC1）
                 // pending_revoke_token: 离线解配对吊销令牌（JSON 文本，仅 REVOKE_PENDING 时非空）
-                conn.execute_batch(
+                migrate(
+                    5,
                     "ALTER TABLE paired_peers ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE';
                      ALTER TABLE paired_peers ADD COLUMN peer_public_key BLOB;
                      ALTER TABLE paired_peers ADD COLUMN pairing_timestamp INTEGER NOT NULL DEFAULT 0;
@@ -149,15 +200,8 @@ impl Database {
                      ALTER TABLE paired_peers ADD COLUMN pending_revoke_token TEXT;
                      ALTER TABLE local_identity ADD COLUMN sig_priv BLOB;
                      ALTER TABLE local_identity ADD COLUMN sig_pub BLOB;",
-                )
-                .map_err(AppError::from_display)?;
+                )?;
             }
-            // 更早版本（user_version=0 时代）缺 manifest 列：列已存在时报 duplicate column，忽略
-            let _ = conn.execute_batch(
-                "ALTER TABLE paired_peers ADD COLUMN manifest TEXT NOT NULL DEFAULT '{}';",
-            );
-            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
-                .map_err(AppError::from_display)?;
         }
         crate::log_info!("打开数据库成功: {}", db_path.display());
         Ok(Self { path: db_path, key })
@@ -340,24 +384,7 @@ impl Database {
     /// None 表示该设备无 v3 pairing_secret（v2 遗留记录）。crypto_version 一律写 2（PBKDF2）。
     /// ips_json：历史 IP 的 JSON 数组（3.3 DHCP 兼容）；None = 旧格式调用方（仅当前 ip）。
     /// status/peer_public_key/pending_revoke_token：新架构信任状态机字段（v5）。
-    pub fn save_paired_peers(
-        &self,
-        peers: &[(
-            String,
-            String,
-            String,
-            i64,
-            String,
-            String,
-            Option<Vec<u8>>,
-            Option<String>,
-            String,
-            Option<Vec<u8>>,
-            i64,
-            i64,
-            Option<String>,
-        )],
-    ) -> Result<(), AppError> {
+    pub fn save_paired_peers(&self, peers: &[PairedPeerRow]) -> Result<(), AppError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
@@ -565,24 +592,7 @@ pub fn get_all_devices(app: tauri::AppHandle) -> Result<Vec<String>, AppError> {
 /// 全量保存配对信任记录到 SQLite（纯逻辑，供 transfer.rs 配对变更后落盘）
 /// tuple: (device_id, name, ip, port, fingerprint, manifest_json, pairing_secret_enc, ips_json,
 ///         status, peer_public_key_sec1, pairing_timestamp, last_heartbeat, pending_revoke_token_json)
-pub fn save_paired_peers(
-    app: &tauri::AppHandle,
-    peers: Vec<(
-        String,
-        String,
-        String,
-        i64,
-        String,
-        String,
-        Option<Vec<u8>>,
-        Option<String>,
-        String,
-        Option<Vec<u8>>,
-        i64,
-        i64,
-        Option<String>,
-    )>,
-) -> Result<(), AppError> {
+pub fn save_paired_peers(app: &tauri::AppHandle, peers: Vec<PairedPeerRow>) -> Result<(), AppError> {
     let state = app.state::<crate::AppState>();
     state.db.save_paired_peers(&peers)
 }

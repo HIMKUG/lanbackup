@@ -5,7 +5,7 @@
 //! Tag：HMAC-SHA256(key, transcript) → hex
 
 use super::*;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 use crate::db::AppError;
 
@@ -78,7 +78,14 @@ fn v4_http_long(
     read_ms: u64,
 ) -> Result<serde_json::Value, AppError> {
     // connect 1500ms, write 5000ms, 带 X-Protocol-Version: 4.0
-    http_json_request_internal(ip, port, method, path, body, 1500, read_ms, 5000, Some("4.0"))
+    http_json_request_internal(
+        ip,
+        port,
+        method,
+        path,
+        body,
+        &HttpRequestOptions { read_ms, write_ms: 5000, protocol_version: Some("4.0"), ..Default::default() },
+    )
 }
 
 /// GET /api/v4/probe（直连对端 receive port，不走 port+1）
@@ -96,6 +103,13 @@ pub fn v4_pair(
     code: String,
     _name: String,
 ) -> Result<serde_json::Value, AppError> {
+    // WB-0021：连接码是 KDF/HMAC 的线格式输入，入口必须与 core 用同一套
+    // 严格规范化（只保留 [A-Z0-9] 并大写）。否则用户输入 `1234-5678`
+    // 与接收端保存的 `12345678` 派生出的密钥永远不相等。
+    let code = lanbackup_core::identity::normalize_connection_code(&code);
+    if code.is_empty() {
+        return Err(AppError("连接码不能为空".to_string()));
+    }
     let info = v4_probe(ip.clone(), port)?;
     let static_pub = info.get("staticPub").and_then(|v| v.as_str()).unwrap_or("");
     let server_nonce = info.get("serverNonce").and_then(|v| v.as_str()).unwrap_or("");
@@ -104,6 +118,9 @@ pub fn v4_pair(
         return Err(AppError(
             "probe 响应缺少 staticPub/serverNonce/deviceId（对端可能未升级 v4）".to_string(),
         ));
+    }
+    if device_id == crate::identity::get_device_id_no_ctx() {
+        return Err(AppError("不能与本机自己配对".to_string()));
     }
 
     let (_eph_priv, eph_pub) = crate::crypto::ecdh_generate_keypair()
@@ -144,59 +161,13 @@ pub fn v4_pair(
     if status != "active" {
         return Err(AppError(format!("配对失败，状态: {status}")));
     }
-    Ok(resp)
-}
-
-// ────────────────────────────────────────────────────────────────
-// P6 数据面接线：按目标 IP 解析 pairing_secret → 派生 per-file transfer_key
-// ────────────────────────────────────────────────────────────────
-
-/// P6：按目标 IP 解析 pairing_secret（paired 表 deviceId→ips 遍历匹配 → secrets 取密钥）。
-/// 无配对记录返回 None（调用方回退 code 派生密钥，兼容旧路径）。
-fn pairing_secret_for_ip(app: &AppHandle, target_ip: &str) -> Option<Vec<u8>> {
-    let st = app.state::<crate::transfer::PairingState>();
-    let device_id = {
-        let paired = st.paired.lock().ok()?;
-        paired
-            .iter()
-            .find(|(_, v)| {
-                if v.get("ip").and_then(|i| i.as_str()) == Some(target_ip) {
-                    return true;
-                }
-                if let Some(ips) = v.get("ips").and_then(|arr| arr.as_array()) {
-                    for ip_val in ips {
-                        if ip_val.as_str() == Some(target_ip) {
-                            return true;
-                        }
-                    }
-                }
-                false
-            })
-            .map(|(id, _)| id.clone())?
-    };
-    let secrets = st.secrets.try_read().ok()?;
-    secrets.get(&device_id).cloned()
-}
-
-/// P6：为目标传输派生 transfer_key（pairing_secret + file_id）。
-/// 仅在有配对密钥时返回 Some；否则 None → 调用方保持 code 派生密钥（向后兼容）。
-pub fn transfer_key_for_target(app: &AppHandle, target_ip: &str, file_id: &[u8]) -> Option<[u8; 32]> {
-    let secret = pairing_secret_for_ip(app, target_ip)?;
-    crate::crypto::derive_transfer_key_v3(&secret, file_id).ok()
-}
-
-/// 逐文件加密密钥选择（每文件独立 transfer_key）。
-/// - 目标已配对 → HKDF(pairing_secret, salt=file_id) 派生 per-file transfer_key
-/// - 否则 → fallback（现有 enc_key：连接码派生 / ECDH 协商 session_key，兼容旧路径）
-pub fn per_file_enc_key(
-    app: &AppHandle,
-    target_ip: &str,
-    file_id: &str,
-    fallback: Option<[u8; 32]>,
-) -> Option<[u8; 32]> {
-    if let Some(k) = transfer_key_for_target(app, target_ip, file_id.as_bytes()) {
-        Some(k)
-    } else {
-        fallback
+    // 服务端必须返回它自己的身份；返回我方 ID 说明对端把 deviceId 回显了，
+    // 桌面若照此落库就会"把自己存成对端"。
+    let resp_device = resp.get("deviceId").and_then(|v| v.as_str()).unwrap_or("");
+    if resp_device != device_id {
+        return Err(AppError(
+            "verify 返回的 deviceId 与 probe 不一致：拒绝把未知身份存为对端".to_string(),
+        ));
     }
+    Ok(resp)
 }

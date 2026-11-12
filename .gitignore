@@ -44,3 +44,8 @@ Shelf
 
 # Tauri
 src-tauri/icons/
+
+# 本地工作产物（改核心/配置前的备份、AI 会话状态、临时计划）不入库
+backups/
+.workbuddy/
+.zcode/

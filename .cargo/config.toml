@@ -1,0 +1,6 @@
+# WB-1033：x86-64-v2 指令集基线上收到 workspace 根 —— 从仓库根构建时同样生效。
+# （desktop/src-tauri/.cargo/config.toml 保留同名配置：就近目录覆盖，内容一致无漂移。）
+# 覆盖 2009 年后全部 x86_64 CPU；让 memcpy/serde/哈希等热路径充分内联向量化。
+# 注意：RUSTFLAGS 环境变量会整体覆盖此处 rustflags。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v2"]

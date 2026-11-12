@@ -1,4 +1,12 @@
-//! 设备身份：基于 Windows MachineGuid 生成永久连接码 + 公开设备标识
+//! 设备身份：**随机安装标识** + 随机初始连接码（WB-0561..0566）
+//!
+//! 安全模型（本模块只兑现，不解释协议 —— 见施工文档 B5）：
+//! - `deviceId`：首次启动 CSPRNG 生成 32 hex，持久化到 app_data，永不重算 ——
+//!   不再由 MachineGuid 哈希派生（同型号镜像/同源虚拟机将共享身份）。
+//! - 连接码：首次启动 CSPRNG 随机生成并持久化 —— 不再由设备特征确定性推导
+//!   （推导码 = 把"秘密"写在公开特征里）。刷新仍是随机码。
+//! - MachineGuid 仅作**降级兜底**：app_data 不可写（磁盘故障）时退回旧的
+//!   派生 deviceId，保证进程可用，并在日志里显式告警身份降级。
 
 use std::sync::atomic::Ordering;
 use std::process::Command;
@@ -7,6 +15,74 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
 
 use crate::db::AppError;
+
+/// 随机安装 deviceId（`init_identity` 在 setup 最早阶段注入）
+static DEVICE_ID: OnceLock<String> = OnceLock::new();
+
+/// 数据库加密密钥缓存（WB-0569：PBKDF2-600k 只算一次，不再每次启动烧 CPU）
+static DB_KEY: OnceLock<String> = OnceLock::new();
+
+/// 启动时初始化设备身份（lib.rs setup 最早阶段调用）。
+///
+/// - `device_id.txt`：缺失/非法 → 生成随机 32 hex 并落盘；
+///   写盘失败 → 退回 MachineGuid 派生（旧行为）并告警，绝不静默换身份。
+/// - `self_code.txt`：缺失/空 → 生成**随机**初始连接码并落盘（WB-0564）。
+///
+/// 返回**本目录解析出的** deviceId（与文件内容一致）。
+///
+/// 返回值刻意不读全局 `DEVICE_ID`：测试并行使用不同目录时，全局只会保留
+/// 最先 set 的进程 ID，拿它和本目录文件比对必然随机失败（原 flaky 根因）。
+pub fn init_identity(app_data: &std::path::Path) -> String {
+    if let Err(e) = std::fs::create_dir_all(app_data) {
+        crate::log_error!("身份目录创建失败 {:?}: {e}，deviceId 降级为机器派生", app_data);
+        let fallback = legacy_machine_device_id();
+        let _ = DEVICE_ID.set(fallback.clone());
+        return fallback;
+    }
+    let id_path = app_data.join("device_id.txt");
+    let existing = std::fs::read_to_string(&id_path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let device_id = if existing.len() == 32 && existing.chars().all(|c| c.is_ascii_hexdigit()) {
+        existing
+    } else {
+        let fresh = hex::encode(rand::random::<[u8; 16]>());
+        if let Err(e) = std::fs::write(&id_path, &fresh) {
+            crate::log_error!("deviceId 落盘失败: {e}，降级为机器派生（配对稳定性受损）");
+            let fallback = legacy_machine_device_id();
+            let _ = DEVICE_ID.set(fallback.clone());
+            // 连接码仍随机初始化（它独立于 deviceId 存活）
+            init_self_code(app_data);
+            return fallback;
+        }
+        fresh
+    };
+    let _ = DEVICE_ID.set(device_id.clone());
+    init_self_code(app_data);
+    device_id
+}
+
+/// 首次初始化随机连接码（已持久化过则不动 —— 刷新语义归 refresh_self_code）
+fn init_self_code(app_data: &std::path::Path) {
+    let p = app_data.join("self_code.txt");
+    let existing = std::fs::read_to_string(&p)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if !existing.is_empty() {
+        return;
+    }
+    let code = random_code();
+    if let Err(e) = std::fs::write(&p, &code) {
+        crate::log_error!("初始连接码落盘失败: {e}（本次进程内有效，重启将重生成）");
+    }
+}
+
+/// 旧版机器派生 deviceId（仅磁盘故障降级用；WB-0561 前的历史行为）
+fn legacy_machine_device_id() -> String {
+    let guid = machine_guid_cached();
+    let digest = Sha256::digest(format!("{guid}|lanbackup-device-id|v2").as_bytes());
+    hex::encode(&digest[..16])
+}
 
 /// 读取 Windows MachineGuid（注册表）
 ///
@@ -56,6 +132,8 @@ fn get_machine_guid() -> String {
         };
         if status.is_none() {
             crate::log_warn!("reg.exe 超时 2s 被强杀（疑似被安全软件拦截），使用 unknown-machine 兜底");
+            // WB-0568：kill 后必须 wait 回收子进程，不留僵尸进程与悬垂句柄
+            let _ = child.wait();
             return "unknown-machine".to_string();
         }
         let mut stdout = String::new();
@@ -102,46 +180,8 @@ fn machine_guid_cached() -> String {
     MACHINE_GUID.get_or_init(get_machine_guid).clone()
 }
 
-/// 生成 8 位连接码（与 shared-core 的 identity.ts 算法一致）
-fn generate_code(stable_id: &str) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-    const LEN: usize = 8;
-
-    crate::log_debug!(
-        "生成连接码 输入特征: 长度={} 前缀={}",
-        stable_id.len(),
-        crate::logger::mask(stable_id)
-    );
-
-    // FNV-1a 32-bit
-    let mut hash: u32 = 0x811c9dc5;
-    let input = format!("{}|localsend-backup|v1", stable_id);
-    for b in input.bytes() {
-        // u8 → u32 宽化，无截断风险
-        hash ^= u32::from(b);
-        hash = hash.wrapping_mul(0x01000193);
-    }
-
-    let mut seed = hash;
-    let mut code = String::new();
-    for _ in 0..LEN {
-        seed ^= seed << 13;
-        seed ^= seed >> 17;
-        seed ^= seed << 5;
-        // SAFETY: ALPHABET.len() = 31，远小于 u32::MAX，as u32 安全。
-        // 取模结果 < 31，as usize 用于索引安全。
-        let idx = (seed % ALPHABET.len() as u32) as usize;
-        // SAFETY: ALPHABET 全是 ASCII 字符 (A-Z, 2-9)，u8 as char 安全。
-        code.push(ALPHABET[idx] as char);
-    }
-    crate::log_info!(
-        "连接码生成完成: {}（哈希种子={:08x}）",
-        crate::logger::mask(&code),
-        hash
-    );
-    code
-}
-
+/// 生成 8 位连接码（**已废弃的确定性推导**，WB-0563/0564 后不再使用：
+/// 输入特征日志可逆推连接码、公开特征推导 = 秘密写在明处。随机码见 `random_code`）
 /// 连接码进程内缓存：接收端每个文件事件都要取码派生解密密钥，
 /// 此前每文件一次磁盘读（Defender 实时扫描下每次 syscall 都不便宜）；
 /// refresh_self_code 时同步失效，「刷新立即生效」语义不变
@@ -149,33 +189,36 @@ static SELF_CODE: Mutex<Option<String>> = Mutex::new(None);
 
 /// 获取本机连接码（纯逻辑，由 lib.rs 包装层注册为 Tauri 命令）
 ///
-/// 优先返回配置文件中持久化的码（刷新过）；否则按设备号计算并缓存到文件。
-/// 进程内缓存 + 文件缓存两级，避免每次调用都执行注册表查询/磁盘读。
+/// 优先返回配置文件中持久化的码（刷新过）；首次（未 init）现场生成随机码。
+/// 进程内缓存 + 文件缓存两级，避免每次调用都执行磁盘读。
 /// M5-3: 传输期间拒绝刷新（见 refresh_self_code）；读取永远返回缓存，永不阻塞传输。
-pub fn get_self_code(app: &AppHandle) -> String {
+pub fn get_self_code(app: &AppHandle) -> Result<String, AppError> {
     if let Some(c) = SELF_CODE.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-        return c.clone();
+        return Ok(c.clone());
     }
-    let dir = config_dir(app);
+    let dir = config_dir(app)?;
     let p = dir.join("self_code.txt");
     if let Ok(s) = std::fs::read_to_string(&p) {
         let t = s.trim().to_string();
         if !t.is_empty() {
             *SELF_CODE.lock().unwrap_or_else(|p| p.into_inner()) = Some(t.clone());
-            return t;
+            return Ok(t);
         }
     }
-    let code = generate_code(&machine_guid_cached());
+    // 未持久化过（init 未跑或文件丢失）：生成随机码并尝试落盘。
+    // 注意这是**随机**码而非设备特征推导（WB-0564）—— 丢失旧码等同刷新，
+    // 配对需重建，这是比"全网同码"安全得多的失败方式。
+    let code = random_code();
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(&p, &code);
     *SELF_CODE.lock().unwrap_or_else(|p| p.into_inner()) = Some(code.clone());
-    code
+    Ok(code)
 }
 
 /// 刷新本机连接码：生成随机码并持久化，旧码立即失效（对方需重新配对）。
 /// M2: 异步通知所有配对设备断开连接（不清除配对记录，传输完成后重新建立）。
 /// M5-3: 传输期间拒绝刷新（防止解密密钥突变导致传输失败）。
-pub fn refresh_self_code(app: &AppHandle) -> String {
+pub fn refresh_self_code(app: &AppHandle) -> Result<String, AppError> {
     // P0-1: 检查是否有传输在进行中（引用计数 > 0）
     if let Some(state) = app.try_state::<crate::transfer::PairingState>() {
         if state.transfer_count.load(Ordering::Relaxed) > 0 {
@@ -184,14 +227,19 @@ pub fn refresh_self_code(app: &AppHandle) -> String {
         }
     }
     let code = random_code();
-    let dir = config_dir(app);
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join("self_code.txt"), &code);
+    let dir = config_dir(app)?;
+    std::fs::create_dir_all(&dir).map_err(AppError::from_display)?;
+    // WB-0085：写盘失败时绝不能返回一个"内存里换过、磁盘上没换"的新码 ——
+    // 重启后旧码复活，已配对的 `target_code` 与新码不一致，传输密钥直接错。
+    if let Err(e) = std::fs::write(dir.join("self_code.txt"), &code) {
+        crate::log_error!("连接码刷新写盘失败，保留旧码: {e}");
+        return get_self_code(app);
+    }
     *SELF_CODE.lock().unwrap_or_else(|p| p.into_inner()) = Some(code.clone());
     crate::log_info!("连接码已刷新: {}", crate::logger::mask(&code));
     // M2: 通知所有配对设备断开（异步，不阻塞码刷新返回）
     crate::transfer::notify_peers_disconnect(app);
-    code
+    Ok(code)
 }
 
 /// 随机 8 位连接码（CSPRNG + 拒绝采样消除模偏差，字符集与默认算法一致）
@@ -216,45 +264,64 @@ pub fn get_device_id(app: &AppHandle) -> String {
     get_device_id_no_ctx()
 }
 
-/// 无句柄变体：deviceId 仅由 MachineGuid 派生，与 Tauri 句柄无关。
-/// 供 http_json_request 等没有 AppHandle 的底层网络上下文注入身份头。
+/// 无句柄变体：deviceId 来自 `init_identity` 注入的**随机安装 ID**，
+/// 与 Tauri 句柄无关。供 http_json_request 等没有 AppHandle 的底层网络
+/// 上下文注入身份头。
+///
+/// 长度必须是 core `DEVICE_ID_LEN`（16 字节 → 32 hex）：core 的
+/// `DeviceIdentity::restore` / `beacon_prefix` 都按这个长度校验。
 pub fn get_device_id_no_ctx() -> String {
-    let guid = machine_guid_cached();
-    let mut h: u64 = 0xcbf29ce484222325;
-    let input = format!("{guid}|lanbackup-device-id|v1");
-    for b in input.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{h:016x}")
+    DEVICE_ID
+        .get_or_init(|| {
+            // init 未跑（纯单元测试路径）——按旧机器派生兜底，保证确定性；
+            // 生产进程在 setup 里必然先 init。
+            crate::log_warn!("deviceId 在 init_identity 前被访问，使用机器派生兜底（仅测试预期）");
+            legacy_machine_device_id()
+        })
+        .clone()
 }
 
-/// 设备配置目录（保存设备名等）
-fn config_dir(app: &AppHandle) -> std::path::PathBuf {
+/// 设备配置目录（保存设备名/连接码等）。
+///
+/// WB-0566：获取失败**上抛错误**，绝不静默落到公共 temp —— 身份文件写
+/// 全局临时目录 = 任何本机用户可读，还可能被系统清理。
+fn config_dir(app: &AppHandle) -> Result<std::path::PathBuf, AppError> {
     app.path()
         .app_config_dir()
-        .unwrap_or_else(|_| std::env::temp_dir())
+        .map_err(|e| AppError(format!("获取应用配置目录失败: {e}")))
 }
 
 /// 设备名（默认计算机名，可在设置中修改并持久化）
-pub fn get_device_name(app: &AppHandle) -> String {
-    let p = config_dir(app).join("device_name.txt");
+pub fn get_device_name(app: &AppHandle) -> Result<String, AppError> {
+    let p = config_dir(app)?.join("device_name.txt");
     if let Ok(s) = std::fs::read_to_string(&p) {
         let t = s.trim().to_string();
         if !t.is_empty() {
-            return t;
+            return Ok(t);
         }
     }
-    std::env::var("COMPUTERNAME")
+    Ok(std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "PC".to_string())
+        .unwrap_or_else(|_| "PC".to_string()))
 }
 
-/// 保存设备名（纯逻辑，由 lib.rs 包装层注册为 Tauri 命令）
+/// 保存设备名（纯逻辑，由 lib.rs 包装层注册为 Tauri 命令）。
+///
+/// WB-0571：名称进 alias/清单/日志，必须有长度与控制符闸。
 pub fn set_device_name(app: &AppHandle, name: String) -> Result<(), AppError> {
-    let dir = config_dir(app);
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return Err(AppError("设备名长度非法（1..=64 字节）".to_string()));
+    }
+    if trimmed
+        .chars()
+        .any(|c| c.is_control() || c == '\n' || c == '\r')
+    {
+        return Err(AppError("设备名不得包含控制字符/换行".to_string()));
+    }
+    let dir = config_dir(app)?;
     std::fs::create_dir_all(&dir).map_err(AppError::from_display)?;
-    std::fs::write(dir.join("device_name.txt"), name.trim()).map_err(AppError::from_display)
+    std::fs::write(dir.join("device_name.txt"), trimmed).map_err(AppError::from_display)
 }
 
 /// 生成数据库加密密钥（派生自 MachineGuid，保证同一设备可解密）。
@@ -267,23 +334,25 @@ pub fn set_device_name(app: &AppHandle, name: String) -> Result<(), AppError> {
 /// 说明：当前 rusqlite 用 `bundled` 特性未启用 SQLCipher（见 Cargo.toml），
 /// `PRAGMA key` 暂无实际加密效果；本函数保证未来启用 SQLCipher 时密钥强度达标。
 pub fn db_encryption_key() -> String {
-    let guid = machine_guid_cached();
-    crate::log_debug!(
-        "派生数据库加密密钥 v2(PBKDF2-600k) 输入特征: 长度={} 前缀={}",
-        guid.len(),
-        crate::logger::mask(&guid)
-    );
-    // salt = SHA256(MachineGuid)：每设备唯一，防彩虹表
-    let salt = Sha256::digest(guid.as_bytes());
-    let mut key = [0u8; 32];
-    ring::pbkdf2::derive(
-        ring::pbkdf2::PBKDF2_HMAC_SHA256,
-        std::num::NonZeroU32::new(600_000).unwrap(),
-        &salt,
-        guid.as_bytes(),
-        &mut key,
-    );
-    hex::encode(key)
+    DB_KEY.get_or_init(|| {
+        let guid = machine_guid_cached();
+        crate::log_debug!(
+            "派生数据库加密密钥 v2(PBKDF2-600k) 输入特征: 长度={} 前缀={}",
+            guid.len(),
+            crate::logger::mask(&guid)
+        );
+        // salt = SHA256(MachineGuid)：每设备唯一，防彩虹表
+        let salt = Sha256::digest(guid.as_bytes());
+        let mut key = [0u8; 32];
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            std::num::NonZeroU32::new(600_000).unwrap(),
+            &salt,
+            guid.as_bytes(),
+            &mut key,
+        );
+        hex::encode(key)
+    }).clone()
 }
 
 /// 旧版 FNV-1a 派生（v1，P2-11 前世）。
@@ -312,33 +381,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn same_input_produces_same_code() {
-        let a = generate_code("machine-guid-abc");
-        let b = generate_code("machine-guid-abc");
-        assert_eq!(a, b, "same stable_id must produce same code");
-    }
-
-    #[test]
-    fn different_input_produces_different_code() {
-        let a = generate_code("device-a");
-        let b = generate_code("device-b");
-        assert_ne!(a, b, "different stable_ids must produce different codes");
-    }
-
-    #[test]
-    fn code_is_8_chars_from_alphabet() {
-        let code = generate_code("test-id");
-        assert_eq!(code.len(), 8, "code must be 8 characters");
-        let valid: std::collections::HashSet<char> =
-            "ABCDEFGHJKMNPQRSTUVWXYZ23456789".chars().collect();
-        for c in code.chars() {
-            assert!(valid.contains(&c), "char {c} not in alphabet");
+    fn random_code_is_8_chars_from_alphabet() {
+        for _ in 0..32 {
+            let code = random_code();
+            assert_eq!(code.len(), 8, "code must be 8 characters");
+            let valid: std::collections::HashSet<char> =
+                "ABCDEFGHJKMNPQRSTUVWXYZ23456789".chars().collect();
+            for c in code.chars() {
+                assert!(valid.contains(&c), "char {c} not in alphabet");
+            }
         }
     }
 
+    /// 随机码不得重复出现（确定性推导被移除后，两次调用应几乎必然不同）
     #[test]
-    fn unknown_machine_fallback_produces_valid_code() {
-        let code = generate_code("unknown-machine");
-        assert_eq!(code.len(), 8);
+    fn random_codes_are_distinct() {
+        let a = random_code();
+        let b = random_code();
+        assert_ne!(a, b, "CSPRNG 连续两码相同概率 ~31^-8，出现即实现有误");
+    }
+
+    /// WB-0561：init 幂等 —— 已有合法 deviceId 时必须原样保留（重启身份不变）。
+    /// OnceLock 静态无法重置，重启不变性由「文件 → 内存」单向加载保证：
+    /// 第二次 init 读到同一文件，set 失败但文件不被覆盖。
+    #[test]
+    fn init_identity_persists_random_device_id_across_restart() {
+        let dir = std::env::temp_dir().join(format!("lanbak-id-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = init_identity(&dir);
+        assert_eq!(first.len(), 32, "deviceId 必须是 32 hex");
+        let persisted = std::fs::read_to_string(dir.join("device_id.txt")).unwrap();
+        assert_eq!(persisted.trim(), first, "deviceId 必须落盘");
+        // 第二次 init（模拟重启后）：同一目录 → 文件不被改写
+        init_identity(&dir);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("device_id.txt")).unwrap().trim(),
+            first,
+            "重启不得更换身份"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WB-0564：首次 init 生成**随机**连接码并持久化；重启沿用
+    #[test]
+    fn init_identity_seeds_random_self_code_once() {
+        let dir = std::env::temp_dir().join(format!("lanbak-code-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        init_identity(&dir);
+        let code = std::fs::read_to_string(dir.join("self_code.txt")).unwrap();
+        assert_eq!(code.trim().len(), 8);
+        // 已有码不被覆盖
+        init_identity(&dir);
+        assert_eq!(std::fs::read_to_string(dir.join("self_code.txt")).unwrap(), code);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WB-0571：设备名闸
+    #[test]
+    fn device_name_validation_rejects_control_chars_and_overlength() {
+        let too_long = "x".repeat(65);
+        assert!(set_device_name_checks(&too_long).is_err());
+        assert!(set_device_name_checks("a\nb").is_err());
+        assert!(set_device_name_checks("").is_err());
+        assert!(set_device_name_checks("我的电脑-1").is_ok());
+    }
+
+    /// 提取纯校验逻辑供测试（不依赖 AppHandle）
+    fn set_device_name_checks(name: &str) -> Result<(), AppError> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed.len() > 64 {
+            return Err(AppError("设备名长度非法（1..=64 字节）".to_string()));
+        }
+        if trimmed
+            .chars()
+            .any(|c| c.is_control() || c == '\n' || c == '\r')
+        {
+            return Err(AppError("设备名不得包含控制字符/换行".to_string()));
+        }
+        Ok(())
     }
 }

@@ -248,6 +248,22 @@ impl DeviceIdentity {
         })
     }
 
+    /// 从 PKCS#8 DER 恢复身份（桌面端 ring `EcdsaKeyPair::generate_pkcs8` 的产物）。
+    ///
+    /// 桌面历史存储的是 PKCS#8（约 138B），而 [`Self::restore`] 只接受 32B
+    /// 私钥标量。曾经把**公钥**字节传进 `restore`，导致每次启动都静默换身份。
+    /// 这里显式解析 PKCS#8，同一份密钥材料在两端得到同一把静态签名密钥。
+    pub fn restore_from_pkcs8(device_id: &str, pkcs8_der: &[u8]) -> Option<Self> {
+        device_id_bytes(device_id)?;
+        use p256::pkcs8::DecodePrivateKey;
+        let secret = p256::SecretKey::from_pkcs8_der(pkcs8_der).ok()?;
+        let keypair = KeyPair::from_signing_bytes(&secret.to_bytes())?;
+        Some(Self {
+            device_id: device_id.to_string(),
+            keypair,
+        })
+    }
+
     /// 公开设备标识（hex）
     pub fn device_id(&self) -> &str {
         &self.device_id
@@ -344,6 +360,43 @@ mod tests {
             DeviceIdentity::restore("aabb", &key).is_none(),
             "长度不足应拒绝"
         );
+    }
+
+    /// PKCS#8 恢复必须得到**同一把**密钥，而不是把公钥当私钥/随机换身份。
+    #[test]
+    fn restore_from_pkcs8_matches_the_same_key() {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use ring::signature::KeyPair as _;
+        let rng = ring::rand::SystemRandom::new();
+        let doc = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &rng,
+        )
+        .unwrap();
+        let ring_kp = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            doc.as_ref(),
+            &rng,
+        )
+        .unwrap();
+        let device_id = "00112233445566778899aabbccddeeff";
+        let id = DeviceIdentity::restore_from_pkcs8(device_id, doc.as_ref())
+            .expect("PKCS#8 必须能恢复");
+        assert_eq!(id.device_id(), device_id);
+        let expected = p256::PublicKey::from_sec1_bytes(ring_kp.public_key().as_ref())
+            .unwrap()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec();
+        assert_eq!(
+            id.public_key_bytes(),
+            expected,
+            "PKCS#8 恢复出的公钥与原密钥不一致"
+        );
+        // 32B 私钥路径与 PKCS#8 路径必须等价
+        let from_scalar =
+            DeviceIdentity::restore(device_id, &id.signing_key_bytes()).expect("32B 私钥应可恢复");
+        assert_eq!(from_scalar.public_key_bytes(), id.public_key_bytes());
     }
 
     #[test]

@@ -57,10 +57,60 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use crate::dto::session::{Algorithm, DegradeReason, FileMeta, TaskReceipt};
-use crate::dto::sync::Manifest;
+use crate::dto::sync::{Manifest, ManifestEntry};
 use crate::state::transfer::TransferState;
 
+use super::sync_api::DirMapping;
 use super::SessionRecord;
+
+/// 进程内自增序号：临时文件名唯一化（WB-0718 —— 固定 `.tmp` 名在并发写同一
+/// JSON 时会互踩：A 的 rename 可能捡到 B 写了一半的临时文件）。
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 原子写 JSON：唯一临时名 → `sync_all` → rename 覆盖。
+/// 失败时清理临时文件，绝不留下半截数据冒充完整文件。
+fn write_json_atomic<T: serde::Serialize>(dir: &Path, name: &str, value: &T) -> std::io::Result<()> {
+    let data = serde_json::to_vec(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!("{name}.{seq}.tmp"));
+    let finalize = || -> std::io::Result<()> {
+        let mut f = File::create(&tmp)?;
+        f.write_all(&data)?;
+        f.sync_all()?;
+        fs::rename(&tmp, dir.join(name))?;
+        Ok(())
+    };
+    match finalize() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// 读 JSON；缺失返回 `None`，损坏告警后按 `None` 处理（隔离脏数据，不静默覆盖回写）。
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    let bytes = fs::read(path).ok()?;
+    match serde_json::from_slice(&bytes) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            log::warn!("持久化文件损坏（忽略，按缺失处理）{:?}: {e}", path);
+            None
+        }
+    }
+}
+
+/// 会话 id 文件名兜底闸（WB-0095/0723）：持久化文件名直接由 sid 拼出，
+/// handler 层虽已做过字符闸，这里再过滤一次 —— `..`/分隔符一旦漏进来就是穿越写。
+fn sanitize_sid(sid: &str) -> String {
+    let s: String = sid
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+    if s.is_empty() { "x".to_string() } else { s }
+}
 
 /// 单个会话的持久化元数据（不含确认块位图 —— 那部分在 `pieces/*.jsonl`）。
 ///
@@ -68,6 +118,10 @@ use super::SessionRecord;
 /// 因为这两张表来自追加日志、在 `load_all` 时重放重建，没有「整文件改写」的必要。
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MetaFile {
+    /// 单调修订号（WB-0711）：每次读改写 +1 —— 并发读改写时后写者至少能看到
+    /// 自己读到的版本号，配合单写者锁，不再出现"旧快照覆盖新状态"。
+    #[serde(default)]
+    rev: u64,
     device_id: String,
     phase: TransferState,
     algorithm: Algorithm,
@@ -91,6 +145,10 @@ struct PieceLine {
 pub(crate) struct SessionPersister {
     meta_dir: PathBuf,
     pieces_dir: PathBuf,
+    /// 单写者锁（WB-0711）：所有「读 meta → 改 → 写 meta」的临界区都在它里面，
+    /// 两个会话线程并发 set_file/set_receipt 时不再互相丢更新。
+    /// 临界区是纯内存 + 一次小文件写，持锁时长亚毫秒级。
+    io_lock: std::sync::Mutex<()>,
 }
 
 impl SessionPersister {
@@ -103,15 +161,19 @@ impl SessionPersister {
         fs::create_dir_all(&meta_dir).map_err(|e| format!("建持久化目录失败 {meta_dir:?}: {e}"))?;
         fs::create_dir_all(&pieces_dir)
             .map_err(|e| format!("建持久化目录失败 {pieces_dir:?}: {e}"))?;
-        Ok(Self { meta_dir, pieces_dir })
+        Ok(Self {
+            meta_dir,
+            pieces_dir,
+            io_lock: std::sync::Mutex::new(()),
+        })
     }
 
     fn meta_path(&self, sid: &str) -> PathBuf {
-        self.meta_dir.join(format!("{sid}.json"))
+        self.meta_dir.join(format!("{}.json", sanitize_sid(sid)))
     }
 
     fn pieces_path(&self, sid: &str) -> PathBuf {
-        self.pieces_dir.join(format!("{sid}.jsonl"))
+        self.pieces_dir.join(format!("{}.jsonl", sanitize_sid(sid)))
     }
 
     /// S10：写穿 last-manifest 快照 —— 原子写 `last-manifest.json`。
@@ -120,25 +182,34 @@ impl SessionPersister {
     /// 在内存（`SyncState.snapshot`）：进程一重启就丢，下一轮同步退化成全量备份。
     /// 与 `write_meta` 同一手法：临时文件 + `sync_all` + 原子 rename。
     pub(crate) fn write_last_manifest(&self, m: &Manifest) {
-        let data = match serde_json::to_vec(m) {
-            Ok(d) => d,
-            Err(e) => {
-                log::warn!("序列化 last-manifest 失败: {e}");
-                return;
-            }
-        };
-        let tmp = self.meta_dir.join("last-manifest.json.tmp");
-        let result = (|| -> std::io::Result<()> {
-            let mut f = File::create(&tmp)?;
-            f.write_all(&data)?;
-            f.sync_all()?;
-            fs::rename(&tmp, self.meta_dir.join("last-manifest.json"))?;
-            Ok(())
-        })();
-        if let Err(e) = result {
+        if let Err(e) = write_json_atomic(&self.meta_dir, "last-manifest.json", m) {
             log::warn!("写 last-manifest 失败: {e}");
-            let _ = fs::remove_file(&tmp);
         }
+    }
+
+    /// WB-0426：假删除墓碑持久化。磁盘文件搬进 `delete/` 后，平台重扫会把墓碑
+    /// 带回清单；但"清单里有、磁盘上本来就没有"的条目只有这份持久化能兜住 ——
+    /// 丢了它，下一轮三路对比就会把用户删掉的文件判成缺失并复活。
+    pub(crate) fn write_tombstones(&self, t: &HashMap<String, ManifestEntry>) {
+        if let Err(e) = write_json_atomic(&self.meta_dir, "tombstones.json", t) {
+            log::warn!("写墓碑持久化失败: {e}");
+        }
+    }
+
+    pub(crate) fn load_tombstones(&self) -> HashMap<String, ManifestEntry> {
+        read_json(&self.meta_dir.join("tombstones.json")).unwrap_or_default()
+    }
+
+    /// WB-0416：目录映射持久化 —— `sync-dir` 登记的映射重启后仍生效，
+    /// 否则每次重启接收端都退回"未登记映射"状态，镜像同步目录绑定丢失。
+    pub(crate) fn write_sync_dirs(&self, d: &HashMap<String, DirMapping>) {
+        if let Err(e) = write_json_atomic(&self.meta_dir, "sync-dirs.json", d) {
+            log::warn!("写目录映射失败: {e}");
+        }
+    }
+
+    pub(crate) fn load_sync_dirs(&self) -> HashMap<String, DirMapping> {
+        read_json(&self.meta_dir.join("sync-dirs.json")).unwrap_or_default()
     }
 
     /// S10：冷启动重载 last-manifest 快照。缺失/损坏时返回 `None`（从无快照启动，
@@ -158,6 +229,7 @@ impl SessionPersister {
     }
 
     /// 原子写 `meta/<sid>.json`：先写 `.tmp`，`sync_all` 后 rename 覆盖。
+    /// **调用方必须已持有 [`Self::io_lock`]**（内部不重复加锁）。
     fn write_meta(&self, sid: &str, meta: &MetaFile) {
         let data = match serde_json::to_vec(meta) {
             Ok(d) => d,
@@ -166,7 +238,8 @@ impl SessionPersister {
                 return;
             }
         };
-        let tmp = self.meta_dir.join(format!("{sid}.json.tmp"));
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = self.meta_dir.join(format!("{sid}.json.{seq}.tmp"));
         let result = (|| -> std::io::Result<()> {
             let mut f = File::create(&tmp)?;
             f.write_all(&data)?;
@@ -179,6 +252,16 @@ impl SessionPersister {
             log::warn!("写会话元数据失败 {sid}: {e}");
             let _ = fs::remove_file(&tmp);
         }
+    }
+
+    /// WB-0711 单写者入口：读 meta → 调用方修改 → rev+1 写回，全程持锁。
+    fn update_meta(&self, sid: &str, f: impl FnOnce(&mut MetaFile)) {
+        let _g = self.io_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut m = self.read_meta(sid);
+        let next_rev = m.rev + 1;
+        f(&mut m);
+        m.rev = next_rev;
+        self.write_meta(sid, &m);
     }
 
     /// 读 `meta/<sid>.json`；缺失或损坏时返回占位（不应发生，仅为兜底）。
@@ -205,7 +288,9 @@ impl SessionPersister {
         degrade_reason: Option<DegradeReason>,
         bitmap_version: u64,
     ) {
+        let _g = self.io_lock.lock().unwrap_or_else(|p| p.into_inner());
         let meta = MetaFile {
+            rev: 0,
             device_id: device_id.to_string(),
             phase,
             algorithm,
@@ -219,9 +304,9 @@ impl SessionPersister {
 
     /// 登记一个待传文件（prepare 阶段）。
     pub(crate) fn set_file(&self, sid: &str, file_id: &str, meta: &FileMeta) {
-        let mut m = self.read_meta(sid);
-        m.files.insert(file_id.to_string(), meta.clone());
-        self.write_meta(sid, &m);
+        self.update_meta(sid, |m| {
+            m.files.insert(file_id.to_string(), meta.clone());
+        });
     }
 
     /// 确认一块已落盘（chunk 阶段）。追加一行到 `pieces/*.jsonl`，O(1)。
@@ -238,6 +323,9 @@ impl SessionPersister {
                 return;
             }
         };
+        // WB-0711：追加也走单写者锁 —— 两个线程的 write_all 交错会把
+        // 两行 JSON 撕成四段，重放时全部丢弃。
+        let _g = self.io_lock.lock().unwrap_or_else(|p| p.into_inner());
         match OpenOptions::new()
             .create(true)
             .append(true)
@@ -261,19 +349,19 @@ impl SessionPersister {
         degrade_reason: Option<DegradeReason>,
         bitmap_version: u64,
     ) {
-        let mut m = self.read_meta(sid);
-        m.phase = phase;
-        m.algorithm = algorithm;
-        m.degrade_reason = degrade_reason;
-        m.bitmap_version = bitmap_version;
-        self.write_meta(sid, &m);
+        self.update_meta(sid, |m| {
+            m.phase = phase;
+            m.algorithm = algorithm;
+            m.degrade_reason = degrade_reason;
+            m.bitmap_version = bitmap_version;
+        });
     }
 
     /// 接收端回传的任务终态。
     pub(crate) fn set_receipt(&self, sid: &str, file_id: &str, receipt: &TaskReceipt) {
-        let mut m = self.read_meta(sid);
-        m.receipts.insert(file_id.to_string(), receipt.clone());
-        self.write_meta(sid, &m);
+        self.update_meta(sid, |m| {
+            m.receipts.insert(file_id.to_string(), receipt.clone());
+        });
     }
 
     /// 终态会话不再有续传价值：删掉它的两份文件，避免僵尸堆积。
@@ -378,6 +466,7 @@ impl SessionPersister {
 impl MetaFile {
     fn blank() -> Self {
         Self {
+            rev: 0,
             device_id: String::new(),
             phase: TransferState::Idle,
             algorithm: Algorithm::Advanced,

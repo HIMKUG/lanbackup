@@ -10,6 +10,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::handshake::PairingState;
+use super::Presence;
+
 // ============================================================
 // 增量策略
 // ============================================================
@@ -189,4 +192,53 @@ pub struct MoveToDeleteRequest {
 pub struct DisconnectRequest {
     #[serde(rename = "deviceId")]
     pub device_id: String,
+}
+
+// ============================================================
+// 响应 DTO（WB-0415/0425/0435：响应必须有 schema，不得手写 json! 漂移）
+// ============================================================
+
+/// `POST /api/v4/sync-dir` 响应：映射登记结果 + 本端清单（发起端一次往返跑三路对比）。
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SyncDirResponse {
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
+    #[serde(rename = "rootId")]
+    pub root_id: String,
+    /// 归一化并通过路径闸后的接收目录名
+    #[serde(rename = "targetDir")]
+    pub target_dir: String,
+    pub strategy: SyncStrategy,
+    #[serde(rename = "peerManifest")]
+    pub peer_manifest: Manifest,
+}
+
+/// `POST /api/v4/move-to-delete` 响应：**逐路径**结果。
+///
+/// 一批里既有能搬的、也有本端没有的、还有被路径闸拒绝的 —— 三类必须分开，
+/// "全成功/全失败"会让对端无从判断该重试哪些（WB-0425）。
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MoveToDeleteResponse {
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
+    /// 已搬入 `delete/` 的墓碑路径
+    pub moved: Vec<String>,
+    /// 幂等重放（已在 `delete/`）或本端清单里不存在的路径
+    pub skipped: Vec<String>,
+    /// 路径闸拒绝或磁盘搬移失败的路径
+    pub rejected: Vec<String>,
+}
+
+/// `POST /api/v4/disconnect` 响应。
+///
+/// `pairingState` 明确回传"断开不动配对"—— 收到 `revoked` 才意味着配对没了。
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DisconnectResponse {
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
+    #[serde(rename = "pairingState")]
+    pub pairing_state: PairingState,
+    pub presence: Presence,
+    #[serde(rename = "abortedSessions")]
+    pub aborted_sessions: Vec<String>,
 }
